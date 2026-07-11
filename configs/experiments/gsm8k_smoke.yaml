@@ -1,0 +1,9 @@
+kind: gsm8k_local_smoke
+run_id: gsm8k-local-smoke
+out_dir: runs/gsm8k-local-smoke
+seed: 123
+model_id: local-deterministic-gsm8k
+prompt_style: thinking_tags
+rollouts: 4
+early_rollouts: 2
+max_new_tokens: 64

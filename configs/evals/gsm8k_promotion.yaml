@@ -1,0 +1,6 @@
+min_primary_delta: 0.02
+min_primary_ci_low: 0.005
+max_mcnemar_p: 0.05
+max_parse_regression: 0.005
+max_easy_regression: 0.01
+max_token_increase_ratio: 1.25

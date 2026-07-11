@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "post-train-engine"
+version = "0.0.1"
+description = "Eval driven post-training experiment engine."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate",
+    "datasets",
+    "huggingface_hub",
+    "numpy",
+    "pandas",
+    "peft",
+    "pydantic",
+    "pyyaml",
+    "safetensors",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    "tqdm",
+    "transformers",
+    "trl",
+    "wandb",
+]
+
+[project.scripts]
+pte = "post_train_engine.cli.main:main"
+post-train-eval-hf = "post_train_engine.evals.hf_cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+    "jupyter",
+    "pytest",
+    "ruff",
+]
+rlvr = [
+    "accelerate",
+    "peft",
+    "trl",
+]
+rollout = [
+    "vllm",
+]
+optimizer = [
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+]
+gpu = [
+    "vllm",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+]
+chaineval = [
+    "bert-score",
+    "rouge-score",
+    "sentence-transformers",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff.lint.per-file-ignores]
+"notebooks/*.ipynb" = ["E402", "F811"]

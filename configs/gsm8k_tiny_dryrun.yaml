@@ -1,0 +1,39 @@
+run:
+  run_id: gsm8k-tiny-dryrun
+  output_dir: runs/gsm8k-tiny-dryrun
+  seed: 123
+  overwrite: true
+dataset:
+  name: gsm8k
+  source: embedded_gsm8k_tiny
+  train_size: 3
+  eval_size: 2
+  split_seed: 123
+  prompt_style: thinking_tags
+baseline:
+  candidate_id: baseline
+  model_id: fake-gsm8k
+  system_prompt: Return only the final answer inside <answer> tags.
+providers:
+  inference:
+    type: fake
+    provider_id: fake-inference
+  training:
+    type: fake_prompt_adapter
+    provider_id: fake-trainer
+rollout:
+  samples_per_example: 2
+  temperature: 0.0
+  top_p: 1.0
+  max_output_tokens: 64
+eval:
+  samples_per_example: 1
+  temperature: 0.0
+  top_p: 1.0
+  max_output_tokens: 64
+promotion:
+  primary_metric: accuracy
+  min_accuracy_delta: 0.0
+  min_paired_delta_ci_low: -1.0
+  min_eval_examples: 2
+  max_parse_regression: 0.0

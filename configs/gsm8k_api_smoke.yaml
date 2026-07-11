@@ -1,0 +1,47 @@
+run:
+  run_id: gsm8k-api-smoke
+  output_dir: runs/gsm8k-api-smoke
+  seed: 123
+  overwrite: true
+dataset:
+  name: gsm8k
+  source: embedded_gsm8k_tiny
+  train_size: 3
+  eval_size: 2
+  split_seed: 123
+  prompt_style: thinking_tags
+baseline:
+  candidate_id: baseline
+  model_id_env: PTE_REMOTE_MODEL
+  system_prompt: Return only the final answer inside <answer> tags.
+providers:
+  inference:
+    type: chat_completions
+    provider_id: remote-chat-completions-inference
+    base_url_env: PTE_REMOTE_BASE_URL
+    api_key_env: PTE_REMOTE_API_KEY
+    model_env: PTE_REMOTE_MODEL
+    timeout_seconds: 60
+  training:
+    type: chat_completions_prompt_adapter
+    provider_id: remote-chat-completions-adapter
+    base_url_env: PTE_REMOTE_BASE_URL
+    api_key_env: PTE_REMOTE_API_KEY
+    model_env: PTE_REMOTE_MODEL
+    timeout_seconds: 60
+rollout:
+  samples_per_example: 1
+  temperature: 0.2
+  top_p: 1.0
+  max_output_tokens: 128
+eval:
+  samples_per_example: 1
+  temperature: 0.0
+  top_p: 1.0
+  max_output_tokens: 128
+promotion:
+  primary_metric: accuracy
+  min_accuracy_delta: 0.0
+  min_paired_delta_ci_low: -1.0
+  min_eval_examples: 2
+  max_parse_regression: 0.0
