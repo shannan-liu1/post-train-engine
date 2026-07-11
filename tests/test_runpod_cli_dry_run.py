@@ -155,7 +155,7 @@ def test_runpod_plan_derives_deployment_environment_from_runpod_config(
     assert environment["gpu_type"] == "NVIDIA A40"
     assert environment["gpu_count"] == 2
     assert environment["container_disk_gb"] == 100
-    assert environment["volume_gb"] == 150
+    assert environment["volume_gb"] == 0
 
 
 def test_runpod_plan_rejects_environment_override_that_conflicts_with_config(

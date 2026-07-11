@@ -196,6 +196,7 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | U-039 | Trace and replay path readers do not all share the RunBundle containment guard. | A crafted artifact can escape the Run root or consume untracked external data. | Route every artifact read through one containment and hash-verification API. | open, artifact safety |
 | U-040 | The repository lacks CI and a declared license. | Future changes can merge without the local evidence gate, and reuse terms remain ambiguous. | Add CI after the first reviewed push; the owner must select the license explicitly. | open, repository operations |
 | U-041 | A valid ownership marker did not prevent overwrite or retention code from traversing a Windows junction. | Cleanup could remove files outside the intended managed tree. | Reject symlinks and junctions at ArtifactStore overwrite, lifecycle pruning, and checkpoint-retention boundaries; cover simulated junctions in tests. | implemented locally |
+| U-042 | The two-A40 smoke config requested a persistent volume despite a bounded ephemeral benchmark attempt. | Retained storage can outlive compute teardown and weaken the spend and data-retention boundary. | Set `volume_gb: 0` in the smoke config and assert that the canonical RunPod plan derives zero persistent volume. | implemented locally |
 
 ## Progress Ledger
 
@@ -207,10 +208,10 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | 3. Canonical RunEngine | partial | F9-F11, F14 | One config dispatcher, shared stage order, central manifest and promotion, and removal of shadow orchestration | Move consequential compiler and adapter preparation behind engine stages |
 | 4. Evidence-backed training | partial | F12-F13, F15 | MethodTrainingRequest, consumption-time TrainingView hash checks, policy-versioned GRPO traces, measured frontier selection, and semantic RunBundle GRPO validation | Replace raw replay with role-aware Trace queries and integrate separation certificates |
 | 5. Campaign control plane | partial | C1-C7 | SQLite proposal, budget, outcome, exposure, planner, CAS tests, atomic finalization, and corrected exposure accounting for pre-evaluation failures | Wire all production compilers and add renewable fenced leases and measured-cost settlement |
-| 6. Cost and runtime | in progress | R1-R4 | Explicit missing-cost state, efficiency summary, cache primitives, output-equivalence tests, dynamic CUDA-image validation, exact hardware attestation, and `docs/runpod_deployment.md` | Ingest provider-derived cost receipts, lock dependencies, then certify runtime only under a later approved deployment instruction |
+| 6. Cost and runtime | in progress | R1-R4 | Explicit missing-cost state, efficiency summary, cache primitives, output-equivalence tests, dynamic CUDA-image validation, exact hardware attestation, ephemeral smoke storage, and `docs/runpod_deployment.md` | Ingest provider-derived cost receipts, lock dependencies, then run the approved bounded R4 attempt from an exact pushed commit |
 | 7. Extensibility | partial | E1-E3 | Exact-math engine task and typed SFT, DPO, GRPO, OPD, and OPSD contracts | Prove executable production paths rather than isolated contract surfaces |
 | 8. Agent and distributed scale | foundation only | R5-R6, E4-E5 | Lease, topology, staleness, and composition primitives with local tests | Add fencing, renewal, production compiler wiring, and distributed fault injection before scale claims |
-| 9. Final compliance and fresh-eyes review | in progress | All criteria | Adversarial review reopened U-029 through U-040, resolved U-041, reviewed the exact staged surface, and verified 257 tests plus Ruff | Commit the reviewed foundation, then address the registered production-certification risks |
+| 9. Final compliance and fresh-eyes review | in progress | All criteria | Foundation commit `05f52b0`; adversarial review reopened U-029 through U-040, resolved U-041 and U-042, and verified 257 tests plus Ruff | Push the exact reviewed deployment commit, then address the registered production-certification risks |
 
 ## Research Decisions
 
