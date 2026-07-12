@@ -35,6 +35,7 @@ from post_train_engine.artifacts import require_valid_run_bundle
 from post_train_engine.artifact_store import ArtifactStore
 from post_train_engine.config import HuggingFaceLifecycleConfig, ModelLifecycleConfig
 from post_train_engine.engine import (
+    CampaignBinding,
     RunEngine,
     RunPlan,
     RunStage,
@@ -121,9 +122,20 @@ class RunSpec(BaseModel):
     model_config = _FROZEN_FORBID
 
     run_id: str = Field(..., min_length=1)
+    certification_mode: Literal["non_certifying_smoke", "certifying"]
+    campaign: CampaignBinding | None = None
     output_dir: str = Field(..., min_length=1)
     seed: int = Field(default=42, ge=0)
     overwrite: bool = False
+    distributed_timeout_seconds: float = Field(default=120.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _certification_has_authority(self) -> RunSpec:
+        if self.certification_mode == "certifying" and self.campaign is None:
+            raise ValueError("certifying run requires campaign binding")
+        if self.certification_mode == "non_certifying_smoke" and self.campaign is not None:
+            raise ValueError("non-certifying smoke cannot bind a campaign")
+        return self
 
 
 class ModelSpec(BaseModel):
@@ -400,7 +412,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
             if resumable
             else ArtifactStore(run_dir, overwrite=cfg.run.overwrite)
         )
-    _wait_for_everyone(state)
+    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
     if (run_dir / "manifest.json").is_file():
         bundle = require_valid_run_bundle(run_dir)
         require_nonfailed_manifest(bundle.manifest, run_dir)
@@ -416,7 +428,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
         store.write_json("config.resolved.json", cfg.model_dump(mode="json"))
         store.write_text("command.txt", " ".join(sys.argv) + "\n")
         store.write_json("environment.json", runtime_environment(dist))
-    _wait_for_everyone(state)
+    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
     _require_cuda(cfg)
     if store is not None and not resumable:
         cfg = _resolve_hub_revisions(cfg)
@@ -425,7 +437,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
         cfg = RunPodGRPOConfig.model_validate(
             _read_json_object(run_dir / "config.resolved.json")
         )
-    _wait_for_everyone(state)
+    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
     if store is None:
         cfg = RunPodGRPOConfig.model_validate(
             _read_json_object(run_dir / "config.resolved.json")
@@ -467,12 +479,23 @@ class _AccelerateRunCoordinator:
         self.is_main_process = dist.is_main_process
         self._state = state
 
-    def wait(self) -> None:
-        _wait_for_everyone(self._state)
+    def wait(self, timeout_seconds: float) -> None:
+        from datetime import timedelta
 
-    def collect_errors(self, error: str | None) -> tuple[str, ...]:
         import torch.distributed as torch_dist
 
+        work = torch_dist.barrier(async_op=True)
+        if not work.wait(timeout=timedelta(seconds=timeout_seconds)):
+            raise TimeoutError("distributed stage barrier timed out")
+
+    def collect_errors(
+        self,
+        error: str | None,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
+        import torch.distributed as torch_dist
+
+        self.wait(timeout_seconds)
         world_size = int(self._state.num_processes)
         gathered: list[str | None] = [None for _ in range(world_size)]
         torch_dist.all_gather_object(gathered, error)
@@ -498,12 +521,14 @@ def _compile_runpod_plan(
         or is_huggingface_commit(dataset_revision)
     )
     return RunPlan(
+        certification_mode=cfg.run.certification_mode,
         run_id=cfg.run.run_id,
         candidate_id=f"{cfg.run.run_id}-grpo-candidate",
         parent_candidate_id="baseline",
         task_name="gsm8k",
         model_id=cfg.model.base_model_id,
         output_dir=cfg.run.output_dir,
+        distributed_timeout_seconds=cfg.run.distributed_timeout_seconds,
         source_root=str(Path(__file__).resolve().parents[2]),
         inputs={
             "model": {
@@ -572,6 +597,7 @@ def _compile_runpod_plan(
             "max_easy_regression": cfg.promotion.max_easy_regression,
             "max_token_increase_ratio": cfg.promotion.max_token_increase_ratio,
         },
+        campaign=cfg.run.campaign,
         metadata={
             "execution_mode": "runpod_grpo",
             "execution": cfg.execution.model_dump(mode="json"),
@@ -1142,9 +1168,20 @@ def _distributed_state(dist: DistributedContext) -> Any | None:
     return PartialState()
 
 
-def _wait_for_everyone(state: Any | None) -> None:
-    if state is not None:
-        state.wait_for_everyone()
+def _wait_for_everyone(
+    state: Any | None,
+    *,
+    timeout_seconds: float = 120.0,
+) -> None:
+    if state is None:
+        return
+    from datetime import timedelta
+
+    import torch.distributed as torch_dist
+
+    work = torch_dist.barrier(async_op=True)
+    if not work.wait(timeout=timedelta(seconds=timeout_seconds)):
+        raise TimeoutError("distributed preparation barrier timed out")
 
 
 def _load_and_split_dataset(

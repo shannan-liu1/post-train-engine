@@ -14,6 +14,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from post_train_engine.engine import CampaignBinding
+
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 
 DatasetSource = Literal["embedded_gsm8k_tiny", "huggingface_gsm8k"]
@@ -35,9 +37,19 @@ class RunSection(BaseModel):
     model_config = _FROZEN_FORBID
 
     run_id: str = Field(..., min_length=1)
+    certification_mode: Literal["non_certifying_smoke", "certifying"]
+    campaign: CampaignBinding | None = None
     output_dir: str = Field(..., min_length=1)
     seed: int = Field(default=123, ge=0)
     overwrite: bool = False
+
+    @model_validator(mode="after")
+    def _certification_has_authority(self) -> RunSection:
+        if self.certification_mode == "certifying" and self.campaign is None:
+            raise ValueError("certifying run requires campaign binding")
+        if self.certification_mode == "non_certifying_smoke" and self.campaign is not None:
+            raise ValueError("non-certifying smoke cannot bind a campaign")
+        return self
 
 
 class DatasetSpec(BaseModel):

@@ -14,6 +14,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
+11. Use `RunPodAllocationPolicy` and `RunPodBudget`. The current authorization is Secure Cloud, exactly two A40s, 50 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend.
 
 ## Image and CUDA compatibility
 
@@ -145,6 +146,11 @@ Treat branch names and tags as discovery aids, not execution identity. Only the 
 
 ## Remote execution order
 
+The repository ships one executable paid config: `configs/gsm8k_runpod_smoke.yaml`.
+It is a one-step non-certifying smoke. The repository intentionally ships no
+300-step paid default. Generate any full certifying config only after claiming a
+fenced campaign proposal and binding provider billing settlement.
+
 1. Start the watchdog.
 2. Deliver source through the selected mode. Verify the bundle hash or exact detached Git SHA.
 3. Enter a new work directory that contains only the verified source.
@@ -169,6 +175,11 @@ Teardown runs after success, failure, timeout, or interruption:
 5. Delete the outside private key and local staging bundle.
 6. Query ending balance and current hourly spend.
 7. Record balance delta, authoritative Pod rate, elapsed time, topology, image, CUDA filter, and artifact hash.
+
+Billing settlement requires two matching provider observations. Record the first
+nonempty amount as provisional. After Pod absence is verified, query again with an
+explicit end time. Settle only when the second amount matches the durable first
+observation. A first nonempty billing response is never final evidence.
 
 ## Failures already observed
 

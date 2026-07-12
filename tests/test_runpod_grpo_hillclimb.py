@@ -229,20 +229,13 @@ def test_runpod_lifecycle_fails_closed_on_ambiguous_remote_transaction(
 
 def test_runpod_grpo_configs_parse_and_are_dispatched() -> None:
     smoke = load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
-    full = load_runpod_grpo_config("configs/gsm8k_runpod_300step.yaml")
-    full_4gpu = load_runpod_grpo_config("configs/gsm8k_runpod_300step_4gpu.yaml")
 
     assert is_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
     assert smoke.execution.provider == "runpod"
     assert smoke.execution.gpu_count == 2
     assert smoke.execution.cuda_version == "12.8"
     assert smoke.training.max_steps == 1
-    assert full.training.max_steps == 300
-    assert full.execution.gpu_count == 2
-    assert full_4gpu.execution.gpu_count == 4
-    assert full_4gpu.training.num_generations == 4
-    assert full.dataset.source == "huggingface_gsm8k"
-    assert full.training.length_penalty_weight > 0
+    assert smoke.run.certification_mode == "non_certifying_smoke"
     assert smoke.checkpoint_selection.enabled is True
     assert smoke.trace_capture.enabled is True
 
@@ -580,7 +573,8 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
         for name in manifest["artifacts"]
         if name.startswith("stage_receipt_")
     } == {f"stage_receipt_{stage}" for stage in CANONICAL_STAGE_ORDER}
-    assert manifest["status"] == "promoted"
+    assert manifest["status"] == "rejected"
+    assert manifest["metadata"]["certification_mode"] == "non_certifying_smoke"
     assert manifest["metadata"]["cost_certifying"] is False
     assert set(manifest["metadata"]["missing_cost_stages"]) >= {
         "evidence",
@@ -737,6 +731,7 @@ def _write_config(
             "volume_gb": 150,
         },
         "run": {
+            "certification_mode": "non_certifying_smoke",
             "run_id": "gsm8k-runpod-test",
             "output_dir": str(run_dir),
             "seed": 42,

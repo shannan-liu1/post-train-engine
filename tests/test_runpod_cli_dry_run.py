@@ -8,7 +8,8 @@ import pytest
 import yaml
 
 from post_train_engine.cli.main import main
-from post_train_engine.runpod import validate_cuda_runtime
+from post_train_engine.runpod import build_runpod_create_request, validate_cuda_runtime
+from post_train_engine.runpod_control_plane import RunPodAllocationPolicy
 
 
 class _FakeCuda:
@@ -147,15 +148,19 @@ def test_runpod_plan_derives_deployment_environment_from_runpod_config(
         ]
     )
 
-    environment = json.loads(out_path.read_text(encoding="utf-8"))["environment"]
+    plan = json.loads(out_path.read_text(encoding="utf-8"))
+    environment = plan["environment"]
     assert environment["image"] == (
         "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
     )
     assert environment["allowed_cuda_versions"] == ["12.8"]
     assert environment["gpu_type"] == "NVIDIA A40"
     assert environment["gpu_count"] == 2
-    assert environment["container_disk_gb"] == 100
+    assert environment["container_disk_gb"] == 50
     assert environment["volume_gb"] == 0
+    request = build_runpod_create_request(plan, pod_name="pte-r4-deadbeef")
+    RunPodAllocationPolicy().validate_request(request)
+    assert request["allowedCudaVersions"] == ["12.8"]
 
 
 def test_runpod_plan_rejects_environment_override_that_conflicts_with_config(

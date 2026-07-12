@@ -12,6 +12,7 @@ from post_train_engine.api_schemas import Candidate, JobHandle, JobRequest, JobR
 class _ImmediateProvider:
     provider_id: str
     provider_type: str
+    recovery_policy = "replay_safe"
 
     def __init__(self, provider_id: str, provider_type: str) -> None:
         self.provider_id = provider_id
@@ -28,6 +29,13 @@ class _ImmediateProvider:
             return self._results[handle.job_id]
         except KeyError as exc:
             raise RuntimeError(f"unknown provider job id: {handle.provider_job_id}") from exc
+
+    def reconcile_job(
+        self,
+        request: JobRequest,
+        _handle: JobHandle | None,
+    ) -> JobResult | None:
+        return self._results.get(request.job_id)
 
 
 class FakeInferenceProvider(_ImmediateProvider):

@@ -275,6 +275,7 @@ def _compile_local_gsm8k_smoke(
         ),
     )
     plan = RunPlan(
+        certification_mode="non_certifying_smoke",
         run_id=cfg.run_id,
         candidate_id="candidate-dry-run",
         parent_candidate_id="seed",

@@ -7,6 +7,7 @@ name = "post-train-engine"
 version = "0.0.1"
 description = "Eval driven post-training experiment engine."
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "accelerate",
@@ -15,7 +16,7 @@ dependencies = [
     "numpy",
     "pandas",
     "peft",
-    "pydantic",
+    "pydantic>=2,<3",
     "pyyaml",
     "safetensors",
     "scikit-learn",
@@ -43,14 +44,10 @@ rlvr = [
     "peft",
     "trl",
 ]
-rollout = [
-    "vllm",
-]
 optimizer = [
     "muon-optimizer @ git+https://github.com/KellerJordan/Muon@f98f1cacc0263b04290753e32be8d498c1efc806",
 ]
 gpu = [
-    "vllm",
     "muon-optimizer @ git+https://github.com/KellerJordan/Muon@f98f1cacc0263b04290753e32be8d498c1efc806",
 ]
 chaineval = [

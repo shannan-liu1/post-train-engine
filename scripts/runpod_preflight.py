@@ -30,8 +30,6 @@ def _command_specs(require_cuda: bool) -> list[tuple[str, list[str]]]:
                 (
                     "from post_train_engine.runpod_grpo import load_runpod_grpo_config; "
                     "load_runpod_grpo_config('configs/gsm8k_runpod_smoke.yaml'); "
-                    "load_runpod_grpo_config('configs/gsm8k_runpod_300step.yaml'); "
-                    "load_runpod_grpo_config('configs/gsm8k_runpod_300step_4gpu.yaml'); "
                     "print('RunPod GRPO configs OK')"
                 ),
             ],

@@ -47,7 +47,8 @@ def test_hillclimb_dryrun_writes_full_api_first_run_bundle(tmp_path: Path) -> No
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert report["run_id"] == "gsm8k-dryrun"
     assert manifest["schema_version"] == "post_train_run_v1"
-    assert manifest["status"] == "promoted"
+    assert manifest["status"] == "rejected"
+    assert manifest["metadata"]["certification_mode"] == "non_certifying_smoke"
     assert manifest["candidate_id"] == report["candidate"]["candidate_id"]
     assert manifest["parent_candidate_id"] == "baseline"
     assert manifest["model_id"] == "fake-gsm8k"
@@ -69,6 +70,7 @@ def test_hillclimb_dryrun_writes_full_api_first_run_bundle(tmp_path: Path) -> No
         "env_redacted",
         "provider_requests",
         "provider_responses",
+        "provider_operations",
         "baseline_candidate",
         "candidate",
         "dataset_splits",
@@ -98,7 +100,8 @@ def test_hillclimb_dryrun_writes_full_api_first_run_bundle(tmp_path: Path) -> No
     assert report["candidate"]["parent_id"] == "baseline"
     assert report["data"]["train_examples"] == 3
     assert report["data"]["eval_examples"] == 2
-    assert report["promotion"]["decision"] == "promote"
+    assert report["promotion"]["decision"] == "reject"
+    assert "non_certifying_smoke" in report["promotion"]["rejection_reasons"]
     assert report["promotion"]["primary_metric"] == "accuracy"
     assert report["promotion"]["stats"]["n"] == 2
     assert report["next_experiment"]["category"]
@@ -628,6 +631,10 @@ def test_provider_submit_failure_writes_redacted_error_artifact(
     class FailingProvider:
         provider_id = "fake-inference"
         provider_type = "fake"
+        recovery_policy = "replay_safe"
+
+        def reconcile_job(self, request, handle):  # type: ignore[no-untyped-def]
+            return None
 
         def submit_job(self, request: JobRequest):  # type: ignore[no-untyped-def]
             raise RuntimeError("provider exploded with api_key=secret-value")
@@ -676,6 +683,10 @@ def test_provider_result_handle_mismatch_fails_closed(tmp_path: Path) -> None:
     class MismatchedResultProvider:
         provider_id = "provider"
         provider_type = "fake"
+        recovery_policy = "replay_safe"
+
+        def reconcile_job(self, request, handle):  # type: ignore[no-untyped-def]
+            return None
 
         def submit_job(self, request: JobRequest) -> JobHandle:
             return JobHandle(
@@ -731,6 +742,10 @@ def test_adapted_candidate_must_link_to_baseline(
     class BadLineageAdapter:
         provider_id = "fake-trainer"
         provider_type = "fake_prompt_adapter"
+        recovery_policy = "replay_safe"
+
+        def reconcile_job(self, request, handle):  # type: ignore[no-untyped-def]
+            return None
 
         def submit_job(self, request: JobRequest) -> JobHandle:
             handle = JobHandle(
@@ -787,6 +802,7 @@ def _write_dryrun_config(
     promotion.update(promotion_overrides or {})
     body = {
         "run": {
+            "certification_mode": "non_certifying_smoke",
             "run_id": "gsm8k-dryrun",
             "output_dir": str(run_dir),
             "seed": 123,
@@ -829,6 +845,7 @@ def _write_dryrun_config(
 def _write_api_config(tmp_path: Path) -> Path:
     body = {
         "run": {
+            "certification_mode": "non_certifying_smoke",
             "run_id": "gsm8k-api-smoke",
             "output_dir": str(tmp_path / "runs" / "gsm8k-api-smoke"),
             "seed": 123,

@@ -25,6 +25,29 @@ Implement the governing flywheel specification through verified vertical slices,
 - Campaign state updates the Incumbent atomically and preserves negative results.
 - Missing required evidence fails closed with an actionable error.
 
+## Execution Order: Delete Before Automating
+
+The remaining work proceeds as vertical slices in this order:
+
+1. Provider operation intent and reconciliation. A crash after external completion
+   never causes an unexamined retry.
+2. Pure compilation plus RunEngine-owned resolution. Delete consequential work
+   outside the stage machine.
+3. Certifying campaign binding. Delete implicit standalone production Runs.
+4. Renewable fenced leases and measured-cost settlement. Delete clock-only worker
+   authority and estimate-as-actual accounting.
+5. Authoritative RunPod create and billing receipts with a $1.50 target. Delete
+   inferred topology pricing and immediate-settlement claims.
+6. Bounded distributed receipt commits with fault injection. Delete unbounded
+   collectives.
+7. Explanation-driven experiment routing. Automate only after the evidence loop is
+   stable and every proposal exposes a risky prediction and rejection criterion.
+
+Each slice uses one public RED test, the minimum GREEN implementation, focused
+regression tests, then the full repository gate. No remote spend occurs before
+slices 1 through 6 pass locally, the reviewed tree is committed and pushed, and
+anonymous checkout of that exact commit succeeds.
+
 ## Foundation Slice 1: Portable RunBundle
 
 Files and interfaces:
@@ -151,8 +174,8 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after the final local code change: 257 tests pass.
-- [ ] Fresh-eyes review finds no unresolved consequential local issue.
+- [x] Full tests and Ruff pass after the final local code change: 293 tests pass.
+- [x] Two fresh-eyes passes found and fixed allocation, billing, identity, and provider-handle defects; the final targeted and full gates pass.
 
 The adversarial review reopened production certification at the promotion-contract,
 sealed-evidence, replay-lineage, receipt-idempotency, campaign-wiring, lease-fencing,

@@ -129,7 +129,7 @@ Moving a Run directory does not invalidate the bundle. Hash, path, role, lineage
 
 `CampaignStore` indexes immutable bundle evidence in local SQLite. It stores hypotheses, proposals, comparison groups, budgets, leases, negative outcomes, suite exposure, and the current Incumbent.
 
-An optional `RunPlan.campaign` binding names the campaign database, proposal lease, expected Incumbent, and promotion suite. During finalization, `RunEngine` atomically records the outcome and suite exposure, then compare-and-swaps the Incumbent only for a promoted Candidate. Reconciliation is idempotent when the bundle becomes durable before the SQLite transaction completes.
+A non-certifying smoke carries no campaign binding and can never promote. A certifying `RunPlan.campaign` binding names the campaign database, fenced proposal lease, expected Incumbent, promotion suite, and cost-settlement mode. Stage-measured Runs finalize atomically. Provider-billed Runs remain `pending_settlement` until a hashed billing receipt settles actual cost and compare-and-swaps the Incumbent. Reconciliation is idempotent across either write order.
 
 ## Extension seams
 

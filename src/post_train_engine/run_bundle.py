@@ -125,7 +125,9 @@ class RunManifest(BaseModel):
     parent_candidate_id: str | None = None
     task_name: str = Field(..., min_length=1)
     model_id: str = Field(..., min_length=1)
-    status: Literal["planned", "running", "failed", "rejected", "promoted"]
+    status: Literal[
+        "planned", "running", "pending_settlement", "failed", "rejected", "promoted"
+    ]
     source: SourceIdentity
     inputs: dict[str, ResolvedInput]
     artifacts: dict[str, ArtifactRef] = Field(default_factory=dict)
@@ -138,7 +140,7 @@ class RunManifest(BaseModel):
             raise ValueError(
                 "Run inputs missing required identities: " + ", ".join(sorted(missing))
             )
-        if self.status in {"promoted", "rejected"}:
+        if self.status in {"pending_settlement", "promoted", "rejected"}:
             unresolved = sorted(
                 name
                 for name, identity in self.inputs.items()

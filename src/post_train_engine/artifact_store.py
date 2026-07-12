@@ -8,7 +8,13 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from post_train_engine.api_schemas import JobRequest, JobResult, redact_secret_text, redact_secrets
+from post_train_engine.api_schemas import (
+    JobHandle,
+    JobRequest,
+    JobResult,
+    redact_secret_text,
+    redact_secrets,
+)
 from post_train_engine.jsonl import read_jsonl, write_jsonl
 from post_train_engine.run_bundle import make_artifact_ref
 
@@ -103,6 +109,69 @@ class ArtifactStore:
             job_id=request.job_id,
         )
 
+    def provider_operation(self, job_id: str) -> dict[str, Any] | None:
+        path = self.run_dir / "provider_operations.jsonl"
+        if not path.is_file():
+            return None
+        return next(
+            (row for row in read_jsonl(path) if row.get("job_id") == job_id),
+            None,
+        )
+
+    def record_provider_intent(
+        self,
+        request: JobRequest,
+        *,
+        request_sha256: str,
+        recovery_policy: str,
+    ) -> None:
+        existing = self.provider_operation(request.job_id)
+        if existing is not None:
+            if existing.get("request_sha256") != request_sha256:
+                raise ValueError("provider operation request differs from durable intent")
+            return
+        _upsert_jsonl(
+            self.run_dir / "provider_operations.jsonl",
+            {
+                "schema_version": "provider_operation_v1",
+                "job_id": request.job_id,
+                "provider_id": request.provider_id,
+                "job_type": request.job_type,
+                "request_sha256": request_sha256,
+                "recovery_policy": recovery_policy,
+                "state": "intent",
+                "request": redact_secrets(request.to_json()),
+                "handle": None,
+                "result": None,
+            },
+            job_id=request.job_id,
+        )
+
+    def record_provider_handle(self, handle: JobHandle) -> None:
+        operation = self.provider_operation(handle.job_id)
+        if operation is None:
+            raise ValueError("provider handle requires a durable operation intent")
+        operation["state"] = "submitted"
+        operation["handle"] = handle.to_json()
+        _upsert_jsonl(
+            self.run_dir / "provider_operations.jsonl",
+            operation,
+            job_id=handle.job_id,
+        )
+
+    def record_provider_result(self, result: JobResult) -> None:
+        operation = self.provider_operation(result.handle.job_id)
+        if operation is None:
+            raise ValueError("provider result requires a durable operation intent")
+        operation["state"] = "completed"
+        operation["handle"] = result.handle.to_json()
+        operation["result"] = result.to_redacted_json()
+        _upsert_jsonl(
+            self.run_dir / "provider_operations.jsonl",
+            operation,
+            job_id=result.handle.job_id,
+        )
+
     def artifact_ref(
         self,
         relative: str,
@@ -152,7 +221,9 @@ def _upsert_jsonl(
 ) -> None:
     existing = read_jsonl(path) if path.is_file() else []
     retained = [item for item in existing if _provider_log_job_id(item) != job_id]
-    write_jsonl(path, [*retained, row])
+    temporary = path.with_name("." + path.name + ".tmp")
+    write_jsonl(temporary, [*retained, row])
+    temporary.replace(path)
 
 
 def _provider_log_job_id(row: dict[str, Any]) -> str | None:

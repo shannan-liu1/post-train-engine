@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import random
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,12 +16,10 @@ from post_train_engine.api_schemas import (
     EvalExampleRecord,
     EvalResult,
     HillClimbConfig,
-    JobHandle,
     JobRequest,
     JobResult,
     ProviderSpec,
     is_chat_completions_provider_type,
-    redact_secret_text,
 )
 from post_train_engine.artifact_store import ArtifactStore
 from post_train_engine.engine import (
@@ -47,6 +44,7 @@ from post_train_engine.evidence_safety import (
 from post_train_engine.providers.base import RemoteProvider
 from post_train_engine.providers.fake import FakeInferenceProvider, FakePromptAdapterProvider
 from post_train_engine.providers.openai_compatible import OpenAICompatibleProvider
+from post_train_engine.provider_operations import execute_provider_operation
 from post_train_engine.traces import TraceRecord, build_rollout_group, stable_prompt_hash
 from post_train_engine.training_views import (
     TrainingViewArtifact,
@@ -201,6 +199,7 @@ def _compile_api_hillclimb(
         "max_token_increase_ratio": cfg.promotion.max_token_increase_ratio,
     }
     plan = RunPlan(
+        certification_mode=cfg.run.certification_mode,
         run_id=cfg.run.run_id,
         candidate_id=candidate.candidate_id,
         parent_candidate_id=resolved.baseline.candidate_id,
@@ -247,6 +246,7 @@ def _compile_api_hillclimb(
             promotion_verifier_id="gsm8k-exact-answer-v1",
         ),
         promotion_gate=promotion_gate,
+        campaign=cfg.run.campaign,
         metadata={
             "execution_mode": "api_hillclimb",
             "dataset": {
@@ -561,6 +561,7 @@ class _APIHillClimbAdapter:
                 "final_report_md": "final_report.md",
                 "provider_requests": "provider_requests.jsonl",
                 "provider_responses": "provider_responses.jsonl",
+                "provider_operations": "provider_operations.jsonl",
             },
             values={"decision": decision["decision"]},
         )
@@ -801,42 +802,13 @@ def _run_provider_job(
     timeout_seconds: float = 300.0,
     poll_interval_seconds: float = 0.05,
 ) -> JobResult:
-    store.append_provider_request(request)
-    try:
-        handle = provider.submit_job(request)
-        start = time.monotonic()
-        while True:
-            status = provider.poll_job(handle)
-            if status.terminal:
-                break
-            if time.monotonic() - start > timeout_seconds:
-                raise TimeoutError(f"provider job timed out: {handle.provider_job_id}")
-            time.sleep(poll_interval_seconds)
-        if status.state != "succeeded":
-            raise RuntimeError(
-                f"provider job failed closed: {handle.provider_job_id}: {status.message}",
-            )
-        result = provider.fetch_result(handle)
-        _validate_provider_result(handle, result)
-    except Exception as exc:
-        store.append_provider_error(request, exc)
-        raise RuntimeError(
-            f"provider job failed closed: {request.job_id}: {redact_secret_text(str(exc))}",
-        ) from exc
-    store.append_provider_response(result)
-    return result
-
-
-def _validate_provider_result(handle: JobHandle, result: JobResult) -> None:
-    if (
-        result.handle.job_id != handle.job_id
-        or result.handle.job_type != handle.job_type
-        or result.handle.provider_id != handle.provider_id
-        or result.handle.provider_job_id != handle.provider_job_id
-    ):
-        raise RuntimeError("provider result handle mismatch")
-    if result.status.state != "succeeded":
-        raise RuntimeError(f"provider result failed closed: {result.status.message}")
+    return execute_provider_operation(
+        provider=provider,
+        store=store,
+        request=request,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
 
 
 def _validate_adapted_candidate(candidate: Candidate, baseline: Candidate) -> None:

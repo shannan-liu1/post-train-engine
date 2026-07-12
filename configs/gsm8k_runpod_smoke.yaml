@@ -5,9 +5,10 @@ execution:
   gpu_type: NVIDIA A40
   gpu_count: 2
   container_image: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
-  disk_gb: 100
+  disk_gb: 50
   volume_gb: 0
 run:
+  certification_mode: non_certifying_smoke
   run_id: gsm8k-runpod-smoke
   output_dir: runs/gsm8k-runpod-smoke
   seed: 42

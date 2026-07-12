@@ -13,6 +13,7 @@ from post_train_engine.task_adapters import ExactMathRunAdapter
 
 def test_second_executable_verifier_task_runs_through_engine(tmp_path: Path) -> None:
     plan = RunPlan(
+        certification_mode="non_certifying_smoke",
         run_id="exact-math-1",
         candidate_id="exact-math-candidate-1",
         parent_candidate_id="seed",
@@ -70,5 +71,6 @@ def test_second_executable_verifier_task_runs_through_engine(tmp_path: Path) -> 
     execution = RunEngine().execute(plan, ExactMathRunAdapter())
 
     assert execution.manifest.task_name == "exact_math_tool"
-    assert execution.manifest.status == "promoted"
+    assert execution.manifest.status == "rejected"
+    assert execution.manifest.metadata["certification_mode"] == "non_certifying_smoke"
     assert execution.manifest.metadata["cost_usd"] == 0.0

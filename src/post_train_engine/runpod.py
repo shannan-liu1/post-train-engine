@@ -229,6 +229,43 @@ def write_runpod_plan(
     return plan
 
 
+def build_runpod_create_request(
+    plan: dict[str, Any],
+    *,
+    pod_name: str,
+) -> dict[str, Any]:
+    """Compile a dry-run plan into the sole authorized REST create shape."""
+
+    if not pod_name:
+        raise ValueError("pod_name must be non-empty")
+    if plan.get("provider") != "runpod" or plan.get("will_submit") is not False:
+        raise ValueError("RunPod create request requires a validated dry-run plan")
+    environment = plan.get("environment")
+    if not isinstance(environment, dict):
+        raise ValueError("RunPod plan environment must be a mapping")
+    allowed_cuda_versions = environment.get("allowed_cuda_versions")
+    if allowed_cuda_versions != [
+        cuda_version_from_image(str(environment.get("image")))
+    ]:
+        raise ValueError("RunPod plan CUDA filter does not match its image")
+    return {
+        "name": pod_name,
+        "allowedCudaVersions": list(allowed_cuda_versions),
+        "cloudType": "SECURE",
+        "computeType": "GPU",
+        "containerDiskInGb": int(environment["container_disk_gb"]),
+        "globalNetworking": True,
+        "gpuCount": int(environment["gpu_count"]),
+        "gpuTypeIds": [str(environment["gpu_type"])],
+        "gpuTypePriority": "availability",
+        "imageName": str(environment["image"]),
+        "interruptible": False,
+        "ports": ["22/tcp"],
+        "supportPublicIp": True,
+        "volumeInGb": int(environment["volume_gb"]),
+    }
+
+
 def _runpod_execution_from_config(
     config_path: str | Path | None,
 ) -> dict[str, Any] | None:
@@ -323,6 +360,7 @@ def _write_json(path: Path, body: dict[str, Any]) -> None:
 
 
 __all__ = [
+    "build_runpod_create_request",
     "cuda_version_from_image",
     "validate_cuda_runtime",
     "write_runpod_plan",

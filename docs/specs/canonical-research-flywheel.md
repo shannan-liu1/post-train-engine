@@ -6,7 +6,7 @@ Owner: repository user
 
 Tracking authority: this document
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
 ## Problem Statement
 
@@ -75,6 +75,30 @@ The campaign control plane records hypotheses, proposals, comparison groups, bud
 - Local evidence remains authoritative. External experiment trackers may mirror it.
 - A second executable-verifier task will prove task extensibility before broad plugin work.
 
+## Working And Epistemic Principles
+
+These rules constrain implementation and experiment selection. They are decision
+rules, not slogans.
+
+1. Name the owner and evidence for every requirement. Delete requirements that do
+   not protect truth, money, safety, or recoverability.
+2. Delete before simplifying. Simplify before accelerating. Accelerate before
+   automating. A deleted stage is the cheapest and most reliable stage.
+3. Start from provider and machine constraints, not inherited repository shapes.
+   Never preserve an interface solely because it already exists.
+4. Every ExperimentProposal states a problem, a causal explanation, the details
+   that make that explanation hard to vary, a risky prediction, and a criticism
+   that would reject it.
+5. Evidence criticizes competing explanations. A passing metric does not prove a
+   mechanism; promotion requires the declared prediction and all regression gates.
+6. Negative results update the explanation and planner. They do not trigger ad hoc
+   metric, split, or hypothesis changes.
+7. Prefer one decisive experiment over many weak experiments. Optimize expected
+   information gain per dollar only after validity constraints pass.
+8. Automate only a demonstrated, stable loop. Human or agent review remains at
+   boundaries where the provider cannot supply idempotency, authoritative cost, or
+   sealed-evaluation isolation.
+
 ## Testing Decisions
 
 - Tests exercise public interfaces and complete vertical slices.
@@ -111,7 +135,7 @@ The campaign control plane records hypotheses, proposals, comparison groups, bud
 
 - [x] C1. Campaign state stores hypotheses, proposals, comparison groups, budgets, Runs, and Incumbent lineage.
 - [x] C2. Proposal hashes detect accidental duplicates.
-- [ ] C3. Renewable fenced work leases prevent duplicate concurrent execution and stale-worker commits.
+- [x] C3. Renewable fenced work leases prevent duplicate concurrent execution and stale-worker commits.
 - [x] C4. Atomic promotion prevents conflicting Incumbent updates.
 - [x] C5. Failed and rejected Runs remain queryable evidence.
 - [ ] C6. Production compilers use Run evidence to select and configure the next experiment mechanism.
@@ -186,19 +210,25 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | U-029 | Promotion compared candidate-produced artifacts without binding them to one immutable suite, protected-row content, prompt, verifier, generation, and RunPlan contract. | A candidate or adapter could change the evaluation law or substitute rows and still satisfy numeric gates. | Add a content-addressed EvalContract to RunPlan; bind protected IDs and content; require both paired artifacts, row membership, and primary metric to match it before `decide_promotion`. | implemented locally |
 | U-030 | Final Run bundles exposed per-example promotion rows and failure annotations through normal artifact surfaces. | Researchers or agents could adapt to sealed holdout content despite split separation. | Mark promotion artifacts sealed, require explicit sealed access for internal certification, redact their status paths, and omit them from normal reports. | implemented locally |
 | U-031 | Content and verifier separation checks existed as isolated helpers and tests, while replay records lacked a canonical role-aware query path. | Training could bypass leakage checks through a non-TrainingView evidence path. | Require validated content and verifier separation certificates in every RunPlan and persisted manifest; expose only train, probe, and replay traces through the canonical training query. | implemented locally |
-| U-032 | Stage receipts referenced mutable paths rather than immutable output hashes, and provider side effects can complete before receipt durability. | Resume could accept changed outputs or duplicate paid work. | Stage receipts now bind every output file to SHA-256 and every receipt read revalidates bytes. Add transactional provider idempotency keys with reconciliation tests. | partial, local byte integrity implemented |
-| U-033 | Campaign, budget, exposure, and next-experiment fields are optional primitives that production compilers do not consistently populate. | Runs can bypass the research flywheel while appearing canonical. | Make production config compilation emit a complete campaign and evidence contract or an explicit non-certifying local-smoke plan. | open, campaign integration |
-| U-034 | Work leases have no renewal heartbeat or fencing token, and finalization does not recheck measured cost against the reserved budget. | A stale worker can commit after lease expiry or overspend a campaign reservation. | Add renewable monotonic fencing and an atomic measured-cost settlement gate. | open, multi-agent control |
-| U-035 | RunPod cost evidence uses configured heuristics rather than provider receipts, and provider rates may already represent the total Pod rate. | Cost reports can double-count GPUs or certify an incorrect spend. | Ingest authoritative create and billing receipts; label estimates non-certifying and never multiply an already-total rate. | open, cost evidence |
-| U-036 | A distributed rank can fail while writing or exchanging a receipt after the last coordinated error check. | Peers can block indefinitely or finalize incomplete evidence. | Add time-bounded collective receipt commits and fault-injection at every post-stage persistence boundary. | open, distributed runtime |
+| U-032 | Stage receipts referenced mutable paths rather than immutable output hashes, and provider side effects can complete before receipt durability. | Resume could accept changed outputs or duplicate paid work. | Stage receipts bind output bytes; provider operations persist intent, reconcile replay-safe jobs, and fail ambiguous non-replayable jobs. | implemented locally |
+| U-033 | Campaign, budget, exposure, and next-experiment fields were optional primitives that production compilers did not consistently populate. | Runs could bypass the research flywheel while appearing canonical. | Require explicit non-certifying smoke mode or a complete fenced campaign binding; make smoke decisions reject promotion. | implemented locally |
+| U-034 | Work leases had no renewal heartbeat or fencing token, and finalization did not recheck measured cost against the reserved budget. | A stale worker could commit after lease expiry or overspend a campaign reservation. | Add renewable monotonic fencing, actual-cost rechecks, and two-phase provider billing settlement. | implemented locally |
+| U-035 | RunPod cost evidence used configured heuristics rather than provider receipts, and provider rates may already represent the total Pod rate. | Cost reports could double-count GPUs or certify an incorrect spend. | Use the create-response total Pod rate for deadlines; keep campaign promotion pending until a hashed billing receipt settles actual total cost. | control plane implemented locally; remote receipt pending |
+| U-036 | A distributed rank can fail while writing or exchanging a receipt after the last coordinated error check. | Peers can block indefinitely or finalize incomplete evidence. | Add one plan timeout to preparation and stage barriers; retain fault injection at post-stage persistence boundaries. | partial; bounded barriers implemented locally |
 | U-037 | The project had no lockfile, dependencies floated, and Muon resolved from a mutable Git branch. | A commit could not reproduce its Python or optimizer environment. | Commit a cross-platform lock and pin Git dependencies to reviewed immutable commits before production certification. | implemented locally |
 | U-038 | API and RunPod compilers perform dataset loading and other consequential work before RunEngine begins. | The canonical stage machine does not own all mutable or costly execution. | Move consequential preparation behind typed RunEngine stages and keep compilers pure. | open, canonical path |
 | U-039 | Trace, report, diagnostic, and upload-plan readers did not all share a containment and byte-integrity guard. | A crafted artifact could escape the Run root or consume changed external data. | Require stage artifacts to remain inside the Run root before entering prior state; verify receipt hashes on every resume; route manifest consumers through `RunBundle.verified_artifact_path`. | implemented locally |
-| U-040 | The repository lacked CI and still lacks a declared license. | Future changes could merge without the local evidence gate, and reuse terms remain ambiguous. | Enforce the locked test, Ruff, build, and secret-scan gates in CI; the owner must select the license explicitly. | partial; CI implemented, license pending owner choice |
+| U-040 | The repository lacked CI and a declared license. | Future changes could merge without the local evidence gate, and reuse terms remained ambiguous. | Enforce locked tests, Ruff, build, and secret scanning in CI; declare Apache-2.0. | implemented locally |
 | U-041 | A valid ownership marker did not prevent overwrite or retention code from traversing a Windows junction. | Cleanup could remove files outside the intended managed tree. | Reject symlinks and junctions at ArtifactStore overwrite, lifecycle pruning, and checkpoint-retention boundaries; cover simulated junctions in tests. | implemented locally |
 | U-042 | The two-A40 smoke config requested a persistent volume despite a bounded ephemeral benchmark attempt. | Retained storage can outlive compute teardown and weaken the spend and data-retention boundary. | Set `volume_gb: 0` in the smoke config and assert that the canonical RunPod plan derives zero persistent volume. | implemented locally |
 | U-043 | Local private-repository access did not prove that the execution boundary permitted sending a PAT to a third-party Pod. | A paid Pod could pass hardware gates but remain unable to receive its exact source commit. | Require anonymous access to the exact public commit before allocation, or use an independently proven credential transport for a private repository. | resolved by verified anonymous public access |
 | U-044 | A REST-created Pod did not expose `RUNPOD_POD_ID`, and a Windows read/write-only private-key ACL prevented deletion. | The deletion watchdog can target an empty ID, and teardown can retain sensitive key material. | Bind the literal create-response Pod ID, verify Pod-side API authentication, grant local key deletion permission, and assert key absence during teardown. | operational procedure implemented |
+| U-045 | RunPod and synchronous chat-completion APIs do not document a universal idempotency key or durable result lookup. | A crash after provider completion but before local receipt durability can duplicate paid work. | Persist operation intent before submission; reconcile RunPod by deterministic Pod name and replay-safe providers by durable handle; fail ambiguity instead of resubmitting. | implemented locally |
+| U-046 | RunPod billing history is time-bucketed and can settle after Pod teardown. | Immediate local estimates can be mistaken for authoritative final spend. | Record `pending_settlement`, reserve campaign budget, and block Incumbent mutation until a hashed provider billing receipt atomically settles cost and the bundle. | implemented locally; remote receipt pending |
+| U-047 | Agents sharing one operating-system identity can bypass RunBundle visibility and read local sealed files directly. | Interface-level sealing cannot prevent adaptive holdout leakage in an adversarial agent population. | Keep protected suites outside worker-readable Run roots and evaluate through a separate authority that returns aggregate signed evidence. | accepted threat model, implementation pending |
+| U-048 | SQLite coordinates one local authority but is not a multi-host consensus system. | Treating it as distributed consensus can permit split-brain claims across machines or network filesystems. | Certify SQLite only for one host and one database authority; preserve an explicit control-plane adapter seam for later multi-host deployment. | accepted scope boundary |
+| U-049 | The lock selected Pydantic 1 even though the code requires Pydantic 2, and an unused vLLM extra forced an obsolete CUDA build on Windows. | A locked clean environment failed during test collection and could not reproduce local evidence. | Require `pydantic>=2,<3`; delete speculative vLLM extras until an output-equivalent benchmark justifies them; refresh the lock. | implemented locally |
+| U-050 | Checked-in 300-step RunPod configs could spend materially without campaign authority. | A researcher or agent could run an expensive non-certifying experiment by mistake. | Delete executable 300-step defaults; retain one one-step, two-A40, ephemeral smoke. Generate full configs only from claimed proposals. | implemented locally |
 
 ## Progress Ledger
 
@@ -209,11 +239,11 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | 2. Sealed evaluation and strict promotion | partial | F5-F8 | EvaluationRoles, one PromotionDecision, EvalContract bindings for protected IDs and content across all compilers, runtime row-membership checks, sealed promotion artifacts and evaluate receipts excluded from normal surfaces, and mandatory content and verifier separation certificates persisted with every plan | Complete suite-rotation bridge evidence |
 | 3. Canonical RunEngine | partial | F9-F11, F14 | One config dispatcher, shared stage order, central manifest and promotion, and removal of shadow orchestration | Move consequential compiler and adapter preparation behind engine stages |
 | 4. Evidence-backed training | partial | F12-F13, F15 | MethodTrainingRequest, consumption-time TrainingView hash checks, policy-versioned GRPO traces, a role-aware training trace query that excludes sealed evaluation roles, measured frontier selection, and semantic RunBundle GRPO validation | Bind replay sampling decisions to explicit policy lineage and measured outcomes |
-| 5. Campaign control plane | partial | C1-C7 | SQLite proposal, budget, outcome, exposure, planner, CAS tests, atomic finalization, and corrected exposure accounting for pre-evaluation failures | Wire all production compilers and add renewable fenced leases and measured-cost settlement |
-| 6. Cost and runtime | in progress | R1-R4 | Explicit missing-cost state, efficiency summary, cache primitives, output-equivalence tests, dynamic CUDA-image validation, exact hardware attestation, ephemeral smoke storage, a cross-platform lock, immutable Muon identity, and a bounded attempt that verified 2x A40 with Torch CUDA 12.8 before source authentication failed closed | Rerun R4 anonymously from the exact public commit after the local certification slices are pushed |
+| 5. Campaign control plane | partial | C1-C7 | Explanation-bound proposals, renewable fenced leases, actual-cost rechecks, two-phase provider settlement, atomic Incumbent CAS, exposure accounting, and explicit compiler certification modes | Add automatic proposal-to-config materialization after pure compiler work |
+| 6. Cost and runtime | in progress | R1-R4 | Hard $1.50 control-plane policy, exact Secure 2xA40 ephemeral request, create-rate deadline, delayed billing receipts, corrected lock, output-equivalence tests, and dynamic CUDA validation | Push the exact reviewed commit, then run R4 and only the one-step smoke if R4 passes |
 | 7. Extensibility | partial | E1-E3 | Exact-math engine task and typed SFT, DPO, GRPO, OPD, and OPSD contracts | Prove executable production paths rather than isolated contract surfaces |
-| 8. Agent and distributed scale | foundation only | R5-R6, E4-E5 | Lease, topology, staleness, and composition primitives with local tests | Add fencing, renewal, production compiler wiring, and distributed fault injection before scale claims |
-| 9. Final compliance and fresh-eyes review | in progress | All criteria | Foundation commit `05f52b0`; adversarial review reopened U-029 through U-040; CI now enforces locked tests, Ruff, build, and secret scanning | Complete production-certification risks and add the owner-selected license |
+| 8. Agent and distributed scale | partial | R5-R6, E4-E5 | Renewable fenced leases, one-host authority scope, topology and staleness contracts, composition proposals, and bounded stage barriers | Finish post-receipt fault injection; add multi-host consensus only when required |
+| 9. Final compliance and fresh-eyes review | in progress | All criteria | Apache-2.0, locked tests, Ruff, build, secret scanning, and the adversarial risk register | Complete fresh-eyes review and preserve honest external blockers |
 
 ## Research Decisions
 

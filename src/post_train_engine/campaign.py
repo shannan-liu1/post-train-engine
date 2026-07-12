@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -11,6 +12,31 @@ from dataclasses import asdict, dataclass
 from math import isfinite
 from pathlib import Path
 from typing import Any, Iterator, Literal
+
+
+@dataclass(frozen=True)
+class ExperimentExplanation:
+    problem_statement: str
+    causal_explanation: str
+    hard_to_vary_details: tuple[str, ...]
+    risky_prediction: str
+    rejection_criterion: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "problem_statement",
+            "causal_explanation",
+            "risky_prediction",
+            "rejection_criterion",
+        ):
+            if not getattr(self, name).strip():
+                raise ValueError(f"explanation {name} must be non-empty")
+        if not self.hard_to_vary_details:
+            raise ValueError("explanation hard_to_vary_details must be non-empty")
+        if any(not detail.strip() for detail in self.hard_to_vary_details):
+            raise ValueError("explanation hard_to_vary_details must contain non-empty values")
+        if len(set(self.hard_to_vary_details)) != len(self.hard_to_vary_details):
+            raise ValueError("explanation hard_to_vary_details must be unique")
 
 
 @dataclass(frozen=True)
@@ -23,6 +49,7 @@ class ExperimentProposal:
     comparison_group_id: str
     comparison_axis: str
     parameters: dict[str, Any]
+    explanation: ExperimentExplanation
     mechanism_parent_ids: tuple[str, ...] = ()
     estimated_cost_usd: float = 0.0
 
@@ -96,6 +123,7 @@ class WorkLease:
     proposal_id: str
     worker_id: str
     expires_at: float
+    fence_token: int
 
 
 @dataclass(frozen=True)
@@ -112,9 +140,54 @@ class ExperimentRecommendation:
         "task_expansion",
     ]
     rationale: str
+    problem_statement: str | None = None
+    causal_explanation: str | None = None
+    hard_to_vary_details: tuple[str, ...] = ()
+    risky_prediction: str | None = None
+    rejection_criterion: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"category": self.category, "rationale": self.rationale}
+    def __post_init__(self) -> None:
+        if not self.rationale:
+            raise ValueError("recommendation rationale must be non-empty")
+        if self.problem_statement is None:
+            object.__setattr__(
+                self,
+                "problem_statement",
+                f"Run evidence selects {self.category} as the unresolved problem class.",
+            )
+        if self.causal_explanation is None:
+            object.__setattr__(self, "causal_explanation", self.rationale)
+        if not self.hard_to_vary_details:
+            object.__setattr__(
+                self,
+                "hard_to_vary_details",
+                (f"evidence_category:{self.category}", f"mechanism:{self.category}"),
+            )
+        if self.risky_prediction is None:
+            object.__setattr__(
+                self,
+                "risky_prediction",
+                f"A controlled {self.category} intervention fixes the named failure "
+                "while every protected gate remains passing.",
+            )
+        if self.rejection_criterion is None:
+            object.__setattr__(
+                self,
+                "rejection_criterion",
+                "Reject the explanation if the named failure does not improve, any "
+                "protected gate regresses, or the comparison contract changes.",
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "rationale": self.rationale,
+            "problem_statement": self.problem_statement,
+            "causal_explanation": self.causal_explanation,
+            "hard_to_vary_details": list(self.hard_to_vary_details),
+            "risky_prediction": self.risky_prediction,
+            "rejection_criterion": self.rejection_criterion,
+        }
 
 
 def recommend_from_run(
@@ -232,8 +305,8 @@ class CampaignStore:
                     proposal_id, campaign_id, hypothesis_id, proposal_hash,
                     method, task_name, parent_candidate_id, comparison_group_id,
                     comparison_axis, parameters_json, mechanism_parent_ids_json,
-                    estimated_cost_usd, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    estimated_cost_usd, explanation_json, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """,
                 (
                     proposal_id,
@@ -248,9 +321,26 @@ class CampaignStore:
                     _json(proposal.parameters),
                     _json(sorted(proposal.mechanism_parent_ids)),
                     proposal.estimated_cost_usd,
+                    _json(asdict(proposal.explanation)),
                 ),
             )
         return proposal_id
+
+    def get_proposal_explanation(self, proposal_id: str) -> ExperimentExplanation:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT explanation_json FROM proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown proposal: {proposal_id}")
+        raw = json.loads(str(row[0]))
+        if not isinstance(raw, dict):
+            raise ValueError("proposal explanation must be a JSON object")
+        details = raw.get("hard_to_vary_details")
+        if isinstance(details, list):
+            raw["hard_to_vary_details"] = tuple(str(item) for item in details)
+        return ExperimentExplanation(**raw)
 
     def claim_proposal(
         self,
@@ -309,16 +399,69 @@ class CampaignStore:
                 """,
                 (campaign_id,),
             ).fetchone()
-            if int(completed_runs) + int(active_runs) + 1 > int(quality_budget):
+            pending_runs, pending_cost = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                FROM pending_settlements s
+                JOIN proposals p ON p.proposal_id = s.proposal_id
+                WHERE p.campaign_id = ? AND s.settled_at IS NULL
+                """,
+                (campaign_id,),
+            ).fetchone()
+            if (
+                int(completed_runs) + int(active_runs) + int(pending_runs) + 1
+                > int(quality_budget)
+            ):
                 raise ValueError("quality budget exceeded")
-            accounted_cost = float(completed_cost) + float(active_cost)
+            accounted_cost = (
+                float(completed_cost) + float(active_cost) + float(pending_cost)
+            )
             if accounted_cost + estimated_cost_usd > float(cost_budget_usd):
                 raise ValueError("cost budget exceeded")
             connection.execute(
-                "INSERT INTO leases VALUES (?, ?, ?)",
-                (proposal_id, worker_id, expires),
+                "UPDATE proposals SET lease_generation = lease_generation + 1 "
+                "WHERE proposal_id = ?",
+                (proposal_id,),
             )
-        return WorkLease(proposal_id, worker_id, expires)
+            fence_token = int(
+                connection.execute(
+                    "SELECT lease_generation FROM proposals WHERE proposal_id = ?",
+                    (proposal_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "INSERT INTO leases VALUES (?, ?, ?, ?)",
+                (proposal_id, worker_id, expires, fence_token),
+            )
+        return WorkLease(proposal_id, worker_id, expires, fence_token)
+
+    def renew_lease(
+        self,
+        proposal_id: str,
+        *,
+        worker_id: str,
+        fence_token: int,
+        ttl_seconds: int,
+    ) -> WorkLease:
+        if ttl_seconds <= 0:
+            raise ValueError("lease ttl_seconds must be positive")
+        now = time.time()
+        expires = now + ttl_seconds
+        with self._transaction() as connection:
+            lease = connection.execute(
+                "SELECT worker_id, expires_at, fence_token FROM leases "
+                "WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if lease is None or lease[0] != worker_id or float(lease[1]) <= now:
+                raise ValueError("active proposal lease is required for renewal")
+            if int(lease[2]) != fence_token:
+                raise ValueError("proposal lease fencing token is stale")
+            connection.execute(
+                "UPDATE leases SET expires_at = ? WHERE proposal_id = ?",
+                (expires, proposal_id),
+            )
+        return WorkLease(proposal_id, worker_id, expires, fence_token)
 
     def get_outcome(self, proposal_id: str) -> ProposalOutcome:
         with self._connect() as connection:
@@ -339,6 +482,7 @@ class CampaignStore:
         campaign_id: str,
         proposal_id: str,
         worker_id: str,
+        fence_token: int,
         expected_incumbent_candidate_id: str,
         candidate_id: str,
         outcome: ProposalOutcome,
@@ -385,11 +529,59 @@ class CampaignStore:
                     "proposal parent does not match the expected Incumbent"
                 )
             lease = connection.execute(
-                "SELECT worker_id, expires_at FROM leases WHERE proposal_id = ?",
+                "SELECT worker_id, expires_at, fence_token FROM leases WHERE proposal_id = ?",
                 (proposal_id,),
             ).fetchone()
             if lease is None or lease[0] != worker_id or float(lease[1]) <= time.time():
                 raise ValueError("active proposal lease is required to finalize a Run")
+            if int(lease[2]) != fence_token:
+                raise ValueError("proposal lease fencing token is stale")
+            if outcome.cost_usd is None:
+                raise ValueError("measured cost is required to finalize a campaign Run")
+            cost_budget_usd = float(
+                connection.execute(
+                    "SELECT cost_budget_usd FROM campaigns WHERE campaign_id = ?",
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            completed_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(COALESCE(o.cost_usd, p.estimated_cost_usd)), 0.0)
+                    FROM outcomes o
+                    JOIN proposals p ON p.proposal_id = o.proposal_id
+                    WHERE p.campaign_id = ?
+                    """,
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            other_active_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                    FROM leases l
+                    JOIN proposals p ON p.proposal_id = l.proposal_id
+                    WHERE p.campaign_id = ? AND p.proposal_id != ?
+                    """,
+                    (campaign_id, proposal_id),
+                ).fetchone()[0]
+            )
+            pending_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                    FROM pending_settlements s
+                    JOIN proposals p ON p.proposal_id = s.proposal_id
+                    WHERE p.campaign_id = ? AND s.settled_at IS NULL
+                    """,
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            if (
+                completed_cost + other_active_cost + pending_cost + outcome.cost_usd
+                > cost_budget_usd
+            ):
+                raise ValueError("measured cost budget exceeded at finalization")
             if promotion_suite_id is not None:
                 exposure_count = int(
                     connection.execute(
@@ -448,6 +640,252 @@ class CampaignStore:
             )
             connection.execute("DELETE FROM leases WHERE proposal_id = ?", (proposal_id,))
 
+    def stage_run_settlement(
+        self,
+        *,
+        campaign_id: str,
+        proposal_id: str,
+        worker_id: str,
+        fence_token: int,
+        expected_incumbent_candidate_id: str,
+        candidate_id: str,
+        provider_resource_id: str,
+        outcome: ProposalOutcome,
+        promotion_suite_id: str | None = None,
+        promotion_suite_version: str | None = None,
+        max_suite_exposures: int | None = None,
+    ) -> None:
+        if outcome.cost_usd is not None:
+            raise ValueError("pending provider settlement cannot include cost_usd")
+        if not provider_resource_id:
+            raise ValueError("provider_resource_id must be non-empty")
+        suite_values = (
+            promotion_suite_id,
+            promotion_suite_version,
+            max_suite_exposures,
+        )
+        if any(value is not None for value in suite_values) and not all(
+            value is not None for value in suite_values
+        ):
+            raise ValueError("promotion suite binding requires id, version, and max exposures")
+        with self._transaction() as connection:
+            existing = connection.execute(
+                """
+                SELECT campaign_id, run_id, provider_resource_id, candidate_id, status, decision,
+                       failure_category, primary_delta,
+                       expected_incumbent_candidate_id
+                FROM pending_settlements WHERE proposal_id = ?
+                """,
+                (proposal_id,),
+            ).fetchone()
+            expected = (
+                campaign_id,
+                outcome.run_id,
+                provider_resource_id,
+                candidate_id,
+                outcome.status,
+                outcome.decision,
+                outcome.failure_category,
+                outcome.primary_delta,
+                expected_incumbent_candidate_id,
+            )
+            if existing is not None:
+                if tuple(existing) != expected:
+                    raise ValueError("existing pending settlement differs from Run evidence")
+                return
+            proposal = connection.execute(
+                "SELECT campaign_id, state, parent_candidate_id FROM proposals "
+                "WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal is None or proposal[0] != campaign_id:
+                raise ValueError("proposal does not belong to campaign")
+            if proposal[1] != "pending":
+                raise ValueError("proposal is not pending")
+            if str(proposal[2]) != expected_incumbent_candidate_id:
+                raise ValueError("proposal parent does not match the expected Incumbent")
+            lease = connection.execute(
+                "SELECT worker_id, expires_at, fence_token FROM leases "
+                "WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if lease is None or lease[0] != worker_id or float(lease[1]) <= time.time():
+                raise ValueError("active proposal lease is required to stage settlement")
+            if int(lease[2]) != fence_token:
+                raise ValueError("proposal lease fencing token is stale")
+            if promotion_suite_id is not None:
+                exposure_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM suite_exposures
+                        WHERE campaign_id = ? AND suite_id = ? AND suite_version = ?
+                        """,
+                        (campaign_id, promotion_suite_id, promotion_suite_version),
+                    ).fetchone()[0]
+                )
+                if exposure_count >= int(max_suite_exposures):
+                    raise ValueError(
+                        f"promotion suite rotation required after {exposure_count} exposures"
+                    )
+                connection.execute(
+                    "INSERT INTO suite_exposures VALUES (?, ?, ?, ?, ?)",
+                    (
+                        campaign_id,
+                        promotion_suite_id,
+                        promotion_suite_version,
+                        candidate_id,
+                        time.time(),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO pending_settlements(
+                    proposal_id, campaign_id, run_id, provider_resource_id,
+                    expected_incumbent_candidate_id, candidate_id, status, decision,
+                    failure_category, primary_delta, staged_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    campaign_id,
+                    outcome.run_id,
+                    provider_resource_id,
+                    expected_incumbent_candidate_id,
+                    candidate_id,
+                    outcome.status,
+                    outcome.decision,
+                    outcome.failure_category,
+                    outcome.primary_delta,
+                    time.time(),
+                ),
+            )
+            connection.execute(
+                "UPDATE proposals SET state = 'settlement_pending' WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+            connection.execute("DELETE FROM leases WHERE proposal_id = ?", (proposal_id,))
+
+    def settle_run(
+        self,
+        proposal_id: str,
+        *,
+        provider_resource_id: str,
+        billed_cost_usd: float,
+        billing_receipt_sha256: str,
+    ) -> None:
+        if (
+            type(billed_cost_usd) is bool
+            or not isinstance(billed_cost_usd, int | float)
+            or not isfinite(float(billed_cost_usd))
+            or billed_cost_usd < 0
+        ):
+            raise ValueError("billed_cost_usd must be finite and non-negative")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", billing_receipt_sha256) is None:
+            raise ValueError("billing receipt must use sha256:<64 hex chars>")
+        with self._transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT campaign_id, run_id, provider_resource_id,
+                       expected_incumbent_candidate_id, candidate_id, status,
+                       decision, failure_category, primary_delta, settled_at,
+                       billed_cost_usd, billing_receipt_sha256
+                FROM pending_settlements WHERE proposal_id = ?
+                """,
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"proposal has no pending settlement: {proposal_id}")
+            if str(row[2]) != provider_resource_id:
+                raise ValueError("billing receipt belongs to a different provider resource")
+            if row[9] is not None:
+                if float(row[10]) != float(billed_cost_usd) or row[11] != billing_receipt_sha256:
+                    raise ValueError("existing billing settlement differs from receipt")
+                return
+            campaign_id = str(row[0])
+            cost_budget_usd = float(
+                connection.execute(
+                    "SELECT cost_budget_usd FROM campaigns WHERE campaign_id = ?",
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            completed_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(o.cost_usd), 0.0)
+                    FROM outcomes o JOIN proposals p ON p.proposal_id = o.proposal_id
+                    WHERE p.campaign_id = ?
+                    """,
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            active_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                    FROM leases l JOIN proposals p ON p.proposal_id = l.proposal_id
+                    WHERE p.campaign_id = ?
+                    """,
+                    (campaign_id,),
+                ).fetchone()[0]
+            )
+            other_pending_cost = float(
+                connection.execute(
+                    """
+                    SELECT COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                    FROM pending_settlements s
+                    JOIN proposals p ON p.proposal_id = s.proposal_id
+                    WHERE p.campaign_id = ? AND s.settled_at IS NULL
+                      AND s.proposal_id != ?
+                    """,
+                    (campaign_id, proposal_id),
+                ).fetchone()[0]
+            )
+            if completed_cost + active_cost + other_pending_cost + billed_cost_usd > cost_budget_usd:
+                raise ValueError("measured cost budget exceeded at settlement")
+            outcome = ProposalOutcome(
+                run_id=str(row[1]),
+                status=str(row[5]),
+                decision=str(row[6]),
+                failure_category=None if row[7] is None else str(row[7]),
+                cost_usd=float(billed_cost_usd),
+                primary_delta=None if row[8] is None else float(row[8]),
+            )
+            connection.execute(
+                "INSERT INTO outcomes VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    proposal_id,
+                    outcome.run_id,
+                    outcome.status,
+                    outcome.decision,
+                    outcome.failure_category,
+                    outcome.cost_usd,
+                    outcome.primary_delta,
+                ),
+            )
+            if outcome.status == "promoted":
+                cursor = connection.execute(
+                    """
+                    UPDATE incumbents SET candidate_id = ?, run_id = ?,
+                        generation = generation + 1
+                    WHERE campaign_id = ? AND candidate_id = ?
+                    """,
+                    (str(row[4]), outcome.run_id, campaign_id, str(row[3])),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("incumbent changed before promotion settlement")
+            connection.execute(
+                """
+                UPDATE pending_settlements
+                SET settled_at = ?, billed_cost_usd = ?, billing_receipt_sha256 = ?
+                WHERE proposal_id = ?
+                """,
+                (time.time(), billed_cost_usd, billing_receipt_sha256, proposal_id),
+            )
+            connection.execute(
+                "UPDATE proposals SET state = 'completed' WHERE proposal_id = ?",
+                (proposal_id,),
+            )
+
     def current_incumbent(self, campaign_id: str) -> dict[str, str | int]:
         with self._connect() as connection:
             row = connection.execute(
@@ -501,11 +939,23 @@ class CampaignStore:
                 """,
                 (campaign_id, time.time()),
             ).fetchone()
+            pending_runs, pending_cost = connection.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(p.estimated_cost_usd), 0.0)
+                FROM pending_settlements s
+                JOIN proposals p ON p.proposal_id = s.proposal_id
+                WHERE p.campaign_id = ? AND s.settled_at IS NULL
+                """,
+                (campaign_id,),
+            ).fetchone()
         return {
-            "reserved_runs": int(completed_runs) + int(active_runs),
-            "reserved_cost_usd": float(completed_cost) + float(active_cost),
+            "reserved_runs": int(completed_runs) + int(active_runs) + int(pending_runs),
+            "reserved_cost_usd": (
+                float(completed_cost) + float(active_cost) + float(pending_cost)
+            ),
             "completed_runs": int(completed_runs),
             "active_leases": int(active_runs),
+            "pending_settlements": int(pending_runs),
         }
 
     def record_suite_exposure(
@@ -592,12 +1042,15 @@ class CampaignStore:
                     parameters_json TEXT NOT NULL,
                     mechanism_parent_ids_json TEXT NOT NULL,
                     estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+                    explanation_json TEXT NOT NULL,
+                    lease_generation INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS leases(
                     proposal_id TEXT PRIMARY KEY REFERENCES proposals(proposal_id),
                     worker_id TEXT NOT NULL,
-                    expires_at REAL NOT NULL
+                    expires_at REAL NOT NULL,
+                    fence_token INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS outcomes(
                     proposal_id TEXT PRIMARY KEY REFERENCES proposals(proposal_id),
@@ -622,6 +1075,22 @@ class CampaignStore:
                     exposed_at REAL NOT NULL,
                     UNIQUE(campaign_id, suite_id, suite_version, candidate_id)
                 );
+                CREATE TABLE IF NOT EXISTS pending_settlements(
+                    proposal_id TEXT PRIMARY KEY REFERENCES proposals(proposal_id),
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                    run_id TEXT NOT NULL UNIQUE,
+                    provider_resource_id TEXT NOT NULL,
+                    expected_incumbent_candidate_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    failure_category TEXT,
+                    primary_delta REAL,
+                    staged_at REAL NOT NULL,
+                    settled_at REAL,
+                    billed_cost_usd REAL,
+                    billing_receipt_sha256 TEXT
+                );
                 """
             )
             proposal_columns = {
@@ -631,6 +1100,21 @@ class CampaignStore:
             if "estimated_cost_usd" not in proposal_columns:
                 connection.execute(
                     "ALTER TABLE proposals ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0"
+                )
+            if "lease_generation" not in proposal_columns:
+                connection.execute(
+                    "ALTER TABLE proposals ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+                )
+            if "explanation_json" not in proposal_columns:
+                connection.execute(
+                    "ALTER TABLE proposals ADD COLUMN explanation_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            lease_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(leases)")
+            }
+            if "fence_token" not in lease_columns:
+                connection.execute(
+                    "ALTER TABLE leases ADD COLUMN fence_token INTEGER NOT NULL DEFAULT 0"
                 )
 
     @contextmanager
@@ -661,6 +1145,7 @@ def _json(value: Any) -> str:
 
 __all__ = [
     "CampaignStore",
+    "ExperimentExplanation",
     "ExperimentProposal",
     "ExperimentRecommendation",
     "ProposalOutcome",

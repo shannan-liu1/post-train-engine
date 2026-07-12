@@ -31,6 +31,8 @@ HttpTransport = Callable[
 class OpenAICompatibleProvider:
     """Synchronous provider over an OpenAI-compatible chat-completions endpoint."""
 
+    recovery_policy = "non_replayable"
+
     def __init__(
         self,
         *,
@@ -85,6 +87,13 @@ class OpenAICompatibleProvider:
             return self._results[handle.job_id]
         except KeyError as exc:
             raise RuntimeError(f"unknown provider job id: {handle.provider_job_id}") from exc
+
+    def reconcile_job(
+        self,
+        request: JobRequest,
+        _handle: JobHandle | None,
+    ) -> JobResult | None:
+        return self._results.get(request.job_id)
 
     def _run_generation_job(self, request: JobRequest) -> JobResult:
         candidate = Candidate.model_validate(request.payload["candidate"])

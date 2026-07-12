@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -63,7 +64,10 @@ class CampaignBinding(BaseModel):
     campaign_id: str = Field(..., min_length=1)
     proposal_id: str = Field(..., min_length=1)
     worker_id: str = Field(..., min_length=1)
+    lease_fence_token: int = Field(..., gt=0)
     expected_incumbent_candidate_id: str = Field(..., min_length=1)
+    settlement_mode: Literal["stage_measured", "provider_billing"] = "stage_measured"
+    provider_resource_id: str | None = None
     promotion_suite_id: str | None = None
     promotion_suite_version: str | None = None
     max_suite_exposures: int | None = Field(default=None, gt=0)
@@ -81,6 +85,10 @@ class CampaignBinding(BaseModel):
             raise ValueError(
                 "campaign promotion suite requires id, version, and max exposures"
             )
+        if self.settlement_mode == "provider_billing" and not self.provider_resource_id:
+            raise ValueError("provider billing settlement requires provider_resource_id")
+        if self.settlement_mode == "stage_measured" and self.provider_resource_id is not None:
+            raise ValueError("stage-measured settlement cannot name provider_resource_id")
         return self
 
 
@@ -89,6 +97,7 @@ class RunPlan(BaseModel):
 
     model_config = _FROZEN_FORBID
 
+    certification_mode: Literal["non_certifying_smoke", "certifying"]
     run_id: str = Field(..., min_length=1)
     candidate_id: str = Field(..., min_length=1)
     parent_candidate_id: str | None = None
@@ -107,6 +116,7 @@ class RunPlan(BaseModel):
     content_separation: ContentSeparationCertificate
     verifier_separation: VerifierSeparation
     max_cost_usd: float | None = Field(default=None, ge=0.0)
+    distributed_timeout_seconds: float = Field(default=120.0, gt=0.0)
     promotion_gate: dict[str, Any] = Field(default_factory=dict)
     campaign: CampaignBinding | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -140,6 +150,20 @@ class RunPlan(BaseModel):
         missing = {"model", "dataset"}.difference(self.inputs)
         if missing:
             raise ValueError("RunPlan missing core inputs: " + ", ".join(sorted(missing)))
+        if self.certification_mode == "certifying" and self.campaign is None:
+            raise ValueError("certifying RunPlan requires a campaign binding")
+        non_exact = sorted(
+            name
+            for name, identity in self.inputs.items()
+            if identity.resolution_state != "exact"
+        )
+        if self.certification_mode == "certifying" and non_exact:
+            raise ValueError(
+                "certifying RunPlan requires exact input identities: "
+                + ", ".join(non_exact)
+            )
+        if self.certification_mode == "non_certifying_smoke" and self.campaign is not None:
+            raise ValueError("non-certifying smoke RunPlan cannot bind a campaign")
         if (
             self.campaign is not None
             and self.parent_candidate_id
@@ -226,10 +250,14 @@ class RunStageAdapter(Protocol):
 class RunCoordinator(Protocol):
     is_main_process: bool
 
-    def wait(self) -> None:
+    def wait(self, timeout_seconds: float) -> None:
         """Synchronize all ranks at an engine-owned stage transition."""
 
-    def collect_errors(self, error: str | None) -> tuple[str, ...]:
+    def collect_errors(
+        self,
+        error: str | None,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
         """Collect rank-local error summaries in rank order."""
 
 
@@ -249,7 +277,7 @@ class RunEngine:
         if is_writer:
             run_dir.mkdir(parents=True, exist_ok=True)
         if coordinator is not None:
-            coordinator.wait()
+            coordinator.wait(plan.distributed_timeout_seconds)
         if manifest_path.is_file():
             bundle = RunBundle.load(run_dir)
             require_valid_run_bundle(run_dir)
@@ -265,7 +293,8 @@ class RunEngine:
                 else coordinator.collect_errors(
                     None
                     if campaign_error is None
-                    else f"{type(campaign_error).__name__}: {campaign_error}"
+                    else f"{type(campaign_error).__name__}: {campaign_error}",
+                    plan.distributed_timeout_seconds,
                 )
             )
             if campaign_error is not None:
@@ -280,7 +309,8 @@ class RunEngine:
                 stage_receipts=self._load_receipts(
                     run_dir,
                     plan,
-                    require_complete=bundle.manifest.status in {"promoted", "rejected"},
+                    require_complete=bundle.manifest.status
+                    in {"pending_settlement", "promoted", "rejected"},
                 ),
             )
         campaign_error = None
@@ -295,7 +325,8 @@ class RunEngine:
             else coordinator.collect_errors(
                 None
                 if campaign_error is None
-                else f"{type(campaign_error).__name__}: {campaign_error}"
+                else f"{type(campaign_error).__name__}: {campaign_error}",
+                plan.distributed_timeout_seconds,
             )
         )
         if campaign_error is not None:
@@ -328,7 +359,7 @@ class RunEngine:
                         ),
                     )
             if coordinator is not None:
-                coordinator.wait()
+                coordinator.wait(plan.distributed_timeout_seconds)
                 if not is_writer:
                     intent_path = run_dir / "state" / f"{stage}.intent.json"
                     intent = StageIntent.model_validate_json(
@@ -363,7 +394,8 @@ class RunEngine:
                 else coordinator.collect_errors(
                     None
                     if local_error is None
-                    else f"{type(local_error).__name__}: {local_error}"
+                    else f"{type(local_error).__name__}: {local_error}",
+                    plan.distributed_timeout_seconds,
                 )
             )
             if local_error is not None or distributed_errors:
@@ -394,7 +426,7 @@ class RunEngine:
                 )
                 _write_model_atomic(receipt_path, receipt)
             if coordinator is not None:
-                coordinator.wait()
+                coordinator.wait(plan.distributed_timeout_seconds)
                 if not is_writer:
                     receipt = self._read_receipt(receipt_path, plan, stage)
             if receipt is None:
@@ -452,7 +484,8 @@ class RunEngine:
             else coordinator.collect_errors(
                 None
                 if finalization_error is None
-                else f"{type(finalization_error).__name__}: {finalization_error}"
+                else f"{type(finalization_error).__name__}: {finalization_error}",
+                plan.distributed_timeout_seconds,
             )
         )
         if finalization_error is not None:
@@ -469,6 +502,91 @@ class RunEngine:
                 stage_receipts=tuple(receipts),
             )
         return execution
+
+    def settle_provider_billing(
+        self,
+        plan: RunPlan,
+        *,
+        receipt: Any,
+        receipt_path: str | Path,
+    ) -> RunManifest:
+        """Settle one provider-billed campaign Run and finish its bundle."""
+
+        from post_train_engine.runpod_control_plane import PodBillingReceipt
+
+        binding = plan.campaign
+        if binding is None or binding.settlement_mode != "provider_billing":
+            raise ValueError("RunPlan is not bound to provider billing settlement")
+        parsed_receipt = PodBillingReceipt.model_validate(receipt)
+        if parsed_receipt.settlement_state != "settled" or parsed_receipt.amount_usd is None:
+            raise ValueError("provider billing receipt is not settled")
+        if parsed_receipt.pod_id != binding.provider_resource_id:
+            raise ValueError("provider billing receipt belongs to a different resource")
+        run_dir = Path(plan.output_dir).resolve()
+        bundle = RunBundle.load(run_dir)
+        require_valid_run_bundle(run_dir)
+        if bundle.manifest.metadata.get("plan_hash") != plan.plan_hash:
+            raise ValueError("Run bundle does not match the settlement RunPlan")
+        path = Path(receipt_path).resolve()
+        receipt_from_disk = PodBillingReceipt.model_validate_json(
+            path.read_text(encoding="utf-8")
+        )
+        if receipt_from_disk != parsed_receipt:
+            raise ValueError("provider billing receipt file differs from supplied receipt")
+        receipt_ref = make_artifact_ref(
+            run_dir,
+            path,
+            kind="provider_billing_receipt",
+        )
+        if bundle.manifest.status in {"promoted", "rejected"}:
+            if bundle.manifest.metadata.get("campaign_settlement") != "settled":
+                raise ValueError("terminal provider-billed manifest lacks settlement evidence")
+            if (
+                bundle.manifest.metadata.get("provider_resource_id")
+                != parsed_receipt.pod_id
+                or float(bundle.manifest.metadata.get("cost_usd", -1.0))
+                != parsed_receipt.amount_usd
+            ):
+                raise ValueError("provider billing receipt differs from settled bundle")
+            if bundle.manifest.artifacts.get("provider_billing_receipt") != receipt_ref:
+                raise ValueError("provider billing receipt differs from settled bundle")
+            return bundle.manifest
+        if bundle.manifest.status != "pending_settlement":
+            raise ValueError("provider-billed Run is not pending settlement")
+        CampaignStore(binding.database_path).settle_run(
+            binding.proposal_id,
+            provider_resource_id=str(binding.provider_resource_id),
+            billed_cost_usd=parsed_receipt.amount_usd,
+            billing_receipt_sha256=receipt_ref.sha256,
+        )
+        decision_ref = bundle.manifest.artifacts.get("promotion_decision")
+        if decision_ref is None:
+            raise ValueError("pending settlement bundle lacks promotion decision")
+        decision = json.loads(
+            (run_dir / decision_ref.path).read_text(encoding="utf-8")
+        )
+        terminal_status = (
+            "promoted" if decision.get("decision") == "promote" else "rejected"
+        )
+        manifest = bundle.manifest.model_copy(
+            update={
+                "status": terminal_status,
+                "artifacts": {
+                    **bundle.manifest.artifacts,
+                    "provider_billing_receipt": receipt_ref,
+                },
+                "metadata": {
+                    **bundle.manifest.metadata,
+                    "campaign_settlement": "settled",
+                    "cost_usd": parsed_receipt.amount_usd,
+                    "cost_certifying": True,
+                    "provider_resource_id": parsed_receipt.pod_id,
+                },
+            }
+        )
+        write_manifest_atomic(run_dir, manifest)
+        require_valid_run_bundle(run_dir)
+        return manifest
 
     def _read_receipt(
         self,
@@ -522,13 +640,21 @@ class RunEngine:
         if "promotion_decision" not in artifacts:
             raise ValueError("promote stage must emit promotion_decision artifact")
 
+        settlement_pending = (
+            plan.campaign is not None
+            and plan.campaign.settlement_mode == "provider_billing"
+        )
         manifest = RunManifest(
             run_id=plan.run_id,
             candidate_id=plan.candidate_id,
             parent_candidate_id=plan.parent_candidate_id,
             task_name=plan.task_name,
             model_id=plan.model_id,
-            status="promoted" if decision == "promote" else "rejected",
+            status=(
+                "pending_settlement"
+                if settlement_pending
+                else ("promoted" if decision == "promote" else "rejected")
+            ),
             source=capture_source_identity(plan.source_root or Path.cwd()),
             inputs=plan.inputs,
             artifacts=artifacts,
@@ -545,6 +671,16 @@ class RunEngine:
                     }
                 ),
                 "plan_hash": plan.plan_hash,
+                "certification_mode": plan.certification_mode,
+                **(
+                    {}
+                    if plan.campaign is None
+                    else {
+                        "campaign_settlement": (
+                            "pending" if settlement_pending else "settled"
+                        )
+                    }
+                ),
                 "evaluation_contract": {
                     **plan.evaluation_contract.model_dump(mode="json"),
                     "contract_hash": plan.evaluation_contract.contract_hash,
@@ -608,6 +744,7 @@ class RunEngine:
             metadata={
                 **plan.metadata,
                 "plan_hash": plan.plan_hash,
+                "certification_mode": plan.certification_mode,
                 "evaluation_contract": {
                     **plan.evaluation_contract.model_dump(mode="json"),
                     "contract_hash": plan.evaluation_contract.contract_hash,
@@ -668,29 +805,62 @@ class RunEngine:
                 if isinstance(rejection_reasons, list) and rejection_reasons
                 else None
             )
-            decision_name = "promote" if status == "promoted" else "reject"
+            raw_decision = str(decision.get("decision"))
+            if raw_decision not in {"promote", "reject"}:
+                raise ValueError("promotion_decision has invalid decision")
+            decision_name = raw_decision
             primary_delta = float(decision["primary_delta"])
         suite_was_exposed = status != "failed" or str(
             manifest.metadata.get("failed_stage")
         ) in {"evaluate", "promote", "finalize"}
-        CampaignStore(binding.database_path).finalize_run(
+        outcome_status = (
+            "failed"
+            if decision_name == "failed"
+            else ("promoted" if decision_name == "promote" else "rejected")
+        )
+        outcome = ProposalOutcome(
+            run_id=manifest.run_id,
+            status=outcome_status,
+            decision=decision_name,
+            failure_category=failure_category,
+            cost_usd=(
+                float(manifest.metadata.get("cost_usd", 0.0))
+                if manifest.metadata.get("cost_certifying") is True
+                and binding.settlement_mode == "stage_measured"
+                else None
+            ),
+            primary_delta=primary_delta,
+        )
+        store = CampaignStore(binding.database_path)
+        if binding.settlement_mode == "provider_billing":
+            store.stage_run_settlement(
+                campaign_id=binding.campaign_id,
+                proposal_id=binding.proposal_id,
+                worker_id=binding.worker_id,
+                fence_token=binding.lease_fence_token,
+                expected_incumbent_candidate_id=binding.expected_incumbent_candidate_id,
+                candidate_id=manifest.candidate_id,
+                provider_resource_id=str(binding.provider_resource_id),
+                outcome=outcome,
+                promotion_suite_id=(
+                    binding.promotion_suite_id if suite_was_exposed else None
+                ),
+                promotion_suite_version=(
+                    binding.promotion_suite_version if suite_was_exposed else None
+                ),
+                max_suite_exposures=(
+                    binding.max_suite_exposures if suite_was_exposed else None
+                ),
+            )
+            return
+        store.finalize_run(
             campaign_id=binding.campaign_id,
             proposal_id=binding.proposal_id,
             worker_id=binding.worker_id,
+            fence_token=binding.lease_fence_token,
             expected_incumbent_candidate_id=binding.expected_incumbent_candidate_id,
             candidate_id=manifest.candidate_id,
-            outcome=ProposalOutcome(
-                run_id=manifest.run_id,
-                status=status,
-                decision=decision_name,
-                failure_category=failure_category,
-                cost_usd=(
-                    float(manifest.metadata.get("cost_usd", 0.0))
-                    if manifest.metadata.get("cost_certifying") is True
-                    else None
-                ),
-                primary_delta=primary_delta,
-            ),
+            outcome=outcome,
             promotion_suite_id=(
                 binding.promotion_suite_id if suite_was_exposed else None
             ),
@@ -749,6 +919,16 @@ class RunEngine:
             candidate_eval,
             PromotionGateConfig(**plan.promotion_gate),
         )
+        if plan.certification_mode == "non_certifying_smoke":
+            decision = replace(
+                decision,
+                decision="reject",
+                gates={**decision.gates, "certification_mode": "fail"},
+                rejection_reasons=(
+                    *decision.rejection_reasons,
+                    "non_certifying_smoke",
+                ),
+            )
         path = run_dir / "promotion_decision.json"
         write_promotion_decision(decision, path)
         evidence = prior.get("evidence")

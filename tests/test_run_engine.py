@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, BrokenBarrierError, Lock
 
 import pytest
 
@@ -13,6 +13,7 @@ from post_train_engine.engine import (
     RunPlan,
     StageOutput,
 )
+from post_train_engine.runpod_control_plane import PodBillingReceipt
 from post_train_engine.evals.contract import EvalContract
 from post_train_engine.evidence_safety import (
     ContentSeparationCertificate,
@@ -21,11 +22,22 @@ from post_train_engine.evidence_safety import (
 from post_train_engine.run_bundle import RunBundle
 from post_train_engine.campaign import (
     CampaignStore,
+    ExperimentExplanation,
     ExperimentProposal,
     ProposalOutcome,
 )
 from post_train_engine.diagnostics import write_run_diagnostics
 from post_train_engine.reports import write_run_report
+
+
+def _experiment_explanation() -> ExperimentExplanation:
+    return ExperimentExplanation(
+        problem_statement="The incumbent fails a measured fixture slice.",
+        causal_explanation="The fixture intervention repairs the measured mechanism.",
+        hard_to_vary_details=("fixture_intervention", "fixture_slice"),
+        risky_prediction="The candidate improves the fixture slice without regression.",
+        rejection_criterion="Reject if the slice does not improve or a gate fails.",
+    )
 
 
 class FakeStageAdapter:
@@ -195,21 +207,25 @@ class ThreadCoordinator:
         self._errors = errors
         self._lock = lock
 
-    def wait(self) -> None:
-        self._barrier.wait(timeout=10)
+    def wait(self, timeout_seconds: float) -> None:
+        self._barrier.wait(timeout=timeout_seconds)
 
-    def collect_errors(self, error: str | None) -> tuple[str, ...]:
+    def collect_errors(
+        self,
+        error: str | None,
+        timeout_seconds: float,
+    ) -> tuple[str, ...]:
         if error is not None:
             with self._lock:
                 self._errors[self._rank] = error
-        self.wait()
+        self.wait(timeout_seconds)
         with self._lock:
             result = tuple(self._errors[index] for index in sorted(self._errors))
-        self.wait()
+        self.wait(timeout_seconds)
         if self.is_main_process:
             with self._lock:
                 self._errors.clear()
-        self.wait()
+        self.wait(timeout_seconds)
         return result
 
 
@@ -329,8 +345,10 @@ def test_run_plan_rejects_campaign_parent_mismatch(tmp_path: Path) -> None:
         "campaign_id": "campaign-1",
         "proposal_id": "proposal-1",
         "worker_id": "worker-1",
+        "lease_fence_token": 1,
         "expected_incumbent_candidate_id": "different-parent",
     }
+    raw["certification_mode"] = "certifying"
 
     with pytest.raises(ValueError, match="campaign expected Incumbent"):
         RunPlan.model_validate(raw)
@@ -338,6 +356,7 @@ def test_run_plan_rejects_campaign_parent_mismatch(tmp_path: Path) -> None:
 
 def test_run_engine_owns_stage_order_manifest_and_resume(tmp_path: Path) -> None:
     plan = RunPlan(
+        certification_mode="non_certifying_smoke",
         run_id="run-1",
         candidate_id="candidate-1",
         parent_candidate_id="seed",
@@ -440,6 +459,7 @@ def test_run_plan_rejects_promotion_data_in_training_view(tmp_path: Path) -> Non
 
     with pytest.raises(ValidationError, match="protected evaluation"):
         RunPlan(
+            certification_mode="non_certifying_smoke",
             run_id="run-1",
             candidate_id="candidate-1",
             task_name="fixture",
@@ -482,6 +502,54 @@ def test_run_engine_fails_closed_when_budgeted_stage_cost_is_unknown(
         RunEngine().execute(plan, MissingCostStageAdapter())
 
 
+def test_certifying_run_requires_campaign_authority(tmp_path: Path) -> None:
+    raw = _fixture_plan(tmp_path / "missing-campaign").model_dump(mode="json")
+    raw["certification_mode"] = "certifying"
+
+    with pytest.raises(ValueError, match="requires a campaign binding"):
+        RunPlan.model_validate(raw)
+
+
+def test_certifying_run_requires_exact_input_identities(tmp_path: Path) -> None:
+    raw = _fixture_plan(tmp_path / "provider-managed-input").model_dump(mode="json")
+    raw["certification_mode"] = "certifying"
+    raw["inputs"]["model"] = {
+        "kind": "model",
+        "requested_id": "model-1",
+        "resolved_id": "model-1",
+        "requested_revision": "main",
+        "resolution_state": "provider_managed",
+        "non_certifying_reason": "provider did not expose an immutable revision",
+    }
+    raw["campaign"] = {
+        "database_path": str(tmp_path / "campaign.sqlite"),
+        "campaign_id": "campaign-1",
+        "proposal_id": "proposal-1",
+        "worker_id": "worker-1",
+        "lease_fence_token": 1,
+        "expected_incumbent_candidate_id": "seed",
+    }
+
+    with pytest.raises(ValueError, match="requires exact input identities"):
+        RunPlan.model_validate(raw)
+
+
+def test_non_certifying_smoke_can_never_promote(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "non-certifying-smoke")
+
+    execution = RunEngine().execute(plan, FakeStageAdapter())
+
+    assert execution.manifest.status == "rejected"
+    assert execution.manifest.metadata["certification_mode"] == "non_certifying_smoke"
+    decision_path = (
+        Path(plan.output_dir)
+        / execution.manifest.artifacts["promotion_decision"].path
+    )
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["decision"] == "reject"
+    assert "non_certifying_smoke" in decision["rejection_reasons"]
+
+
 def test_run_engine_persists_terminal_stage_failure_bundle(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "failed-run")
 
@@ -516,6 +584,7 @@ def test_run_engine_coordinates_distributed_stages_with_one_writer(
     tmp_path: Path,
 ) -> None:
     plan = RunPlan(
+        certification_mode="non_certifying_smoke",
         run_id="distributed-run",
         candidate_id="candidate-1",
         parent_candidate_id="seed",
@@ -629,6 +698,22 @@ def test_run_engine_propagates_distributed_stage_failure_without_deadlock(
     assert bundle.validate()["status"] == "ok"
 
 
+def test_run_engine_bounds_wait_when_distributed_peer_disappears(tmp_path: Path) -> None:
+    raw = _fixture_plan(tmp_path / "missing-peer").model_dump(mode="json")
+    raw["distributed_timeout_seconds"] = 0.01
+    plan = RunPlan.model_validate(raw)
+    coordinator = ThreadCoordinator(
+        is_main_process=True,
+        rank=0,
+        barrier=Barrier(2),
+        errors={},
+        lock=Lock(),
+    )
+
+    with pytest.raises(BrokenBarrierError):
+        RunEngine().execute(plan, FakeStageAdapter(), coordinator=coordinator)
+
+
 def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
     tmp_path: Path,
 ) -> None:
@@ -637,6 +722,7 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
     campaign.add_hypothesis("campaign-1", "hypothesis-1", "candidate improves accuracy")
     proposal_id = campaign.submit_proposal(
         ExperimentProposal(
+            explanation=_experiment_explanation(),
             campaign_id="campaign-1",
             hypothesis_id="hypothesis-1",
             method="fixture",
@@ -652,12 +738,14 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
         candidate_id="seed",
         run_id="seed-run",
     )
-    assert campaign.claim_proposal(
+    lease = campaign.claim_proposal(
         proposal_id,
         worker_id="worker-1",
         ttl_seconds=60,
-    ) is not None
+    )
+    assert lease is not None
     plan = RunPlan(
+        certification_mode="certifying",
         run_id="campaign-run",
         candidate_id="candidate-1",
         parent_candidate_id="seed",
@@ -701,6 +789,7 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
             "campaign_id": "campaign-1",
             "proposal_id": proposal_id,
             "worker_id": "worker-1",
+            "lease_fence_token": lease.fence_token,
             "expected_incumbent_candidate_id": "seed",
             "promotion_suite_id": "suite-1",
             "promotion_suite_version": "v1",
@@ -719,6 +808,7 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
     campaign.add_hypothesis("campaign-1", "hypothesis-2", "later candidate improves")
     later_proposal_id = campaign.submit_proposal(
         ExperimentProposal(
+            explanation=_experiment_explanation(),
             campaign_id="campaign-1",
             hypothesis_id="hypothesis-2",
             method="sft",
@@ -729,11 +819,17 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
             parameters={"candidate": "candidate-2"},
         )
     )
-    campaign.claim_proposal(later_proposal_id, worker_id="worker-2", ttl_seconds=30)
+    later_lease = campaign.claim_proposal(
+        later_proposal_id,
+        worker_id="worker-2",
+        ttl_seconds=30,
+    )
+    assert later_lease is not None
     campaign.finalize_run(
         campaign_id="campaign-1",
         proposal_id=later_proposal_id,
         worker_id="worker-2",
+        fence_token=later_lease.fence_token,
         expected_incumbent_candidate_id="candidate-1",
         candidate_id="candidate-2",
         outcome=ProposalOutcome(
@@ -757,6 +853,7 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
     campaign.add_hypothesis("campaign-1", "hypothesis-1", "candidate improves")
     proposal_id = campaign.submit_proposal(
         ExperimentProposal(
+            explanation=_experiment_explanation(),
             campaign_id="campaign-1",
             hypothesis_id="hypothesis-1",
             method="fixture",
@@ -768,7 +865,12 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
         )
     )
     campaign.initialize_incumbent("campaign-1", candidate_id="seed", run_id="seed-run")
-    campaign.claim_proposal(proposal_id, worker_id="worker-1", ttl_seconds=60)
+    lease = campaign.claim_proposal(
+        proposal_id,
+        worker_id="worker-1",
+        ttl_seconds=60,
+    )
+    assert lease is not None
     raw = _fixture_plan(tmp_path / "prepare-failure").model_dump(mode="json")
     raw["evaluation_contract"] = _eval_contract(
         suite_id="suite-1",
@@ -779,11 +881,13 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
         "campaign_id": "campaign-1",
         "proposal_id": proposal_id,
         "worker_id": "worker-1",
+        "lease_fence_token": lease.fence_token,
         "expected_incumbent_candidate_id": "seed",
         "promotion_suite_id": "suite-1",
         "promotion_suite_version": "v1",
         "max_suite_exposures": 3,
     }
+    raw["certification_mode"] = "certifying"
     plan = RunPlan.model_validate(raw)
 
     with pytest.raises(RuntimeError, match="prepare fixture failure"):
@@ -793,8 +897,101 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
     assert campaign.suite_exposure("campaign-1", "suite-1", "v1") == 0
 
 
+def test_run_engine_stages_provider_billing_before_campaign_promotion(
+    tmp_path: Path,
+) -> None:
+    campaign = CampaignStore(tmp_path / "campaign.sqlite")
+    campaign.create_campaign("campaign-1", quality_budget=1, cost_budget_usd=1.5)
+    campaign.add_hypothesis("campaign-1", "hypothesis-1", "candidate improves")
+    campaign.initialize_incumbent("campaign-1", candidate_id="seed", run_id="seed-run")
+    proposal_id = campaign.submit_proposal(
+        ExperimentProposal(
+            explanation=_experiment_explanation(),
+            campaign_id="campaign-1",
+            hypothesis_id="hypothesis-1",
+            method="fixture",
+            task_name="fixture",
+            parent_candidate_id="seed",
+            comparison_group_id="provider-billing",
+            comparison_axis="method",
+            parameters={"method": "fixture"},
+            estimated_cost_usd=0.5,
+        )
+    )
+    lease = campaign.claim_proposal(
+        proposal_id, worker_id="worker-1", ttl_seconds=60
+    )
+    assert lease is not None
+    raw = _fixture_plan(tmp_path / "provider-billing").model_dump(mode="json")
+    raw["certification_mode"] = "certifying"
+    raw["promotion_gate"] = {
+        "min_examples": 2,
+        "min_primary_delta": 0.1,
+        "min_primary_ci_low": -1.0,
+        "max_mcnemar_p": 1.0,
+        "max_parse_regression": 0.0,
+        "max_easy_regression": 0.0,
+        "max_token_increase_ratio": 2.0,
+    }
+    raw["campaign"] = {
+        "database_path": str(campaign.path),
+        "campaign_id": "campaign-1",
+        "proposal_id": proposal_id,
+        "worker_id": "worker-1",
+        "lease_fence_token": lease.fence_token,
+        "expected_incumbent_candidate_id": "seed",
+        "settlement_mode": "provider_billing",
+        "provider_resource_id": "pod-1",
+    }
+    plan = RunPlan.model_validate(raw)
+
+    execution = RunEngine().execute(plan, PromotingStageAdapter())
+
+    assert execution.manifest.status == "pending_settlement"
+    assert campaign.current_incumbent("campaign-1")["candidate_id"] == "seed"
+    assert campaign.campaign_usage("campaign-1")["pending_settlements"] == 1
+
+    receipt_path = Path(plan.output_dir) / "runpod_billing_receipt.json"
+    receipt = PodBillingReceipt(
+        pod_id="pod-1",
+        settlement_state="settled",
+        amount_usd=0.44,
+        row_count=1,
+        recorded_at_unix=1.0,
+    )
+    receipt_path.write_text(receipt.model_dump_json(), encoding="utf-8")
+    settled = RunEngine().settle_provider_billing(
+        plan,
+        receipt=receipt,
+        receipt_path=receipt_path,
+    )
+    replayed = RunEngine().settle_provider_billing(
+        plan,
+        receipt=receipt,
+        receipt_path=receipt_path,
+    )
+
+    assert settled.status == "promoted"
+    assert replayed == settled
+    assert settled.metadata["cost_usd"] == 0.44
+    assert settled.metadata["campaign_settlement"] == "settled"
+    assert "provider_billing_receipt" in settled.artifacts
+    assert campaign.current_incumbent("campaign-1")["candidate_id"] == "candidate-1"
+
+    different_receipt = receipt.model_copy(update={"amount_usd": 0.45})
+    different_path = Path(plan.output_dir) / "different_billing_receipt.json"
+    different_path.write_text(different_receipt.model_dump_json(), encoding="utf-8")
+    with pytest.raises(ValueError, match="differs from settled bundle"):
+        RunEngine().settle_provider_billing(
+            plan,
+            receipt=different_receipt,
+            receipt_path=different_path,
+        )
+
+
 def _fixture_plan(output_dir: Path, *, max_cost_usd: float | None = None) -> RunPlan:
     return RunPlan(
+        certification_mode="non_certifying_smoke",
         run_id=output_dir.name,
         candidate_id="candidate-1",
         parent_candidate_id="seed",

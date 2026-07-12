@@ -1,4 +1,5 @@
 run:
+  certification_mode: non_certifying_smoke
   run_id: gsm8k-hyperbolic-api-smoke
   output_dir: runs/gsm8k-hyperbolic-api-smoke
   seed: 123
