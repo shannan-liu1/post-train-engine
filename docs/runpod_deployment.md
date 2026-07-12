@@ -13,6 +13,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 7. Start a Pod-side deletion watchdog immediately after SSH becomes available.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
+10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
 
 ## Image and CUDA compatibility
 
@@ -89,12 +90,16 @@ RunPod injects account SSH keys at Pod creation. Register the temporary public k
 6. Start the watchdog as the first remote command.
 7. During teardown, remove only the temporary public key, delete the private key, and verify the original account keys remain.
 
+On Windows, grant the task owner deletion permission on the temporary private key. A read/write-only ACL can make teardown unable to delete the key. Verify that both the private key and its `.pub` file are absent after teardown.
+
 Example watchdog for a 20-minute attempt:
 
 ```bash
 nohup bash -lc 'sleep 1200; runpodctl pod delete "$RUNPOD_POD_ID" || kill 1' \
   >/workspace/pte-watchdog.log 2>&1 &
 ```
+
+Do not assume that a REST-created Pod exports `RUNPOD_POD_ID`. Bind the watchdog to the literal Pod ID returned by the create response and verify that `RUNPOD_API_KEY` is present without printing its value. Confirm that the watchdog process remains alive before source delivery. If Pod-side authenticated deletion is unavailable, do not treat `kill 1` as sufficient because the provider may restart a Pod whose desired state remains `RUNNING`.
 
 ## Source delivery contract
 
@@ -124,6 +129,17 @@ Use Git only when the reviewed source exists in a reachable remote repository. A
 5. Clone or fetch the repository, then run `git checkout --detach <expected-sha>`.
 6. Require `git rev-parse HEAD` to equal the expected full SHA before installation or execution.
 7. Remove the ephemeral credential during teardown. Do not persist it in the image or volume.
+
+The execution environment must permit the chosen credential transport. Do not infer this permission from the user's approval or from a successful local Git check. If direct PAT transmission is prohibited, use a repository-scoped, read-only GitHub deploy key with SSH agent forwarding:
+
+1. Generate the deploy key outside the repository.
+2. Ask the repository owner to register only its public key with write access disabled.
+3. Verify the exact remote commit locally with that key.
+4. Keep the private key on the trusted local machine and load it into a task-local SSH agent.
+5. Connect to the Pod with agent forwarding and clone through the forwarded agent. Never copy the deploy private key to the Pod.
+6. Remove the deploy key from GitHub and delete the local private key during teardown.
+
+Prove that agent forwarding works before allocation when the environment permits a non-billable test. Otherwise treat the first paid connection as a fail-fast gate and delete immediately on failure.
 
 Treat branch names and tags as discovery aids, not execution identity. Only the detached full commit SHA certifies the source. If the remote is private, the user must explicitly approve that repository and trust boundary.
 
@@ -167,6 +183,9 @@ Teardown runs after success, failure, timeout, or interruption:
 | Bundle contained caches | Allowlisted directories still contained `__pycache__` | Exclude caches and audit every archive member before upload. |
 | Local sandbox denied source upload | The execution environment prohibited private workspace transfer even after explicit user approval | Confirm transfer capability before renting; otherwise use the exact Git commit mode, a user-supplied prebuilt image, or a user-controlled checkout already present on the Pod. Never bypass the policy. |
 | PowerShell state update deleted a healthy Pod | A new property was assigned to a fixed `PSCustomObject`, which threw inside the fail-closed handler | Rebuild operational state through an ordered map, validate it locally, then persist it. |
+| Private GitHub PAT could not be sent to the Pod | The execution security boundary rejected credential transmission to a third-party machine despite explicit workflow approval | Use a repository-scoped read-only deploy key through SSH agent forwarding, or require a user-controlled checkout. Never bypass the credential boundary. |
+| Watchdog had an empty Pod ID | A REST-created Pod did not export `RUNPOD_POD_ID` | Bind the create-response Pod ID literally and verify Pod-side API authentication without exposing it. |
+| Temporary private key survived teardown | Its Windows ACL granted read/write but not delete permission | Grant the task owner deletion permission and verify both key files are absent after teardown. |
 
 ## Primary references
 
