@@ -100,3 +100,24 @@ def test_runtime_pair_balances_order_and_uses_conservative_speedup() -> None:
     assert evidence.conservative_speedup == 2.0
     assert evidence.output_parity is True
     assert evidence.certifying is True
+
+
+def test_runtime_pair_records_which_trials_changed_output() -> None:
+    clock_values = iter([0.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 6.0])
+    baseline_outputs = iter([["reference"], ["baseline-drift"]])
+    optimized_outputs = iter(
+        [["reference"], ["optimized-drift"], ["reference"]]
+    )
+
+    evidence = measure_runtime_pair(
+        baseline=lambda: next(baseline_outputs),
+        optimized=lambda: next(optimized_outputs),
+        synchronize=lambda: None,
+        reduce_seconds=lambda value: value,
+        clock=lambda: next(clock_values),
+    )
+
+    assert evidence.baseline_output_parity == (True, False)
+    assert evidence.optimized_output_parity == (False, True)
+    assert evidence.output_parity is False
+    assert evidence.certifying is False

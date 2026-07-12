@@ -71,6 +71,39 @@ def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) 
     assert journal["receipt"]["pod_rate_usd_per_hour"] == 0.44
 
 
+def test_delete_updates_the_canonical_operation_journal(tmp_path: Path) -> None:
+    journal_path = tmp_path / "runpod_operation.json"
+    transport = FakeTransport(
+        [
+            {"id": "pod-1", "name": "pte-r4-deadbeef", "costPerHr": 0.44},
+            {},
+        ]
+    )
+    control = RunPodControlPlane(transport, journal_path)
+    control.create_pod(
+        _request(),
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+    )
+
+    control.delete_pod("pod-1")
+
+    journal = json.loads(journal_path.read_text("utf-8"))
+    assert journal["state"] == "deleted"
+    assert journal["deleted_pod_id"] == "pod-1"
+    assert journal["deleted_at_unix"] > journal["receipt"]["recorded_at_unix"]
+
+
+def test_corrupt_journal_cannot_block_provider_deletion(tmp_path: Path) -> None:
+    journal_path = tmp_path / "runpod_operation.json"
+    journal_path.write_text("{", encoding="utf-8")
+    transport = FakeTransport([{}])
+
+    with pytest.raises(json.JSONDecodeError):
+        RunPodControlPlane(transport, journal_path).delete_pod("pod-1")
+
+    assert transport.calls == [("DELETE", "/pods/pod-1", None)]
+
+
 def test_budget_deadline_subtracts_settled_campaign_spend() -> None:
     budget = RunPodBudget(
         target_spend_usd=1.5,

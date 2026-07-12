@@ -213,11 +213,19 @@ def _tail(value: str | bytes | None) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--constraints-only", action="store_true")
+    parser.add_argument("--root", type=Path, default=Path("."))
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--timeout-sec", type=int, default=120)
     parser.add_argument("--total-timeout-sec", type=int, default=300)
     parser.add_argument("--no-cuda-required", action="store_true")
     args = parser.parse_args()
+    if args.constraints_only:
+        verify_runpod_constraints(args.root)
+        print("RunPod constraints OK")
+        return
+    if args.root != Path("."):
+        parser.error("--root is valid only with --constraints-only")
     report = run_preflight(
         out=args.out,
         command_timeout_sec=args.timeout_sec,
@@ -227,6 +235,10 @@ def main() -> None:
     print(json.dumps(report, indent=2, sort_keys=True))
     if not report["ok"]:
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
 
 
 __all__ = [

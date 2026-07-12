@@ -10,7 +10,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 4. Pin the container image, GPU type, and GPU count. Derive the CUDA allocation filter from the image tag. Never hardcode one global CUDA version.
 5. Verify one dedicated account SSH identity before Pod creation. Retain a persistent service identity; remove only an explicitly task-scoped temporary identity during teardown.
 6. Use exactly one audited source-delivery mode: an allowlist bundle or an exact Git commit. Never mix source modes within one attempt.
-7. Start a Pod-side deletion watchdog immediately after SSH becomes available.
+7. Start a provider-authoritative local deletion watchdog immediately after creation. Add a Pod-side watchdog after SSH only when the Pod already has provider deletion authority; never transmit an account API key into the Pod to create that authority.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
@@ -93,7 +93,7 @@ RunPod injects account SSH keys at Pod creation. Prefer one dedicated persistent
    before reload is not persistence evidence.
 4. Create the Pod.
 5. Pin the host key in a task-specific `known_hosts` file.
-6. Start the watchdog as the first remote command.
+6. Confirm the local provider-deletion watchdog remains active. Start a Pod-side watchdog as the first remote command only when the Pod already has provider deletion authority.
 7. During teardown, retain a `persistent_service` key. Remove and delete only a `task_scoped` key, then verify all unrelated account keys remain.
 
 On Windows, grant the task owner deletion permission on a task-scoped private key. A read/write-only ACL can make teardown unable to delete it. Verify that both task-scoped key files are absent after teardown. Do not apply this deletion step to the persistent service identity.
@@ -105,7 +105,11 @@ nohup bash -lc 'sleep 1200; runpodctl pod delete "$RUNPOD_POD_ID" || kill 1' \
   >/workspace/pte-watchdog.log 2>&1 &
 ```
 
-Do not assume that a REST-created Pod exports `RUNPOD_POD_ID`. Bind the watchdog to the literal Pod ID returned by the create response and verify that `RUNPOD_API_KEY` is present without printing its value. Confirm that the watchdog process remains alive before source delivery. If Pod-side authenticated deletion is unavailable, do not treat `kill 1` as sufficient because the provider may restart a Pod whose desired state remains `RUNNING`.
+Do not assume that a REST-created Pod exports `RUNPOD_POD_ID`. Bind every watchdog to the literal Pod ID returned by the create response. Keep provider credentials on the trusted local machine. A local watchdog must call the provider delete API after its short deadline and record whether it deleted an active Pod or found it absent. If the Pod already exposes authenticated provider deletion, verify that authority without printing it and add a Pod-side watchdog. If Pod-side authenticated deletion is unavailable, do not transmit an account API key into the Pod and do not treat `kill 1` as sufficient because the provider may restart a Pod whose desired state remains `RUNNING`.
+
+The repository does not yet ship a canonical detached-process launcher for the
+local watchdog. This is a blocker for another paid attempt. Add and test that
+launcher before creating a Pod; do not hand-write another task-local watchdog.
 
 ## Source delivery contract
 
@@ -161,7 +165,7 @@ fenced campaign proposal and binding provider billing settlement.
 1. Start the watchdog.
 2. Deliver source through the selected mode. Verify the bundle hash or exact detached Git SHA.
 3. Enter a new work directory that contains only the verified source.
-4. Run `PYTHONPATH=src python -c "from post_train_engine.runpod_preflight import verify_runpod_constraints; verify_runpod_constraints()"`. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
+4. Run `python src/post_train_engine/runpod_preflight.py --constraints-only` directly so this stdlib-only gate works before project dependencies exist. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
@@ -176,7 +180,7 @@ Run the full locked test suite, Ruff, architecture constraints check, and diff c
 Teardown runs after success, failure, timeout, or interruption:
 
 1. Download any available logs and evidence.
-2. Delete the Pod through the REST API.
+2. Delete the Pod through the REST API and require the canonical operation journal to transition from `created` to `deleted` with the exact Pod ID and deletion time.
 3. Verify the target Pod is absent and no unintended Pod remains.
 4. Remove only a task-scoped account SSH key and verify the original key set. Retain the dedicated persistent service identity.
 5. Delete only task-scoped private keys and the local staging bundle.
@@ -206,6 +210,11 @@ observation. A first nonempty billing response is never final evidence.
 | Temporary private key survived teardown | Its Windows ACL granted read/write but not delete permission | Grant the task owner deletion permission and verify both key files are absent after teardown. |
 | Pod-specific `SSH_PUBLIC_KEY` did not authorize REST-created Pods | Two Secure 2xA40 Pods exposed healthy SSH endpoints but rejected the injected ed25519 key; the first non-batch probe waited on authentication | Do not rely on create-request environment injection for SSH. Verify an account-level key with `runpodctl ssh list-keys` or the RunPod console before allocation, and use batch-mode SSH so rejection fails in seconds. |
 | RunPod console key edit appeared saved but reverted after reload | The SSH key form remained mounted while its accordion was collapsed, so automation could inspect hidden state without a reliable interactive submission | Expand the SSH public keys accordion, submit through its visible controls, require the success confirmation, then reload and verify persistence before allocation. |
+| Pre-install constraint check could not import Pydantic | Importing the package-scoped verifier executed the package root before frozen dependencies existed | Execute `src/post_train_engine/runpod_preflight.py --constraints-only` directly before installation; it uses only the standard library. |
+| R4 batching changed generated text | BF16 GPU generation produced different greedy completions for scalar and batched tensor shapes despite deterministic sampling settings | Keep R4 failed closed. Preserve exact-output parity as the certification law and diagnose numerical batch-shape sensitivity before another paid attempt. |
+| Security boundary rejected account API-key transfer to the Pod | A Pod-side provider-deletion watchdog would require disclosing the account credential to the rented machine | Start a local provider-authoritative deletion watchdog immediately after create; add Pod-side deletion only when authority already exists without credential transfer. |
+| Deleted Pod left the operation journal in `created` state | Teardown evidence was split across an ad hoc sidecar while the canonical control-plane record remained stale | Update the operation journal atomically after a successful provider delete and retain the Pod ID and deletion time. |
+| Failed R4 artifact collapsed all trial drift into one boolean | The artifact could not distinguish baseline instability from optimized-path drift | Record warmup-relative parity separately for both baseline and both optimized ABBA trials without exposing completions. |
 
 ## Primary references
 

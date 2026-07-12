@@ -290,6 +290,19 @@ class RunPodControlPlane:
         if not pod_id:
             raise ValueError("pod_id must be non-empty")
         self.transport.request("DELETE", f"/pods/{pod_id}")
+        journal = self._read_journal()
+        receipt = None if journal is None else journal.get("receipt")
+        if isinstance(receipt, dict) and str(receipt.get("pod_id")) != pod_id:
+            return
+        if journal is not None:
+            self._write_journal(
+                {
+                    **journal,
+                    "state": "deleted",
+                    "deleted_pod_id": pod_id,
+                    "deleted_at_unix": time.time(),
+                }
+            )
 
     def fetch_billing(
         self,

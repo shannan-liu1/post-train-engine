@@ -2440,6 +2440,11 @@ def run_runpod_eval_benchmark(
             "max_rank_wall_seconds_trials": list(evidence.optimized_seconds),
         },
         "measurement_order": ["baseline", "optimized", "optimized", "baseline"],
+        "trial_output_parity": {
+            "reference": "warmup_optimized",
+            "baseline": list(evidence.baseline_output_parity),
+            "optimized": list(evidence.optimized_output_parity),
+        },
         "warmup_strategy": "optimized",
         "minimum_speedup": evidence.minimum_speedup,
         "speedup": evidence.conservative_speedup,

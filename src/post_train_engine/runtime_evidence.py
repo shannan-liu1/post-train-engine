@@ -21,6 +21,8 @@ class RuntimePairEvidence:
     baseline_seconds: tuple[float, float]
     optimized_seconds: tuple[float, float]
     conservative_speedup: float
+    baseline_output_parity: tuple[bool, bool]
+    optimized_output_parity: tuple[bool, bool]
     output_parity: bool
     certifying: bool
     minimum_speedup: float
@@ -62,17 +64,26 @@ def measure_runtime_pair(
 
     baseline_seconds = tuple(value[0] for value in observations["baseline"])
     optimized_seconds = tuple(value[0] for value in observations["optimized"])
-    outputs = [
-        warm_output,
-        *(value[1] for value in observations["baseline"]),
-        *(value[1] for value in observations["optimized"]),
-    ]
-    output_parity = all(output == warm_output for output in outputs[1:])
+    baseline_output_parity = tuple(
+        output == warm_output for _seconds, output in observations["baseline"]
+    )
+    optimized_output_parity = tuple(
+        output == warm_output for _seconds, output in observations["optimized"]
+    )
+    output_parity = all((*baseline_output_parity, *optimized_output_parity))
     conservative_speedup = min(baseline_seconds) / max(optimized_seconds)
     return RuntimePairEvidence(
         baseline_seconds=(baseline_seconds[0], baseline_seconds[1]),
         optimized_seconds=(optimized_seconds[0], optimized_seconds[1]),
         conservative_speedup=conservative_speedup,
+        baseline_output_parity=(
+            baseline_output_parity[0],
+            baseline_output_parity[1],
+        ),
+        optimized_output_parity=(
+            optimized_output_parity[0],
+            optimized_output_parity[1],
+        ),
         output_parity=output_parity,
         certifying=output_parity and conservative_speedup >= minimum_speedup,
         minimum_speedup=minimum_speedup,

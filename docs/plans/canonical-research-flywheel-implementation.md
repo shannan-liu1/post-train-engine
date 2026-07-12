@@ -174,19 +174,21 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after the final local code change: 303 tests pass.
+- [x] Full tests and Ruff pass after the final local code change: 307 tests pass.
 - [x] Two fresh-eyes passes found and fixed allocation, billing, identity, dependency, runtime-certification, preflight, and provider-handle defects; the final targeted and full gates pass.
 
 The adversarial review reopened production certification at the promotion-contract,
 sealed-evidence, replay-lineage, receipt-idempotency, campaign-wiring, lease-fencing,
 provider-cost, dependency-locking, and distributed-failure boundaries. U-029 through
-U-058 in the governing spec own those findings. Local tests certify implemented
+U-065 in the governing spec own those findings. Local tests certify implemented
 mechanics only. They do not certify a production-safe research flywheel.
 
-R4 also remains open. A later remote attempt must follow explicit user instructions,
+R4 remains open after a Secure two-A40 attempt measured a 1.973 conservative speedup
+but failed exact output parity. GRPO did not run. A later remote attempt must diagnose
+the scalar-versus-batched BF16 generation drift, receive explicit user authorization,
 select exactly one source-delivery mode from `docs/runpod_deployment.md`, and bind the
 CUDA allocation filter to the chosen image. No local review or commit authorizes a
-RunPod action.
+second RunPod action.
 
 ## Risks And Escape Hatches
 

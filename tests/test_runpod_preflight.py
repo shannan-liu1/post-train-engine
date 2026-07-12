@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -110,3 +111,35 @@ def test_preflight_records_missing_executable_as_a_failed_gate(
 
     assert report["ok"] is False
     assert report["results"][0]["error_type"] == "FileNotFoundError"
+
+
+def test_constraints_can_run_before_project_dependencies_are_installed(
+    tmp_path: Path,
+) -> None:
+    lock_text = "version = 1\npackage = []\n"
+    digest = hashlib.sha256(lock_text.encode("utf-8")).hexdigest()
+    (tmp_path / "uv.lock").write_text(lock_text, encoding="utf-8")
+    requirements = tmp_path / "requirements"
+    requirements.mkdir()
+    (requirements / "runpod.txt").write_text(
+        f"# uv-lock-sha256: {digest}\naccelerate==1.0\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(Path(runpod_preflight.__file__)),
+            "--constraints-only",
+            "--root",
+            str(tmp_path),
+        ],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "RunPod constraints OK"
