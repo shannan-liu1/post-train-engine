@@ -39,6 +39,11 @@ from post_train_engine.evals.promotion import (
     PromotionDecision,
     load_eval_artifact,
 )
+from post_train_engine.evals.contract import EvalContract
+from post_train_engine.evidence_safety import (
+    VerifierSeparation,
+    certify_content_separation,
+)
 from post_train_engine.providers.base import RemoteProvider
 from post_train_engine.providers.fake import FakeInferenceProvider, FakePromptAdapterProvider
 from post_train_engine.providers.openai_compatible import OpenAICompatibleProvider
@@ -211,6 +216,36 @@ def _compile_api_hillclimb(
         ),
         training_example_ids=tuple(example.id for example in train_examples),
         promotion_example_ids=tuple(example.id for example in eval_examples),
+        evaluation_contract=EvalContract.from_components(
+            suite_id=f"{cfg.dataset.name}-promotion",
+            suite_version=(
+                f"{cfg.dataset.dataset_name}:"
+                f"{cfg.dataset.dataset_revision or cfg.dataset.source}:"
+                f"seed={cfg.dataset.split_seed}"
+            ),
+            example_ids=tuple(example.id for example in eval_examples),
+            example_content=tuple(
+                {
+                    "id": example.id,
+                    "question": example.question,
+                    "gold_answer": example.gold_answer,
+                }
+                for example in eval_examples
+            ),
+            prompt_contract={"prompt_style": cfg.dataset.prompt_style},
+            verifier_contract={"task": cfg.dataset.name, "verifier": "exact-answer-v1"},
+            generation_contract=cfg.eval.model_dump(mode="json"),
+            primary_metric="accuracy",
+        ),
+        content_separation=certify_content_separation(
+            training_texts=tuple(example.question for example in train_examples),
+            protected_texts=tuple(example.question for example in eval_examples),
+        ),
+        verifier_separation=VerifierSeparation(
+            verifier_kind="executable_ground_truth",
+            training_verifier_id="gsm8k-exact-answer-v1",
+            promotion_verifier_id="gsm8k-exact-answer-v1",
+        ),
         promotion_gate=promotion_gate,
         metadata={
             "execution_mode": "api_hillclimb",
@@ -354,8 +389,6 @@ class _APIHillClimbAdapter:
             self.store,
             artifacts={
                 "train_rollouts": "rollouts/baseline_train_rollouts.jsonl",
-                "provider_requests": "provider_requests.jsonl",
-                "provider_responses": "provider_responses.jsonl",
                 **evidence_artifacts,
             },
             values=evidence_values,
@@ -444,7 +477,7 @@ class _APIHillClimbAdapter:
 
     def _evaluate(
         self,
-        _plan: RunPlan,
+        plan: RunPlan,
         prior: dict[str, StageOutput],
     ) -> StageOutput:
         cfg = self.resolved.config
@@ -472,11 +505,17 @@ class _APIHillClimbAdapter:
         )
         self.store.write_json(
             "evals/baseline.json",
-            _api_promotion_artifact(baseline).to_dict(),
+            _api_promotion_artifact(
+                baseline,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
         )
         self.store.write_json(
             "evals/candidate.json",
-            _api_promotion_artifact(candidate_result).to_dict(),
+            _api_promotion_artifact(
+                candidate_result,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
         )
         return _api_stage_output(
             self.store,
@@ -520,6 +559,8 @@ class _APIHillClimbAdapter:
             artifacts={
                 "final_report_json": "final_report.json",
                 "final_report_md": "final_report.md",
+                "provider_requests": "provider_requests.jsonl",
+                "provider_responses": "provider_responses.jsonl",
             },
             values={"decision": decision["decision"]},
         )
@@ -698,10 +739,15 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
             raise ValueError(f"expected JSONL objects: {path}")
         rows.append(row)
     return rows
-def _api_promotion_artifact(result: EvalResult) -> EvalArtifact:
+def _api_promotion_artifact(
+    result: EvalResult,
+    *,
+    evaluation_contract_hash: str,
+) -> EvalArtifact:
     return EvalArtifact(
         artifact_id=result.candidate_id,
         primary_metric="accuracy",
+        evaluation_contract_hash=evaluation_contract_hash,
         examples=tuple(
             EvalExampleResult(
                 example_id=row.example_id,

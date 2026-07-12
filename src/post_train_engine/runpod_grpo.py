@@ -45,6 +45,11 @@ from post_train_engine.evals.promotion import (
     EvalArtifact,
     EvalExampleResult,
 )
+from post_train_engine.evals.contract import EvalContract
+from post_train_engine.evidence_safety import (
+    VerifierSeparation,
+    certify_content_separation,
+)
 from post_train_engine.evaluation_roles import EvaluationRoles
 from post_train_engine.hub_identity import (
     is_huggingface_commit,
@@ -385,6 +390,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
     state = _distributed_state(dist)
     run_dir = Path(cfg.run.output_dir)
     store: ArtifactStore | None = None
+    resumable = False
     if dist.is_main_process:
         resumable = run_dir.is_dir() and (
             (run_dir / "manifest.json").is_file() or (run_dir / "state").is_dir()
@@ -400,7 +406,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
         require_nonfailed_manifest(bundle.manifest, run_dir)
         return _read_json_object(run_dir / "final_report.json")
 
-    if store is not None:
+    if store is not None and not resumable:
         _event(
             store,
             "run_started",
@@ -412,9 +418,13 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
         store.write_json("environment.json", runtime_environment(dist))
     _wait_for_everyone(state)
     _require_cuda(cfg)
-    if store is not None:
+    if store is not None and not resumable:
         cfg = _resolve_hub_revisions(cfg)
         store.write_json("config.resolved.json", cfg.model_dump(mode="json"))
+    elif store is not None:
+        cfg = RunPodGRPOConfig.model_validate(
+            _read_json_object(run_dir / "config.resolved.json")
+        )
     _wait_for_everyone(state)
     if store is None:
         cfg = RunPodGRPOConfig.model_validate(
@@ -522,6 +532,37 @@ def _compile_runpod_plan(
         training_example_ids=tuple(row.id for row in train_examples),
         selection_example_ids=tuple(row.id for row in selection_examples),
         promotion_example_ids=tuple(row.id for row in promotion_examples),
+        evaluation_contract=EvalContract.from_components(
+            suite_id="gsm8k-runpod-promotion",
+            suite_version=(
+                f"{cfg.dataset.dataset_name}:{dataset_revision}:"
+                f"seed={cfg.dataset.split_seed}"
+            ),
+            example_ids=tuple(row.id for row in promotion_examples),
+            example_content=tuple(
+                {
+                    "id": row.id,
+                    "question": row.question,
+                    "gold_answer": row.gold_answer,
+                }
+                for row in promotion_examples
+            ),
+            prompt_contract={"prompt_style": cfg.dataset.prompt_style},
+            verifier_contract={"task": "gsm8k", "verifier": "exact-answer-v1"},
+            generation_contract=cfg.eval.model_dump(mode="json"),
+            primary_metric="accuracy",
+        ),
+        content_separation=certify_content_separation(
+            training_texts=tuple(row.question for row in train_examples),
+            protected_texts=tuple(
+                row.question for row in (*selection_examples, *promotion_examples)
+            ),
+        ),
+        verifier_separation=VerifierSeparation(
+            verifier_kind="executable_ground_truth",
+            training_verifier_id="gsm8k-exact-answer-v1",
+            promotion_verifier_id="gsm8k-exact-answer-v1",
+        ),
         promotion_gate={
             "min_examples": cfg.promotion.min_eval_examples,
             "min_primary_delta": max(cfg.promotion.min_accuracy_delta, 1e-12),
@@ -804,7 +845,7 @@ class _RunPodGRPOAdapter:
 
     def _evaluate(
         self,
-        _plan: RunPlan,
+        plan: RunPlan,
         prior: dict[str, StageOutput],
     ) -> StageOutput:
         started = time.perf_counter()
@@ -828,11 +869,19 @@ class _RunPodGRPOAdapter:
         _write_eval_outputs(self.store, "candidate", candidate_rows)
         self.store.write_json(
             "evals/baseline.json",
-            _runpod_promotion_artifact("baseline", baseline_rows).to_dict(),
+            _runpod_promotion_artifact(
+                "baseline",
+                baseline_rows,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
         )
         self.store.write_json(
             "evals/candidate.json",
-            _runpod_promotion_artifact("candidate", candidate_rows).to_dict(),
+            _runpod_promotion_artifact(
+                "candidate",
+                candidate_rows,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
         )
         return _runpod_output(
             self.store,
@@ -1983,6 +2032,8 @@ def _eval_metrics(rows: Sequence[EvalRow]) -> dict[str, float]:
 def _runpod_promotion_artifact(
     artifact_id: str,
     rows: Sequence[EvalRow],
+    *,
+    evaluation_contract_hash: str,
 ) -> EvalArtifact:
     metrics = _eval_metrics(rows)
     examples = tuple(
@@ -1998,6 +2049,7 @@ def _runpod_promotion_artifact(
     return EvalArtifact(
         artifact_id=artifact_id,
         primary_metric="accuracy",
+        evaluation_contract_hash=evaluation_contract_hash,
         examples=examples,
         metrics=metrics,
         slices={"easy_stable": {"accuracy": metrics["accuracy"]}},

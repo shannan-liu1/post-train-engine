@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -23,6 +24,7 @@ _PAIRED_CORRECTNESS_PRIMARY_METRICS = {
     "greedy_exact_accuracy@1",
     "pass@1",
 }
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _SEVERITY_ORDER: dict[Severity, int] = {
     "none": 0,
@@ -73,6 +75,7 @@ class EvalArtifact:
     artifact_id: str
     primary_metric: str
     examples: tuple[EvalExampleResult, ...]
+    evaluation_contract_hash: str | None = None
     metrics: Mapping[str, float] = field(default_factory=dict)
     slices: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -82,6 +85,12 @@ class EvalArtifact:
             raise ValueError("artifact_id must be non-empty")
         if not self.primary_metric:
             raise ValueError("primary_metric must be non-empty")
+        if self.evaluation_contract_hash is not None and not _SHA256_RE.fullmatch(
+            self.evaluation_contract_hash
+        ):
+            raise ValueError(
+                "evaluation_contract_hash must use sha256:<64 lowercase hex chars>"
+            )
         _assert_unique_eval_example_ids(self.examples)
         _assert_finite_metric_map(self.metrics, label="metrics")
         for slice_name, values in self.slices.items():
@@ -111,6 +120,11 @@ class EvalArtifact:
         return cls(
             artifact_id=artifact_id,
             primary_metric=primary_metric,
+            evaluation_contract_hash=(
+                str(body["evaluation_contract_hash"])
+                if body.get("evaluation_contract_hash") is not None
+                else None
+            ),
             examples=examples,
             metrics=metrics,
             slices={
@@ -127,6 +141,7 @@ class EvalArtifact:
         return {
             "artifact_id": self.artifact_id,
             "primary_metric": self.primary_metric,
+            "evaluation_contract_hash": self.evaluation_contract_hash,
             "metrics": dict(self.metrics),
             "slices": {key: dict(value) for key, value in self.slices.items()},
             "examples": [asdict(example) for example in self.examples],
@@ -280,6 +295,16 @@ def decide_promotion(
     *,
     canary_decision: CanaryDecision | Mapping[str, Any] | None = None,
 ) -> PromotionDecision:
+    if (
+        baseline_eval.evaluation_contract_hash is None
+        or candidate_eval.evaluation_contract_hash is None
+    ):
+        raise ValueError("promotion artifacts require an evaluation contract")
+    if (
+        baseline_eval.evaluation_contract_hash
+        != candidate_eval.evaluation_contract_hash
+    ):
+        raise ValueError("promotion artifacts use different evaluation contracts")
     if baseline_eval.primary_metric != candidate_eval.primary_metric:
         raise ValueError(
             "eval artifacts must declare the same primary_metric; "

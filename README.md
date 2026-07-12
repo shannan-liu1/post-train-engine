@@ -25,9 +25,9 @@ have complete production evidence.
 ## Install and verify
 
 ```powershell
-uv sync --extra dev
-uv run pytest -q
-uv run ruff check .
+uv sync --frozen --extra dev
+uv run --frozen pytest -q
+uv run --frozen ruff check .
 ```
 
 Codex on Windows can use the repository-local wrapper when the global `uv` cache is sandboxed:

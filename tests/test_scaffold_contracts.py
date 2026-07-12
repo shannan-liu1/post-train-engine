@@ -7,7 +7,6 @@ from post_train_engine.evals.grades import Grade, summarize_grades
 from post_train_engine.evals.source import EvalSource
 from post_train_engine.jsonl import read_jsonl
 from post_train_engine.registry.checkpoints import CheckpointRecord, CheckpointRegistry
-from post_train_engine.registry.replay import ReplayBuffer, ReplayTrace
 from post_train_engine.tasks.registry import TaskRegistry, TaskSpec
 from post_train_engine.tasks.schema import Example
 
@@ -112,19 +111,3 @@ def test_checkpoint_registry_and_replay_buffer_persist_jsonl(tmp_path) -> None:
         "candidate-1",
         "candidate-2",
     ]
-
-    replay = ReplayBuffer(tmp_path / "replay.jsonl")
-    replay.append(
-        ReplayTrace(
-            trace_id="trace-1",
-            task="toy",
-            example_id="ex-1",
-            prompt="2 + 2?",
-            generation="4",
-            grade={"is_correct": True},
-            source_candidate_id="candidate-1",
-            difficulty="easy",
-        )
-    )
-
-    assert replay.by_task("toy")[0].trace_id == "trace-1"

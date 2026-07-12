@@ -44,6 +44,7 @@ class ArtifactRef(BaseModel):
     kind: str = Field(..., min_length=1)
     sha256: str
     required: StrictBool = True
+    visibility: Literal["standard", "sealed"] = "standard"
 
     @field_validator("path")
     @classmethod
@@ -169,17 +170,40 @@ class RunBundle:
             raise ValueError(f"manifest JSON root must be an object: {manifest_path}")
         return cls(root, RunManifest.model_validate(raw))
 
-    def artifact_path(self, name: str) -> Path:
+    def artifact_path(self, name: str, *, allow_sealed: bool = False) -> Path:
         try:
             ref = self.manifest.artifacts[name]
         except KeyError as exc:
             raise ValueError(f"manifest missing artifact {name!r}") from exc
+        if ref.visibility == "sealed" and not allow_sealed:
+            raise ValueError(
+                f"sealed artifact {name!r} requires explicit sealed evidence access"
+            )
         candidate = (self.root / PurePosixPath(ref.path)).resolve()
         try:
             candidate.relative_to(self.root)
         except ValueError as exc:
             raise ValueError(f"artifact path escapes run bundle: {ref.path}") from exc
         return candidate
+
+    def verified_artifact_path(
+        self,
+        name: str,
+        *,
+        allow_sealed: bool = False,
+    ) -> Path:
+        """Return one contained artifact only when its recorded bytes still match."""
+
+        path = self.artifact_path(name, allow_sealed=allow_sealed)
+        if not path.is_file():
+            raise ValueError(f"artifact is not a file: {name!r}")
+        actual = _sha256(path)
+        expected = self.manifest.artifacts[name].sha256
+        if actual != expected:
+            raise ValueError(
+                f"artifact hash mismatch for {name!r}: expected {expected}, got {actual}"
+            )
+        return path
 
     def validate(self) -> dict[str, Any]:
         manifest_path = self.root / "manifest.json"
@@ -197,7 +221,7 @@ class RunBundle:
             }
         ]
         for name, ref in sorted(self.manifest.artifacts.items()):
-            path = self.artifact_path(name)
+            path = self.artifact_path(name, allow_sealed=True)
             actual = _sha256(path) if path.is_file() else None
             if not path.is_file():
                 status = "missing"
@@ -209,7 +233,8 @@ class RunBundle:
                 {
                     "name": name,
                     "kind": ref.kind,
-                    "path": ref.path,
+                    "path": "[SEALED]" if ref.visibility == "sealed" else ref.path,
+                    "visibility": ref.visibility,
                     "required": ref.required,
                     "status": status,
                     "exists": path.is_file(),
@@ -217,9 +242,14 @@ class RunBundle:
                     "actual_sha256": actual,
                 }
             )
-        statuses.append(self._promotion_consistency_status())
-        statuses.append(self._training_view_leakage_status())
-        statuses.append(self._grpo_reward_evidence_status())
+        physical_failures = any(
+            status["required"] and status["status"] != "ok"
+            for status in statuses
+        )
+        if not physical_failures:
+            statuses.append(self._promotion_consistency_status())
+            statuses.append(self._training_view_leakage_status())
+            statuses.append(self._grpo_reward_evidence_status())
         failures = [
             status
             for status in statuses
@@ -284,7 +314,7 @@ class RunBundle:
     def _read_artifact_object(self, name: str) -> dict[str, Any]:
         if name not in self.manifest.artifacts:
             raise ValueError(f"manifest missing artifact {name!r}")
-        path = self.artifact_path(name)
+        path = self.verified_artifact_path(name, allow_sealed=True)
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"artifact {name!r} JSON root must be an object")
@@ -386,7 +416,7 @@ class RunBundle:
         return _semantic_status("grpo_reward_evidence", status="ok")
 
     def _read_jsonl_artifact(self, name: str) -> list[dict[str, Any]]:
-        path = self.artifact_path(name)
+        path = self.verified_artifact_path(name, allow_sealed=True)
         rows: list[dict[str, Any]] = []
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(),
@@ -460,6 +490,7 @@ def make_artifact_ref(
     *,
     kind: str,
     required: bool = True,
+    visibility: Literal["standard", "sealed"] = "standard",
 ) -> ArtifactRef:
     """Build one portable content-addressed reference inside a Run bundle."""
 
@@ -476,6 +507,7 @@ def make_artifact_ref(
         kind=kind,
         sha256=_sha256(path),
         required=required,
+        visibility=visibility,
     )
 
 

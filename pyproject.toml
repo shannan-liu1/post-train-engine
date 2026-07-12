@@ -47,11 +47,11 @@ rollout = [
     "vllm",
 ]
 optimizer = [
-    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon@f98f1cacc0263b04290753e32be8d498c1efc806",
 ]
 gpu = [
     "vllm",
-    "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon@f98f1cacc0263b04290753e32be8d498c1efc806",
 ]
 chaineval = [
     "bert-score",

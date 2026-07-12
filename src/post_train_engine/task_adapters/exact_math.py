@@ -122,11 +122,19 @@ class ExactMathRunAdapter:
     def _evaluate(
         self,
         root: Path,
-        _plan: RunPlan,
+        plan: RunPlan,
         _prior: dict[str, StageOutput],
     ) -> dict[str, str]:
-        baseline = _eval_artifact("baseline", correct=(False, False, False, False))
-        candidate = _eval_artifact("candidate", correct=(True, True, True, True))
+        baseline = _eval_artifact(
+            "baseline",
+            correct=(False, False, False, False),
+            evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+        )
+        candidate = _eval_artifact(
+            "candidate",
+            correct=(True, True, True, True),
+            evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+        )
         baseline_path = _write_json(root / "eval" / "baseline.json", baseline)
         candidate_path = _write_json(root / "eval" / "candidate.json", candidate)
         return {"baseline_eval": str(baseline_path), "candidate_eval": str(candidate_path)}
@@ -144,11 +152,17 @@ class ExactMathRunAdapter:
         return {"final_report_json": str(path)}
 
 
-def _eval_artifact(artifact_id: str, *, correct: tuple[bool, ...]) -> dict[str, Any]:
+def _eval_artifact(
+    artifact_id: str,
+    *,
+    correct: tuple[bool, ...],
+    evaluation_contract_hash: str,
+) -> dict[str, Any]:
     accuracy = sum(correct) / len(correct)
     return {
         "artifact_id": artifact_id,
         "primary_metric": "accuracy",
+        "evaluation_contract_hash": evaluation_contract_hash,
         "metrics": {"accuracy": accuracy, "mean_tokens": 1.0},
         "slices": {"easy_stable": {"accuracy": accuracy}},
         "examples": [

@@ -8,6 +8,9 @@ from post_train_engine.jsonl import append_jsonl, read_jsonl
 from post_train_engine.traces.schema import TraceRecord
 
 
+_TRAINING_ELIGIBLE_ROLES = frozenset({"train", "probe", "replay"})
+
+
 class JsonlTraceStore:
     """Append-only local trace store backed by JSONL."""
 
@@ -21,6 +24,18 @@ class JsonlTraceStore:
         if not self.path.exists():
             return []
         return [TraceRecord.model_validate(row) for row in read_jsonl(self.path)]
+
+    def training_eligible(self, *, task_id: str | None = None) -> tuple[TraceRecord, ...]:
+        """Query replayable evidence without admitting protected evaluation roles."""
+
+        if task_id == "":
+            raise ValueError("task_id must be non-empty when provided")
+        return tuple(
+            trace
+            for trace in self.read_all()
+            if trace.split_role in _TRAINING_ELIGIBLE_ROLES
+            and (task_id is None or trace.task_id == task_id)
+        )
 
 
 __all__ = ["JsonlTraceStore"]

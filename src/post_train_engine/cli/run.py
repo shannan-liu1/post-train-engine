@@ -30,6 +30,11 @@ from post_train_engine.evals.promotion import (
     PromotionGateConfig,
     load_eval_artifact,
 )
+from post_train_engine.evals.contract import EvalContract
+from post_train_engine.evidence_safety import (
+    VerifierSeparation,
+    certify_content_separation,
+)
 from post_train_engine.engine import (
     RunEngine,
     RunPlan,
@@ -295,6 +300,32 @@ def _compile_local_gsm8k_smoke(
         },
         training_example_ids=tuple(example.id for example in train_examples),
         promotion_example_ids=tuple(example.id for example in promotion_examples),
+        evaluation_contract=EvalContract.from_components(
+            suite_id="gsm8k-local-smoke",
+            suite_version="2026-06-16",
+            example_ids=tuple(example.id for example in promotion_examples),
+            example_content=tuple(
+                {
+                    "id": example.id,
+                    "question": example.question,
+                    "gold_answer": example.gold_answer,
+                }
+                for example in promotion_examples
+            ),
+            prompt_contract={"prompt_style": cfg.prompt_style},
+            verifier_contract={"task": "gsm8k", "verifier": "exact-answer-v1"},
+            generation_contract={"backend": "deterministic_fixture", "seed": cfg.seed},
+            primary_metric="greedy_exact_accuracy@1",
+        ),
+        content_separation=certify_content_separation(
+            training_texts=tuple(example.question for example in train_examples),
+            protected_texts=tuple(example.question for example in promotion_examples),
+        ),
+        verifier_separation=VerifierSeparation(
+            verifier_kind="executable_ground_truth",
+            training_verifier_id="gsm8k-exact-answer-v1",
+            promotion_verifier_id="gsm8k-exact-answer-v1",
+        ),
         promotion_gate=asdict(promotion_gate),
         metadata={
             "compute_required": "none",
@@ -522,11 +553,13 @@ class _LocalGSM8KSmokeAdapter:
             promotion_examples,
             artifact_id="seed",
             model_id=self.cfg.model_id,
+            evaluation_contract_hash=plan.evaluation_contract.contract_hash,
         )
         candidate = _fixture_eval_artifact(
             promotion_examples,
             artifact_id=plan.candidate_id,
             model_id=self.cfg.model_id,
+            evaluation_contract_hash=plan.evaluation_contract.contract_hash,
         )
         baseline_path = Path(plan.output_dir) / "eval" / "baseline.json"
         candidate_path = Path(plan.output_dir) / "eval" / "candidate.json"
@@ -720,6 +753,7 @@ def _fixture_eval_artifact(
     *,
     artifact_id: str,
     model_id: str,
+    evaluation_contract_hash: str,
 ) -> EvalArtifact:
     results = (
         EvalExampleResult(
@@ -741,6 +775,7 @@ def _fixture_eval_artifact(
     return EvalArtifact(
         artifact_id=artifact_id,
         primary_metric="greedy_exact_accuracy@1",
+        evaluation_contract_hash=evaluation_contract_hash,
         examples=results,
         metrics={
             "greedy_exact_accuracy@1": accuracy,

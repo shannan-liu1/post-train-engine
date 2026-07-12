@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from post_train_engine.evals.promotion import (
@@ -11,6 +13,10 @@ from post_train_engine.evals.promotion import (
     decide_promotion,
     load_promotion_gate_config,
 )
+
+
+_EVAL_CONTRACT_HASH = "sha256:" + "1" * 64
+_OTHER_EVAL_CONTRACT_HASH = "sha256:" + "2" * 64
 
 
 def _artifact(
@@ -35,9 +41,21 @@ def _artifact(
     return EvalArtifact(
         artifact_id=artifact_id,
         primary_metric="greedy_exact_accuracy@1",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=examples,
         metrics={"greedy_exact_accuracy@1": accuracy},
     )
+
+
+def test_promotion_rejects_mismatched_evaluation_contracts() -> None:
+    baseline = _artifact("old", [False, False])
+    candidate = replace(
+        _artifact("new", [True, False]),
+        evaluation_contract_hash=_OTHER_EVAL_CONTRACT_HASH,
+    )
+
+    with pytest.raises(ValueError, match="evaluation contract"):
+        decide_promotion(baseline, candidate, PromotionGateConfig())
 
 
 def test_promotion_rejects_flat_two_percent_with_high_churn() -> None:
@@ -93,6 +111,7 @@ def test_promotion_rejects_when_easy_regression_evidence_is_missing() -> None:
     baseline = EvalArtifact(
         artifact_id="old",
         primary_metric="greedy_exact_accuracy@1",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=tuple(
             EvalExampleResult(example_id=f"e{idx:03d}", correct=False, tokens=10)
             for idx in range(100)
@@ -101,6 +120,7 @@ def test_promotion_rejects_when_easy_regression_evidence_is_missing() -> None:
     candidate = EvalArtifact(
         artifact_id="new",
         primary_metric="greedy_exact_accuracy@1",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=tuple(
             EvalExampleResult(
                 example_id=f"e{idx:03d}",
@@ -218,6 +238,7 @@ def test_promotion_fails_closed_on_mismatched_primary_metric_contracts() -> None
     candidate = EvalArtifact(
         artifact_id="new",
         primary_metric="sampled_pass@16",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=tuple(
             EvalExampleResult(
                 example_id=f"e{idx:03d}",
@@ -238,6 +259,7 @@ def test_promotion_fails_closed_on_unsupported_primary_metric_contracts() -> Non
     baseline = EvalArtifact(
         artifact_id="old",
         primary_metric="sampled_pass@16",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=tuple(
             EvalExampleResult(
                 example_id=f"e{idx:03d}",
@@ -252,6 +274,7 @@ def test_promotion_fails_closed_on_unsupported_primary_metric_contracts() -> Non
     candidate = EvalArtifact(
         artifact_id="new",
         primary_metric="sampled_pass@16",
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=tuple(
             EvalExampleResult(
                 example_id=f"e{idx:03d}",
@@ -327,11 +350,13 @@ def test_promotion_rejects_required_slice_regression_even_when_global_delta_pass
         EvalArtifact(
             artifact_id="old",
             primary_metric="greedy_exact_accuracy@1",
+            evaluation_contract_hash=_EVAL_CONTRACT_HASH,
             examples=tuple(baseline_rows),
         ),
         EvalArtifact(
             artifact_id="new",
             primary_metric="greedy_exact_accuracy@1",
+            evaluation_contract_hash=_EVAL_CONTRACT_HASH,
             examples=tuple(candidate_rows),
         ),
         PromotionGateConfig(
@@ -377,6 +402,7 @@ def test_promotion_rejects_critical_or_high_severity_regressions() -> None:
     protected_candidate = EvalArtifact(
         artifact_id="new-protected",
         primary_metric=baseline.primary_metric,
+        evaluation_contract_hash=_EVAL_CONTRACT_HASH,
         examples=(
             EvalExampleResult(
                 example_id="e000",

@@ -3,9 +3,36 @@ from __future__ import annotations
 import pytest
 
 from post_train_engine.evidence_safety import (
+    ContentSeparationCertificate,
     VerifierSeparation,
     certify_content_separation,
 )
+
+
+def test_content_separation_certificate_rejects_failed_threshold() -> None:
+    with pytest.raises(ValueError, match="exceeds threshold"):
+        ContentSeparationCertificate(
+            training_count=1,
+            protected_count=1,
+            ngram_size=3,
+            max_allowed_jaccard=0.8,
+            observed_max_jaccard=0.9,
+            closest_training_index=0,
+            closest_protected_index=0,
+        )
+
+
+def test_content_separation_certificate_rejects_out_of_range_evidence() -> None:
+    with pytest.raises(ValueError, match="closest training index"):
+        ContentSeparationCertificate(
+            training_count=1,
+            protected_count=1,
+            ngram_size=5,
+            max_allowed_jaccard=0.8,
+            observed_max_jaccard=0.1,
+            closest_training_index=1,
+            closest_protected_index=0,
+        )
 
 
 def test_content_separation_rejects_near_duplicate_protected_text() -> None:

@@ -23,6 +23,29 @@ class ContentSeparationCertificate(BaseModel):
     closest_training_index: int | None = Field(default=None, ge=0)
     closest_protected_index: int | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def _observed_overlap_must_pass(self) -> ContentSeparationCertificate:
+        if self.observed_max_jaccard > self.max_allowed_jaccard:
+            raise ValueError(
+                "training and protected evaluation content overlap exceeds threshold: "
+                f"{self.observed_max_jaccard:.6f} > {self.max_allowed_jaccard:.6f}"
+            )
+        if (self.closest_training_index is None) != (
+            self.closest_protected_index is None
+        ):
+            raise ValueError("closest content indices must be both present or both absent")
+        if (
+            self.closest_training_index is not None
+            and self.closest_training_index >= self.training_count
+        ):
+            raise ValueError("closest training index exceeds the certified row count")
+        if (
+            self.closest_protected_index is not None
+            and self.closest_protected_index >= self.protected_count
+        ):
+            raise ValueError("closest protected index exceeds the certified row count")
+        return self
+
 
 class VerifierSeparation(BaseModel):
     model_config = _FROZEN_FORBID

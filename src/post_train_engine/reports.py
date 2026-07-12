@@ -7,14 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from post_train_engine.artifacts import validate_run_bundle
+from post_train_engine.run_bundle import RunBundle
 
 
 def write_run_report(run_dir: str | Path) -> dict[str, Any]:
     run_dir = Path(run_dir)
     artifact_status = validate_run_bundle(run_dir, write=True)
+    bundle = RunBundle.load(run_dir)
     manifest = _read_json(run_dir / "manifest.json")
     if manifest["status"] == "failed":
-        failure = _read_json(_artifact_path(run_dir, manifest, "failure"))
+        failure = _read_json(bundle.verified_artifact_path("failure"))
         promotion = {
             "decision": "failed",
             "primary_metric": None,
@@ -24,7 +26,7 @@ def write_run_report(run_dir: str | Path) -> dict[str, Any]:
             ],
         }
     else:
-        promotion = _read_json(_artifact_path(run_dir, manifest, "promotion_decision"))
+        promotion = _read_json(bundle.verified_artifact_path("promotion_decision"))
     summary = {
         "run_id": manifest["run_id"],
         "candidate_id": manifest["candidate_id"],
@@ -45,6 +47,7 @@ def write_run_report(run_dir: str | Path) -> dict[str, Any]:
         "artifacts": {
             name: ref["path"]
             for name, ref in dict(manifest.get("artifacts", {})).items()
+            if ref.get("visibility", "standard") != "sealed"
         },
     }
     runpod_plan_path = run_dir / "runpod_plan.json"
@@ -82,14 +85,6 @@ def _markdown_report(summary: dict[str, Any]) -> str:
             "",
         ],
     )
-
-
-def _artifact_path(run_dir: Path, manifest: dict[str, Any], name: str) -> Path:
-    try:
-        path = Path(manifest["artifacts"][name]["path"])
-    except KeyError as exc:
-        raise ValueError(f"manifest missing artifact {name!r}") from exc
-    return path if path.is_absolute() else run_dir / path
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:

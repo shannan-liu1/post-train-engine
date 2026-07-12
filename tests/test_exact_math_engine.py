@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from post_train_engine.engine import RunEngine, RunPlan
+from post_train_engine.evals.contract import EvalContract
+from post_train_engine.evidence_safety import (
+    VerifierSeparation,
+    certify_content_separation,
+)
 from post_train_engine.task_adapters import ExactMathRunAdapter
 
 
@@ -14,7 +19,28 @@ def test_second_executable_verifier_task_runs_through_engine(tmp_path: Path) -> 
         task_name="exact_math_tool",
         model_id="deterministic-calculator-policy",
         output_dir=str(tmp_path / "run"),
+        training_example_ids=tuple(f"math-{index}" for index in range(4)),
         promotion_example_ids=tuple(f"promotion-{index}" for index in range(4)),
+        evaluation_contract=EvalContract.from_components(
+            suite_id="exact-math-promotion",
+            suite_version="v1",
+            example_ids=tuple(f"promotion-{index}" for index in range(4)),
+            example_content=("9 + 8", "7 * 6", "20 - 3", "18 / 3"),
+            prompt_contract={"task": "exact_math_tool"},
+            verifier_contract={"verifier": "exact-integer-v1"},
+            generation_contract={"backend": "deterministic"},
+            primary_metric="accuracy",
+        ),
+        content_separation=certify_content_separation(
+            training_texts=("2 + 2", "3 * 5", "12 - 7", "8 / 2"),
+            protected_texts=("9 + 8", "7 * 6", "20 - 3", "18 / 3"),
+            ngram_size=2,
+        ),
+        verifier_separation=VerifierSeparation(
+            verifier_kind="executable_ground_truth",
+            training_verifier_id="exact-integer-v1",
+            promotion_verifier_id="exact-integer-v1",
+        ),
         promotion_gate={
             "min_primary_delta": 0.1,
             "min_primary_ci_low": -1.0,

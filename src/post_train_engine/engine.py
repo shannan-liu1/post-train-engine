@@ -13,6 +13,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from post_train_engine.artifacts import require_valid_run_bundle
 from post_train_engine.campaign import CampaignStore, ProposalOutcome, recommend_from_run
 from post_train_engine.evaluation_roles import EvaluationRoles
+from post_train_engine.evidence_safety import (
+    ContentSeparationCertificate,
+    VerifierSeparation,
+)
+from post_train_engine.evals.contract import EvalContract, hash_example_ids
 from post_train_engine.evals.promotion import (
     PromotionGateConfig,
     decide_promotion,
@@ -98,6 +103,9 @@ class RunPlan(BaseModel):
     promotion_example_ids: tuple[str, ...] = ()
     canary_example_ids: tuple[str, ...] = ()
     unseen_example_ids: tuple[str, ...] = ()
+    evaluation_contract: EvalContract
+    content_separation: ContentSeparationCertificate
+    verifier_separation: VerifierSeparation
     max_cost_usd: float | None = Field(default=None, ge=0.0)
     promotion_gate: dict[str, Any] = Field(default_factory=dict)
     campaign: CampaignBinding | None = None
@@ -113,6 +121,22 @@ class RunPlan(BaseModel):
             unseen_example_ids=self.unseen_example_ids,
         )
         roles.require_training_eligible(self.training_example_ids)
+        if not self.promotion_example_ids:
+            raise ValueError("RunPlan requires promotion example IDs")
+        if self.evaluation_contract.example_ids_sha256 != hash_example_ids(
+            self.promotion_example_ids
+        ):
+            raise ValueError(
+                "RunPlan promotion example IDs do not match the evaluation contract example IDs"
+            )
+        expected_protected_count = len(roles.protected_example_ids)
+        if (
+            self.content_separation.training_count != len(self.training_example_ids)
+            or self.content_separation.protected_count != expected_protected_count
+        ):
+            raise ValueError(
+                "RunPlan content separation counts do not match training and protected roles"
+            )
         missing = {"model", "dataset"}.difference(self.inputs)
         if missing:
             raise ValueError("RunPlan missing core inputs: " + ", ".join(sorted(missing)))
@@ -124,6 +148,15 @@ class RunPlan(BaseModel):
             raise ValueError(
                 "RunPlan parent_candidate_id must match the campaign expected Incumbent"
             )
+        if self.campaign is not None and self.campaign.promotion_suite_id is not None:
+            if (
+                self.campaign.promotion_suite_id != self.evaluation_contract.suite_id
+                or self.campaign.promotion_suite_version
+                != self.evaluation_contract.suite_version
+            ):
+                raise ValueError(
+                    "campaign promotion suite must match the evaluation contract"
+                )
         return self
 
     @property
@@ -162,6 +195,7 @@ class StageReceipt(BaseModel):
     plan_hash: str
     duration_seconds: float = Field(..., ge=0.0)
     output: StageOutput
+    artifact_sha256: dict[str, str]
 
 
 class StageIntent(BaseModel):
@@ -356,6 +390,7 @@ class RunEngine:
                     plan_hash=plan.plan_hash,
                     duration_seconds=time.perf_counter() - started,
                     output=output,
+                    artifact_sha256=_hash_stage_artifacts(run_dir, output),
                 )
                 _write_model_atomic(receipt_path, receipt)
             if coordinator is not None:
@@ -444,6 +479,9 @@ class RunEngine:
         receipt = StageReceipt.model_validate_json(path.read_text(encoding="utf-8"))
         if receipt.plan_hash != plan.plan_hash or receipt.stage != stage:
             raise ValueError(f"stage receipt does not match RunPlan: {path}")
+        run_dir = path.parent.parent.resolve()
+        if _hash_stage_artifacts(run_dir, receipt.output) != receipt.artifact_sha256:
+            raise ValueError(f"stage receipt artifact hash mismatch: {path}")
         return receipt
 
     def _finalize_run(
@@ -464,12 +502,22 @@ class RunEngine:
             for name, raw_path in receipt.output.artifacts.items():
                 if name in artifacts:
                     raise ValueError(f"duplicate artifact name across stages: {name}")
-                artifacts[name] = make_artifact_ref(run_dir, raw_path, kind=name)
+                artifacts[name] = make_artifact_ref(
+                    run_dir,
+                    raw_path,
+                    kind=name,
+                    visibility=(
+                        "sealed"
+                        if name in {"baseline_eval", "candidate_eval", "canary_eval", "unseen_eval"}
+                        else "standard"
+                    ),
+                )
             receipt_path = run_dir / "state" / f"{receipt.stage}.json"
             artifacts[f"stage_receipt_{receipt.stage}"] = make_artifact_ref(
                 run_dir,
                 receipt_path,
                 kind="stage_receipt",
+                visibility="sealed" if receipt.stage == "evaluate" else "standard",
             )
         if "promotion_decision" not in artifacts:
             raise ValueError("promote stage must emit promotion_decision artifact")
@@ -497,6 +545,12 @@ class RunEngine:
                     }
                 ),
                 "plan_hash": plan.plan_hash,
+                "evaluation_contract": {
+                    **plan.evaluation_contract.model_dump(mode="json"),
+                    "contract_hash": plan.evaluation_contract.contract_hash,
+                },
+                "content_separation": plan.content_separation.model_dump(mode="json"),
+                "verifier_separation": plan.verifier_separation.model_dump(mode="json"),
                 "stage_order": list(CANONICAL_STAGE_ORDER),
                 "cost_usd": spent,
                 **_cost_certification_metadata(receipts),
@@ -539,6 +593,7 @@ class RunEngine:
                     run_dir,
                     receipt_path,
                     kind="stage_receipt",
+                    visibility="sealed" if receipt.stage == "evaluate" else "standard",
                 )
         manifest = RunManifest(
             run_id=plan.run_id,
@@ -553,6 +608,12 @@ class RunEngine:
             metadata={
                 **plan.metadata,
                 "plan_hash": plan.plan_hash,
+                "evaluation_contract": {
+                    **plan.evaluation_contract.model_dump(mode="json"),
+                    "contract_hash": plan.evaluation_contract.contract_hash,
+                },
+                "content_separation": plan.content_separation.model_dump(mode="json"),
+                "verifier_separation": plan.verifier_separation.model_dump(mode="json"),
                 "stage_order": list(CANONICAL_STAGE_ORDER),
                 "failed_stage": failed_stage,
                 "cost_usd": spent,
@@ -657,9 +718,35 @@ class RunEngine:
             raise ValueError(
                 "evaluate stage must emit baseline_eval and candidate_eval artifacts"
             ) from exc
+        baseline_eval = load_eval_artifact(baseline_path)
+        candidate_eval = load_eval_artifact(candidate_path)
+        expected_contract_hash = plan.evaluation_contract.contract_hash
+        if (
+            baseline_eval.evaluation_contract_hash != expected_contract_hash
+            or candidate_eval.evaluation_contract_hash != expected_contract_hash
+        ):
+            raise ValueError(
+                "promotion artifacts do not match the RunPlan evaluation contract"
+            )
+        if (
+            baseline_eval.primary_metric != plan.evaluation_contract.primary_metric
+            or candidate_eval.primary_metric != plan.evaluation_contract.primary_metric
+        ):
+            raise ValueError(
+                "promotion artifacts do not match the evaluation contract primary metric"
+            )
+        expected_example_ids_hash = plan.evaluation_contract.example_ids_sha256
+        if any(
+            hash_example_ids(tuple(row.example_id for row in artifact.examples))
+            != expected_example_ids_hash
+            for artifact in (baseline_eval, candidate_eval)
+        ):
+            raise ValueError(
+                "promotion artifact rows do not match the evaluation contract"
+            )
         decision = decide_promotion(
-            load_eval_artifact(baseline_path),
-            load_eval_artifact(candidate_path),
+            baseline_eval,
+            candidate_eval,
             PromotionGateConfig(**plan.promotion_gate),
         )
         path = run_dir / "promotion_decision.json"
@@ -701,9 +788,7 @@ class RunEngine:
             path = run_dir / "state" / f"{stage}.json"
             if not path.is_file() and not require_complete:
                 break
-            receipt = StageReceipt.model_validate_json(path.read_text(encoding="utf-8"))
-            if receipt.plan_hash != plan.plan_hash:
-                raise ValueError(f"existing Run manifest belongs to a different plan: {path}")
+            receipt = self._read_receipt(path, plan, stage)
             receipts.append(receipt)
         return tuple(receipts)
 
@@ -737,6 +822,22 @@ def _write_model_atomic(path: Path, model: BaseModel) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _hash_stage_artifacts(run_dir: Path, output: StageOutput) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for name, raw_path in sorted(output.artifacts.items()):
+        path = Path(raw_path).resolve()
+        try:
+            path.relative_to(run_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(
+                f"stage artifact is outside run directory: {name}={path}"
+            ) from exc
+        if not path.is_file():
+            raise ValueError(f"stage artifact is not a file: {name}={path}")
+        hashes[name] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
 
 
 def _write_json_atomic(path: Path, body: dict[str, Any]) -> None:

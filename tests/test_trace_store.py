@@ -66,6 +66,31 @@ def test_stable_prompt_hash_is_deterministic_sha256() -> None:
     assert len(digest) == len("sha256:") + 64
 
 
+def test_training_eligible_query_excludes_protected_evaluation_roles(
+    tmp_path: Path,
+) -> None:
+    store = JsonlTraceStore(tmp_path / "traces.jsonl")
+    for trace_id, role in (
+        ("train-trace", "train"),
+        ("replay-trace", "replay"),
+        ("promotion-trace", "promotion"),
+        ("canary-trace", "canary"),
+    ):
+        store.append(
+            TraceRecord(
+                **{
+                    **_trace_payload(),
+                    "trace_id": trace_id,
+                    "split_role": role,
+                }
+            )
+        )
+
+    assert [
+        trace.trace_id for trace in store.training_eligible(task_id="gsm8k")
+    ] == ["train-trace", "replay-trace"]
+
+
 def _trace_payload() -> dict[str, object]:
     return {
         "trace_id": "trace-001",

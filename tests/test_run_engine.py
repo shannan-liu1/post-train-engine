@@ -13,6 +13,11 @@ from post_train_engine.engine import (
     RunPlan,
     StageOutput,
 )
+from post_train_engine.evals.contract import EvalContract
+from post_train_engine.evidence_safety import (
+    ContentSeparationCertificate,
+    VerifierSeparation,
+)
 from post_train_engine.run_bundle import RunBundle
 from post_train_engine.campaign import (
     CampaignStore,
@@ -41,6 +46,7 @@ class FakeStageAdapter:
         if stage == "evaluate":
             evaluation = {
                 "primary_metric": "accuracy",
+                "evaluation_contract_hash": plan.evaluation_contract.contract_hash,
                 "metrics": {"accuracy": 0.5, "mean_tokens": 1.0},
                 "slices": {"easy_stable": {"accuracy": 0.5}},
                 "examples": [
@@ -80,6 +86,97 @@ class FakeStageAdapter:
             values={},
             cost_usd=0.0,
         )
+
+
+def _eval_contract(
+    example_ids: tuple[str, ...] = ("eval-1", "eval-2"),
+    *,
+    suite_id: str = "fixture-promotion",
+    suite_version: str = "v1",
+) -> EvalContract:
+    return EvalContract.from_components(
+        suite_id=suite_id,
+        suite_version=suite_version,
+        example_ids=example_ids,
+        example_content=[{"id": value, "prompt": f"prompt:{value}"} for value in example_ids],
+        prompt_contract={"template": "fixture-v1"},
+        verifier_contract={"verifier": "exact-match-v1"},
+        generation_contract={"temperature": 0.0},
+        primary_metric="accuracy",
+    )
+
+
+def test_eval_contract_binds_protected_row_content() -> None:
+    left = _eval_contract()
+    right = EvalContract.from_components(
+        suite_id=left.suite_id,
+        suite_version=left.suite_version,
+        example_ids=("eval-1", "eval-2"),
+        example_content=[
+            {"id": "eval-1", "prompt": "changed"},
+            {"id": "eval-2", "prompt": "prompt:eval-2"},
+        ],
+        prompt_contract={"template": "fixture-v1"},
+        verifier_contract={"verifier": "exact-match-v1"},
+        generation_contract={"temperature": 0.0},
+        primary_metric="accuracy",
+    )
+
+    assert left.example_content_sha256 != right.example_content_sha256
+    assert left.contract_hash != right.contract_hash
+
+
+def _content_separation(
+    *,
+    training_count: int = 0,
+    protected_count: int = 2,
+) -> ContentSeparationCertificate:
+    return ContentSeparationCertificate(
+        training_count=training_count,
+        protected_count=protected_count,
+        ngram_size=3,
+        max_allowed_jaccard=0.8,
+        observed_max_jaccard=0.0,
+    )
+
+
+def _verifier_separation() -> VerifierSeparation:
+    return VerifierSeparation(
+        verifier_kind="executable_ground_truth",
+        training_verifier_id="exact-match-v1",
+        promotion_verifier_id="exact-match-v1",
+    )
+
+
+def test_run_plan_rejects_promotion_rows_outside_eval_contract(tmp_path: Path) -> None:
+    raw = _fixture_plan(tmp_path / "contract-mismatch").model_dump(mode="json")
+    raw["promotion_example_ids"] = ["different-row"]
+
+    with pytest.raises(ValueError, match="evaluation contract example IDs"):
+        RunPlan.model_validate(raw)
+
+
+def test_run_plan_rejects_separation_certificate_count_mismatch(
+    tmp_path: Path,
+) -> None:
+    raw = _fixture_plan(tmp_path / "separation-count-mismatch").model_dump(
+        mode="json"
+    )
+    raw["content_separation"] = ContentSeparationCertificate(
+        training_count=1,
+        protected_count=2,
+        ngram_size=3,
+        max_allowed_jaccard=0.8,
+        observed_max_jaccard=0.0,
+    ).model_dump(mode="json")
+    raw["verifier_separation"] = VerifierSeparation(
+        verifier_kind="executable_ground_truth",
+        training_verifier_id="exact-match-v1",
+        promotion_verifier_id="exact-match-v1",
+    ).model_dump(mode="json")
+
+    with pytest.raises(ValueError, match="content separation counts"):
+        RunPlan.model_validate(raw)
 
 
 class ThreadCoordinator:
@@ -148,6 +245,23 @@ class PromotingStageAdapter(FakeStageAdapter):
         return output
 
 
+class SubstitutedEvaluationRowsAdapter(FakeStageAdapter):
+    def execute_stage(
+        self,
+        stage: str,
+        plan: RunPlan,
+        prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        output = super().execute_stage(stage, plan, prior)
+        if stage == "evaluate":
+            for name in ("baseline_eval", "candidate_eval"):
+                path = Path(output.artifacts[name])
+                body = json.loads(path.read_text(encoding="utf-8"))
+                body["examples"][0]["example_id"] = "substituted-row"
+                path.write_text(json.dumps(body), encoding="utf-8")
+        return output
+
+
 class MissingCostStageAdapter(FakeStageAdapter):
     def execute_stage(
         self,
@@ -188,6 +302,26 @@ class PrepareFailingAdapter(FakeStageAdapter):
         return super().execute_stage(stage, plan, prior)
 
 
+class ExternalArtifactAdapter(FakeStageAdapter):
+    def __init__(self, external_path: Path) -> None:
+        super().__init__()
+        self.external_path = external_path
+
+    def execute_stage(
+        self,
+        stage: str,
+        plan: RunPlan,
+        prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if stage == "prepare":
+            self.external_path.write_text("external", encoding="utf-8")
+            return StageOutput(
+                artifacts={"external": str(self.external_path)},
+                cost_usd=0.0,
+            )
+        return super().execute_stage(stage, plan, prior)
+
+
 def test_run_plan_rejects_campaign_parent_mismatch(tmp_path: Path) -> None:
     raw = _fixture_plan(tmp_path / "parent-mismatch").model_dump(mode="json")
     raw["campaign"] = {
@@ -210,6 +344,10 @@ def test_run_engine_owns_stage_order_manifest_and_resume(tmp_path: Path) -> None
         task_name="fixture",
         model_id="model-1",
         output_dir=str(tmp_path / "run-1"),
+        promotion_example_ids=("eval-1", "eval-2"),
+        evaluation_contract=_eval_contract(),
+        content_separation=_content_separation(),
+        verifier_separation=_verifier_separation(),
         inputs={
             "model": {
                 "kind": "model",
@@ -250,6 +388,52 @@ def test_run_engine_owns_stage_order_manifest_and_resume(tmp_path: Path) -> None
     assert all(receipt.duration_seconds >= 0 for receipt in first.stage_receipts)
 
 
+def test_run_engine_rejects_stage_artifacts_outside_run_root(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "contained-run")
+    adapter = ExternalArtifactAdapter(tmp_path / "external.txt")
+
+    with pytest.raises(ValueError, match="outside run directory"):
+        RunEngine().execute(plan, adapter)
+
+    assert adapter.calls == []
+
+
+def test_run_engine_seals_promotion_rows_from_normal_surfaces(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "sealed-evaluation")
+    execution = RunEngine().execute(plan, FakeStageAdapter())
+    bundle = RunBundle.load(plan.output_dir)
+
+    for name in ("baseline_eval", "candidate_eval"):
+        assert execution.manifest.artifacts[name].visibility == "sealed"
+        with pytest.raises(ValueError, match="sealed artifact"):
+            bundle.artifact_path(name)
+        assert bundle.artifact_path(name, allow_sealed=True).is_file()
+
+    summary = write_run_report(plan.output_dir)
+    assert "baseline_eval" not in summary["artifacts"]
+    assert "candidate_eval" not in summary["artifacts"]
+    assert "stage_receipt_evaluate" not in summary["artifacts"]
+
+
+def test_run_engine_rejects_substituted_evaluation_rows(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "substituted-evaluation-rows")
+
+    with pytest.raises(ValueError, match="rows do not match"):
+        RunEngine().execute(plan, SubstitutedEvaluationRowsAdapter())
+
+
+def test_report_rejects_mutated_artifact_instead_of_consuming_it(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "mutated-report-artifact")
+    execution = RunEngine().execute(plan, FakeStageAdapter())
+    decision = Path(plan.output_dir) / execution.manifest.artifacts[
+        "promotion_decision"
+    ].path
+    decision.write_text('{"decision":"promote"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        write_run_report(plan.output_dir)
+
+
 def test_run_plan_rejects_promotion_data_in_training_view(tmp_path: Path) -> None:
     from pydantic import ValidationError
     import pytest
@@ -264,6 +448,12 @@ def test_run_plan_rejects_promotion_data_in_training_view(tmp_path: Path) -> Non
             training_example_ids=("promotion-1",),
             selection_example_ids=("selection-1",),
             promotion_example_ids=("promotion-1",),
+            evaluation_contract=_eval_contract(("promotion-1",)),
+            content_separation=_content_separation(
+                training_count=1,
+                protected_count=2,
+            ),
+            verifier_separation=_verifier_separation(),
             inputs={
                 "model": {
                     "kind": "model",
@@ -310,6 +500,18 @@ def test_run_engine_persists_terminal_stage_failure_bundle(tmp_path: Path) -> No
     assert resumed.manifest.status == "failed"
 
 
+def test_run_engine_rejects_mutated_receipt_artifact_on_resume(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "mutated-receipt")
+    RunEngine().execute(plan, FakeStageAdapter())
+    (Path(plan.output_dir) / "manifest.json").unlink()
+
+    prepare_artifact = Path(plan.output_dir) / "artifacts" / "prepare.json"
+    prepare_artifact.write_text('{"stage":"tampered"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact hash mismatch"):
+        RunEngine().execute(plan, FailingStageAdapter())
+
+
 def test_run_engine_coordinates_distributed_stages_with_one_writer(
     tmp_path: Path,
 ) -> None:
@@ -320,6 +522,10 @@ def test_run_engine_coordinates_distributed_stages_with_one_writer(
         task_name="fixture",
         model_id="model-1",
         output_dir=str(tmp_path / "distributed-run"),
+        promotion_example_ids=("eval-1", "eval-2"),
+        evaluation_contract=_eval_contract(),
+        content_separation=_content_separation(),
+        verifier_separation=_verifier_separation(),
         inputs={
             "model": {
                 "kind": "model",
@@ -458,6 +664,13 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
         task_name="fixture",
         model_id="model-1",
         output_dir=str(tmp_path / "campaign-run"),
+        promotion_example_ids=("eval-1", "eval-2"),
+        evaluation_contract=_eval_contract(
+            suite_id="suite-1",
+            suite_version="v1",
+        ),
+        content_separation=_content_separation(),
+        verifier_separation=_verifier_separation(),
         inputs={
             "model": {
                 "kind": "model",
@@ -557,6 +770,10 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
     campaign.initialize_incumbent("campaign-1", candidate_id="seed", run_id="seed-run")
     campaign.claim_proposal(proposal_id, worker_id="worker-1", ttl_seconds=60)
     raw = _fixture_plan(tmp_path / "prepare-failure").model_dump(mode="json")
+    raw["evaluation_contract"] = _eval_contract(
+        suite_id="suite-1",
+        suite_version="v1",
+    ).model_dump(mode="json")
     raw["campaign"] = {
         "database_path": str(campaign.path),
         "campaign_id": "campaign-1",
@@ -585,6 +802,10 @@ def _fixture_plan(output_dir: Path, *, max_cost_usd: float | None = None) -> Run
         model_id="model-1",
         output_dir=str(output_dir),
         max_cost_usd=max_cost_usd,
+        promotion_example_ids=("eval-1", "eval-2"),
+        evaluation_contract=_eval_contract(),
+        content_separation=_content_separation(),
+        verifier_separation=_verifier_separation(),
         inputs={
             "model": {
                 "kind": "model",

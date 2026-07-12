@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from post_train_engine.artifacts import require_valid_run_bundle
+from post_train_engine.run_bundle import RunBundle
 
 
 def write_hf_push_plan(
@@ -23,10 +24,11 @@ def write_hf_push_plan(
         raise RuntimeError("push-hf currently supports --dry-run only")
     run_dir = Path(run_dir)
     artifact_status = require_valid_run_bundle(run_dir)
+    bundle = RunBundle.load(run_dir)
     manifest = _read_json(run_dir / "manifest.json")
-    lifecycle_path = _artifact_path(run_dir, manifest, "lifecycle")
+    lifecycle_path = bundle.verified_artifact_path("lifecycle")
     lifecycle = _read_json(lifecycle_path)
-    promotion = _read_json(_artifact_path(run_dir, manifest, "promotion_decision"))
+    promotion = _read_json(bundle.verified_artifact_path("promotion_decision"))
     hf_path = str(lifecycle.get("hf_path") or "")
     if not hf_path:
         raise ValueError("lifecycle artifact missing hf_path")
@@ -71,14 +73,6 @@ def write_hf_push_plan(
     }
     _write_json(run_dir / "push_plan.json", plan)
     return plan
-
-
-def _artifact_path(run_dir: Path, manifest: dict[str, Any], name: str) -> Path:
-    try:
-        path = Path(manifest["artifacts"][name]["path"])
-    except KeyError as exc:
-        raise ValueError(f"manifest missing artifact {name!r}") from exc
-    return path if path.is_absolute() else run_dir / path
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
