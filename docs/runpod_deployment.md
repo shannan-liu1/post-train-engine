@@ -14,7 +14,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
-11. Use `RunPodAllocationPolicy` and `RunPodBudget`. Supply settled campaign spend before creation. The current authorization is Secure Cloud, exactly two A40s, 50 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend across attempts.
+11. Use `RunPodAllocationPolicy` and `RunPodBudget`. Supply settled campaign spend before creation. The current authorization is Secure Cloud, exactly two A40s, 40 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend across attempts.
 12. Probe SSH with `BatchMode=yes`, `PasswordAuthentication=no`, one connection attempt, and a short timeout. Never allow an unattended password prompt to consume paid time.
 
 ## Image and CUDA compatibility
@@ -65,7 +65,7 @@ The minimum request shape below is an example. Substitute the selected image and
   "allowedCudaVersions": ["12.8"],
   "cloudType": "SECURE",
   "computeType": "GPU",
-  "containerDiskInGb": 50,
+  "containerDiskInGb": 40,
   "globalNetworking": true,
   "gpuCount": 2,
   "gpuTypeIds": ["NVIDIA A40"],

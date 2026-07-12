@@ -112,7 +112,7 @@ class RunPodAllocationPolicy(BaseModel):
     cloud_type: Literal["SECURE"] = "SECURE"
     gpu_type: Literal["NVIDIA A40"] = "NVIDIA A40"
     gpu_count: Literal[2] = 2
-    container_disk_gb: Literal[50] = 50
+    container_disk_gb: Literal[40] = 40
     volume_gb: Literal[0] = 0
 
     def validate_request(self, request: dict[str, Any]) -> None:
@@ -125,7 +125,7 @@ class RunPodAllocationPolicy(BaseModel):
         if request.get("gpuCount") != self.gpu_count:
             raise ValueError("RunPod request must use exactly two A40 GPUs")
         if request.get("containerDiskInGb") != self.container_disk_gb:
-            raise ValueError("RunPod request must use exactly 50 GB container disk")
+            raise ValueError("RunPod request must use exactly 40 GB container disk")
         if request.get("volumeInGb") != self.volume_gb:
             raise ValueError("RunPod request must use zero persistent volume")
         if request.get("interruptible") is not False:

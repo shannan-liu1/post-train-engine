@@ -108,7 +108,7 @@ class ManualRunPodExecution(BaseModel):
     gpu_type: str = Field(..., min_length=1)
     gpu_count: int = Field(default=1, gt=0)
     container_image: str = Field(..., min_length=1)
-    disk_gb: int = Field(default=100, ge=50)
+    disk_gb: int = Field(default=100, ge=40)
     volume_gb: int = Field(default=150, ge=0)
     accelerator_hour_usd: float | None = Field(default=None, ge=0.0)
 

@@ -156,7 +156,7 @@ def test_runpod_plan_derives_deployment_environment_from_runpod_config(
     assert environment["allowed_cuda_versions"] == ["12.8"]
     assert environment["gpu_type"] == "NVIDIA A40"
     assert environment["gpu_count"] == 2
-    assert environment["container_disk_gb"] == 50
+    assert environment["container_disk_gb"] == 40
     assert environment["volume_gb"] == 0
     request = build_runpod_create_request(plan, pod_name="pte-r4-deadbeef")
     RunPodAllocationPolicy().validate_request(request)
