@@ -8,13 +8,13 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 2. Query the starting account balance and active Pods. Create at most one Pod at a time.
 3. Use the GPU count required by the evidence claim. A one-GPU run cannot certify a two-GPU claim.
 4. Pin the container image, GPU type, and GPU count. Derive the CUDA allocation filter from the image tag. Never hardcode one global CUDA version.
-5. Add temporary SSH access before Pod creation. Remove only that key during teardown.
+5. Verify one dedicated account SSH identity before Pod creation. Retain a persistent service identity; remove only an explicitly task-scoped temporary identity during teardown.
 6. Use exactly one audited source-delivery mode: an allowlist bundle or an exact Git commit. Never mix source modes within one attempt.
 7. Start a Pod-side deletion watchdog immediately after SSH becomes available.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
-11. Use `RunPodAllocationPolicy` and `RunPodBudget`. The current authorization is Secure Cloud, exactly two A40s, 50 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend.
+11. Use `RunPodAllocationPolicy` and `RunPodBudget`. Supply settled campaign spend before creation. The current authorization is Secure Cloud, exactly two A40s, 50 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend across attempts.
 12. Probe SSH with `BatchMode=yes`, `PasswordAuthentication=no`, one connection attempt, and a short timeout. Never allow an unattended password prompt to consume paid time.
 
 ## Image and CUDA compatibility
@@ -82,17 +82,21 @@ Choose `SECURE` or `COMMUNITY` deliberately. Repository upload approval must cov
 
 ## SSH lifecycle
 
-RunPod injects account SSH keys at Pod creation. Register the temporary public key before creating the Pod.
+RunPod injects account SSH keys at Pod creation. Prefer one dedicated persistent service identity for repeated Codex operations. A task-scoped identity is optional and temporary. Register either identity before creating the Pod.
 
-1. Generate or copy one task-specific private key outside the workspace.
+1. Generate or select one dedicated private key outside the workspace. Record whether its lifecycle is `persistent_service` or `task_scoped`.
 2. Restrict its Windows ACL so OpenSSH accepts it.
 3. Add its public key to the existing RunPod account keys without replacing unrelated keys.
+   In the RunPod console, expand the SSH public keys accordion before editing.
+   Require the `Public key updated` confirmation, reload Settings, expand the
+   accordion again, and verify that the new key remains present. A value visible
+   before reload is not persistence evidence.
 4. Create the Pod.
 5. Pin the host key in a task-specific `known_hosts` file.
 6. Start the watchdog as the first remote command.
-7. During teardown, remove only the temporary public key, delete the private key, and verify the original account keys remain.
+7. During teardown, retain a `persistent_service` key. Remove and delete only a `task_scoped` key, then verify all unrelated account keys remain.
 
-On Windows, grant the task owner deletion permission on the temporary private key. A read/write-only ACL can make teardown unable to delete the key. Verify that both the private key and its `.pub` file are absent after teardown.
+On Windows, grant the task owner deletion permission on a task-scoped private key. A read/write-only ACL can make teardown unable to delete it. Verify that both task-scoped key files are absent after teardown. Do not apply this deletion step to the persistent service identity.
 
 Example watchdog for a 20-minute attempt:
 
@@ -115,7 +119,9 @@ The benchmark bundle contains only:
 - `post_train_engine/`
 - `scripts/`
 - `configs/`
+- `requirements/`
 - `pyproject.toml`
+- `uv.lock`
 - `README.md`
 
 Exclude `__pycache__`, `*.pyc`, `.pytest_cache`, `.env*`, `.git`, `tests`, `docs`, `runs`, and local artifacts. List every archive member and reject the bundle if any forbidden path appears. Record its byte count, member count, and SHA-256 before upload. Verify the remote SHA-256 after upload.
@@ -155,15 +161,15 @@ fenced campaign proposal and binding provider billing settlement.
 1. Start the watchdog.
 2. Deliver source through the selected mode. Verify the bundle hash or exact detached Git SHA.
 3. Enter a new work directory that contains only the verified source.
-4. Install the required extras: `python -m pip install -e ".[dev,rlvr]"`.
+4. Run `PYTHONPATH=src python -c "from post_train_engine.runpod_preflight import verify_runpod_constraints; verify_runpod_constraints()"`. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
 8. Run the benchmark with `accelerate launch --num_processes 2`.
-9. Require exit code zero, exact output parity, `speedup > 1`, and `certifying: true`.
+9. Require exit code zero, exact output parity, paired ABBA trials, conservative `speedup >= 1.05`, and `certifying: true` under benchmark schema v2.
 10. Download the JSON artifact and logs before teardown.
 
-The repository preflight script includes tests and Ruff. Run it only when the uploaded bundle includes those surfaces. The reduced benchmark bundle instead relies on the full verified local suite plus the remote CUDA, config, dependency, and distributed probes above.
+Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 
 ## Teardown and evidence
 
@@ -172,8 +178,8 @@ Teardown runs after success, failure, timeout, or interruption:
 1. Download any available logs and evidence.
 2. Delete the Pod through the REST API.
 3. Verify the target Pod is absent and no unintended Pod remains.
-4. Remove the temporary account SSH key and verify the original key set.
-5. Delete the outside private key and local staging bundle.
+4. Remove only a task-scoped account SSH key and verify the original key set. Retain the dedicated persistent service identity.
+5. Delete only task-scoped private keys and the local staging bundle.
 6. Query ending balance and current hourly spend.
 7. Record balance delta, authoritative Pod rate, elapsed time, topology, image, CUDA filter, and artifact hash.
 
@@ -199,6 +205,7 @@ observation. A first nonempty billing response is never final evidence.
 | Watchdog had an empty Pod ID | A REST-created Pod did not export `RUNPOD_POD_ID` | Bind the create-response Pod ID literally and verify Pod-side API authentication without exposing it. |
 | Temporary private key survived teardown | Its Windows ACL granted read/write but not delete permission | Grant the task owner deletion permission and verify both key files are absent after teardown. |
 | Pod-specific `SSH_PUBLIC_KEY` did not authorize REST-created Pods | Two Secure 2xA40 Pods exposed healthy SSH endpoints but rejected the injected ed25519 key; the first non-batch probe waited on authentication | Do not rely on create-request environment injection for SSH. Verify an account-level key with `runpodctl ssh list-keys` or the RunPod console before allocation, and use batch-mode SSH so rejection fails in seconds. |
+| RunPod console key edit appeared saved but reverted after reload | The SSH key form remained mounted while its accordion was collapsed, so automation could inspect hidden state without a reliable interactive submission | Expand the SSH public keys accordion, submit through its visible controls, require the success confirmation, then reload and verify persistence before allocation. |
 
 ## Primary references
 

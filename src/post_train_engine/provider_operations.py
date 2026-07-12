@@ -5,37 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Literal, Protocol
 
 from post_train_engine.api_schemas import (
     JobHandle,
     JobRequest,
     JobResult,
-    JobStatus,
     redact_secret_text,
 )
 from post_train_engine.artifact_store import ArtifactStore
-
-RecoveryPolicy = Literal["reconcile", "replay_safe", "non_replayable"]
-
-
-class RecoverableRemoteProvider(Protocol):
-    provider_id: str
-    provider_type: str
-    recovery_policy: RecoveryPolicy
-
-    def submit_job(self, request: JobRequest) -> JobHandle: ...
-
-    def poll_job(self, handle: JobHandle) -> JobStatus: ...
-
-    def fetch_result(self, handle: JobHandle) -> JobResult: ...
-
-    def reconcile_job(
-        self,
-        request: JobRequest,
-        handle: JobHandle | None,
-    ) -> JobResult | None:
-        """Return durable provider state for an existing intent when available."""
+from post_train_engine.providers.base import RemoteProvider
 
 
 class AmbiguousProviderOperationError(RuntimeError):
@@ -44,7 +22,7 @@ class AmbiguousProviderOperationError(RuntimeError):
 
 def execute_provider_operation(
     *,
-    provider: RecoverableRemoteProvider,
+    provider: RemoteProvider,
     store: ArtifactStore,
     request: JobRequest,
     timeout_seconds: float = 300.0,
@@ -143,6 +121,4 @@ def _validate_provider_handle(request: JobRequest, handle: JobHandle) -> None:
 __all__ = [
     "AmbiguousProviderOperationError",
     "execute_provider_operation",
-    "RecoverableRemoteProvider",
-    "RecoveryPolicy",
 ]

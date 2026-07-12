@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import re
+import tomllib
+from pathlib import Path
+
 import pytest
 
 from post_train_engine.cli.main import main
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_only_canonical_promotion_module_exposes_decision_authority() -> None:
@@ -39,3 +46,30 @@ def test_retired_standalone_promotion_command_is_not_registered(
 
     assert excinfo.value.code == 2
     assert "invalid choice: 'promote'" in capsys.readouterr().err
+
+
+def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    base = {_requirement_name(value) for value in project["project"]["dependencies"]}
+    rlvr = {
+        _requirement_name(value)
+        for value in project["project"]["optional-dependencies"]["rlvr"]
+    }
+
+    assert {"accelerate", "peft", "trl"} <= rlvr
+    assert base.isdisjoint(rlvr)
+    assert "wandb" not in base | rlvr
+
+    lock = ROOT / "uv.lock"
+    constraints = (ROOT / "requirements" / "runpod.txt").read_text(encoding="utf-8")
+    expected_hash = hashlib.sha256(
+        lock.read_text(encoding="utf-8").encode("utf-8")
+    ).hexdigest()
+    assert f"# uv-lock-sha256: {expected_hash}" in constraints.splitlines()[:3]
+    assert not any(
+        line.lower().startswith("torch==") for line in constraints.splitlines()
+    )
+
+
+def _requirement_name(value: str) -> str:
+    return re.split(r"[ <=>@\[]", value, maxsplit=1)[0].lower()

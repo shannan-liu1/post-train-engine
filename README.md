@@ -2,7 +2,7 @@
 
 Post-Train Engine is an early evidence-driven research flywheel for model post-training. The repository implements a canonical local stage machine, portable Run bundles, typed training evidence, paired promotion gates, and campaign primitives. The governing spec distinguishes locally verified mechanics from open production certification work.
 
-The repository optimizes first for one researcher. Its immutable proposals, SQLite leases, canonical Run bundles, and coordinated stage receipts provide a foundation for multi-agent work. Lease fencing, sealed evaluation, provider-derived costs, and end-to-end production wiring remain open before that foundation can safely support many concurrent agents.
+The repository optimizes first for one researcher. Its immutable proposals, renewable fenced SQLite leases, canonical Run bundles, and coordinated stage receipts provide a foundation for multi-agent work. External sealed-evaluation authority, provider-derived production cost evidence, multi-host consensus, and end-to-end production wiring remain open before that foundation can safely support many concurrent agents.
 
 ## Governing contracts
 

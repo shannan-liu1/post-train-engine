@@ -5,13 +5,79 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 _CACHE_KEYS = frozenset({"model", "suite", "generation", "verifier"})
+
+
+@dataclass(frozen=True)
+class RuntimePairEvidence:
+    baseline_seconds: tuple[float, float]
+    optimized_seconds: tuple[float, float]
+    conservative_speedup: float
+    output_parity: bool
+    certifying: bool
+    minimum_speedup: float
+    output: Any
+
+
+def measure_runtime_pair(
+    *,
+    baseline: Callable[[], Any],
+    optimized: Callable[[], Any],
+    synchronize: Callable[[], None],
+    reduce_seconds: Callable[[float], float],
+    minimum_speedup: float = 1.05,
+    clock: Callable[[], float] = time.perf_counter,
+) -> RuntimePairEvidence:
+    """Measure one warmed ABBA pair and certify only its worst-case speedup."""
+    if not math.isfinite(minimum_speedup) or minimum_speedup <= 1.0:
+        raise ValueError("minimum_speedup must be finite and greater than one")
+
+    warm_output = optimized()
+    observations: dict[str, list[tuple[float, Any]]] = {
+        "baseline": [],
+        "optimized": [],
+    }
+    for name, operation in (
+        ("baseline", baseline),
+        ("optimized", optimized),
+        ("optimized", optimized),
+        ("baseline", baseline),
+    ):
+        synchronize()
+        started = clock()
+        output = operation()
+        synchronize()
+        seconds = reduce_seconds(clock() - started)
+        if not math.isfinite(seconds) or seconds <= 0.0:
+            raise ValueError("runtime trial duration must be positive and finite")
+        observations[name].append((seconds, output))
+
+    baseline_seconds = tuple(value[0] for value in observations["baseline"])
+    optimized_seconds = tuple(value[0] for value in observations["optimized"])
+    outputs = [
+        warm_output,
+        *(value[1] for value in observations["baseline"]),
+        *(value[1] for value in observations["optimized"]),
+    ]
+    output_parity = all(output == warm_output for output in outputs[1:])
+    conservative_speedup = min(baseline_seconds) / max(optimized_seconds)
+    return RuntimePairEvidence(
+        baseline_seconds=(baseline_seconds[0], baseline_seconds[1]),
+        optimized_seconds=(optimized_seconds[0], optimized_seconds[1]),
+        conservative_speedup=conservative_speedup,
+        output_parity=output_parity,
+        certifying=output_parity and conservative_speedup >= minimum_speedup,
+        minimum_speedup=minimum_speedup,
+        output=warm_output,
+    )
 
 
 class PhaseCostRecord(BaseModel):
@@ -158,5 +224,7 @@ __all__ = [
     "ExecutionTopology",
     "PhaseCostRecord",
     "PolicyUse",
+    "RuntimePairEvidence",
+    "measure_runtime_pair",
     "summarize_costs",
 ]

@@ -9,6 +9,8 @@ It does not submit pods or hide provider state behind an API client.
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
 import math
 import os
 import platform
@@ -64,7 +66,11 @@ from post_train_engine.lifecycle import (
 )
 from post_train_engine.rewards.gsm8k import GSM8KRewardConfig, compute_gsm8k_reward
 from post_train_engine.runpod import cuda_version_from_image, validate_cuda_runtime
-from post_train_engine.runtime_evidence import PhaseCostRecord, summarize_costs
+from post_train_engine.runtime_evidence import (
+    PhaseCostRecord,
+    measure_runtime_pair,
+    summarize_costs,
+)
 from post_train_engine.tasks.gsm8k import (
     GSM8KExample,
     format_prompt,
@@ -1194,9 +1200,9 @@ def _load_and_split_dataset(
             revision=cfg.dataset.resolved_revision or cfg.dataset.revision,
         )
     else:
-        from post_train_engine.api_hillclimb import _embedded_gsm8k_examples
+        from post_train_engine.tasks.gsm8k import embedded_gsm8k_examples
 
-        examples = _embedded_gsm8k_examples()
+        examples = embedded_gsm8k_examples()
     required = (
         cfg.dataset.train_size
         + cfg.dataset.selection_size
@@ -2346,6 +2352,124 @@ def _event(store: ArtifactStore | None, event: str, payload: Mapping[str, Any]) 
     )
 
 
+def run_runpod_eval_benchmark(
+    config_path: str | Path,
+    out_path: str | Path,
+) -> dict[str, Any] | None:
+    """Certify batched evaluation with warmed, order-balanced runtime evidence."""
+    cfg = load_runpod_grpo_config(config_path)
+    dist = DistributedContext.from_env()
+    _validate_launch_topology(cfg, dist)
+    state = _distributed_state(dist)
+    runtime_attestation = _require_cuda(cfg)
+    cfg = _resolve_hub_revisions(cfg)
+    _train, _selection, promotion = _load_and_split_dataset(cfg)
+    local_examples = _shard_sequence(promotion, dist)
+    scalar_cfg = cfg.model_copy(
+        update={"eval": cfg.eval.model_copy(update={"batch_size": 1})}
+    )
+
+    def evaluate_scalar() -> list[dict[str, Any]]:
+        local_rows = []
+        for example in local_examples:
+            local_rows.extend(
+                _evaluate_hf_model(
+                    cfg=scalar_cfg,
+                    model_ref=cfg.model.base_model_id,
+                    examples=[example],
+                    dist=dist,
+                )
+            )
+        return [row.to_json() for row in _gather_eval_rows(local_rows, dist)]
+
+    def evaluate_optimized() -> list[dict[str, Any]]:
+        local_rows = _evaluate_hf_model(
+            cfg=cfg,
+            model_ref=cfg.model.base_model_id,
+            examples=local_examples,
+            dist=dist,
+        )
+        return [row.to_json() for row in _gather_eval_rows(local_rows, dist)]
+
+    def synchronize() -> None:
+        _wait_for_everyone(state)
+        import torch
+
+        torch.cuda.synchronize()
+
+    evidence = measure_runtime_pair(
+        baseline=evaluate_scalar,
+        optimized=evaluate_optimized,
+        synchronize=synchronize,
+        reduce_seconds=lambda seconds: _max_rank_seconds(seconds, dist),
+    )
+    if not dist.is_main_process:
+        return None
+
+    optimized_payload = evidence.output
+    payload = json.dumps(
+        optimized_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    result: dict[str, Any] = {
+        "schema_version": "runpod_eval_runtime_benchmark_v2",
+        "certifying": evidence.certifying,
+        "config": str(Path(config_path)),
+        "model_id": cfg.model.base_model_id,
+        "model_revision": cfg.model.resolved_revision,
+        "dataset_revision": (
+            "embedded-gsm8k-tiny-v1"
+            if cfg.dataset.source == "embedded_gsm8k_tiny"
+            else cfg.dataset.resolved_revision
+        ),
+        "topology": dist.to_json(),
+        "environment": runtime_environment(dist),
+        "runtime_attestation": runtime_attestation,
+        "example_count": len(promotion),
+        "baseline": {
+            "strategy": "one_model_load_per_example",
+            "model_load_count_per_rank": len(local_examples),
+            "batch_size": 1,
+            "max_rank_wall_seconds_trials": list(evidence.baseline_seconds),
+        },
+        "optimized": {
+            "strategy": "one_model_load_per_shard_with_batching",
+            "model_load_count_per_rank": 1,
+            "batch_size": cfg.eval.batch_size,
+            "max_rank_wall_seconds_trials": list(evidence.optimized_seconds),
+        },
+        "measurement_order": ["baseline", "optimized", "optimized", "baseline"],
+        "warmup_strategy": "optimized",
+        "minimum_speedup": evidence.minimum_speedup,
+        "speedup": evidence.conservative_speedup,
+        "output_parity": evidence.output_parity,
+        "output_sha256": "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+    }
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+    if not evidence.output_parity:
+        raise RuntimeError("batched evaluation output drifted from scalar evaluation")
+    if not evidence.certifying:
+        raise RuntimeError(
+            "conservative paired runtime speedup did not meet the certification margin; "
+            "inspect benchmark artifact"
+        )
+    return result
+
+
+def _max_rank_seconds(seconds: float, dist: DistributedContext) -> float:
+    if not dist.is_distributed:
+        return seconds
+    import torch
+    import torch.distributed as torch_dist
+
+    value = torch.tensor(seconds, device=f"cuda:{dist.local_rank}")
+    torch_dist.all_reduce(value, op=torch_dist.ReduceOp.MAX)
+    return float(value.item())
+
+
 __all__ = [
     "RunPodGRPOConfig",
     "DistributedContext",
@@ -2363,5 +2487,6 @@ __all__ = [
     "is_runpod_grpo_config",
     "load_runpod_grpo_config",
     "run_runpod_grpo_hillclimb",
+    "run_runpod_eval_benchmark",
     "runtime_environment",
 ]

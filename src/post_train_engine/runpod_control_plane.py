@@ -77,20 +77,23 @@ class RunPodBudget(BaseModel):
     model_config = _FROZEN_FORBID
 
     target_spend_usd: float = Field(..., gt=0.0, le=_MAX_USER_AUTHORIZED_SPEND_USD)
+    settled_spend_usd: float = Field(..., ge=0.0)
     reserve_usd: float = Field(default=0.15, ge=0.0)
     minimum_runtime_seconds: int = Field(default=60, gt=0)
 
     @model_validator(mode="after")
-    def _reserve_leaves_execution_budget(self) -> RunPodBudget:
-        if self.reserve_usd >= self.target_spend_usd:
-            raise ValueError("reserve_usd must be below target_spend_usd")
+    def _settled_spend_and_reserve_leave_execution_budget(self) -> RunPodBudget:
+        if self.settled_spend_usd + self.reserve_usd >= self.target_spend_usd:
+            raise ValueError(
+                "settled_spend_usd plus reserve_usd must be below target_spend_usd"
+            )
         return self
 
     def hard_deadline_seconds(self, pod_rate_usd_per_hour: float) -> int:
         if not math.isfinite(pod_rate_usd_per_hour) or pod_rate_usd_per_hour <= 0.0:
             raise ValueError("RunPod create receipt requires a positive finite Pod rate")
         seconds = math.floor(
-            (self.target_spend_usd - self.reserve_usd)
+            (self.target_spend_usd - self.settled_spend_usd - self.reserve_usd)
             / pod_rate_usd_per_hour
             * 3600.0
         )
@@ -234,7 +237,25 @@ class RunPodControlPlane:
 
         pod_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
         if not pod_id:
-            raise ValueError("RunPod create response did not include a Pod id")
+            self._write_journal(
+                {
+                    "state": "ambiguous",
+                    "pod_name": pod_name,
+                    "request_sha256": request_sha256,
+                    "budget": budget_json,
+                    "request": request,
+                }
+            )
+            raw = self._reconcile_by_name(pod_name)
+            if raw is None:
+                raise AmbiguousPodCreationError(
+                    "RunPod create response omitted the Pod id and no same-name Pod was found"
+                )
+            pod_id = str(raw.get("id") or "")
+            if not pod_id:
+                raise AmbiguousPodCreationError(
+                    "RunPod reconciliation found a same-name row without a Pod id"
+                )
         try:
             rate = _pod_rate(raw)
             hard_deadline = budget.hard_deadline_seconds(rate)
@@ -249,16 +270,20 @@ class RunPodControlPlane:
             request_sha256=request_sha256,
             recorded_at_unix=time.time(),
         )
-        self._write_journal(
-            {
-                "state": "created",
-                "pod_name": pod_name,
-                "request_sha256": request_sha256,
-                "budget": budget_json,
-                "request": request,
-                "receipt": receipt.model_dump(mode="json"),
-            }
-        )
+        try:
+            self._write_journal(
+                {
+                    "state": "created",
+                    "pod_name": pod_name,
+                    "request_sha256": request_sha256,
+                    "budget": budget_json,
+                    "request": request,
+                    "receipt": receipt.model_dump(mode="json"),
+                }
+            )
+        except BaseException:
+            self.delete_pod(pod_id)
+            raise
         return receipt
 
     def delete_pod(self, pod_id: str) -> None:

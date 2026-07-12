@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 from post_train_engine.api_schemas import JobHandle, JobRequest, JobResult, JobStatus
-from post_train_engine.provider_operations import RecoveryPolicy
+RecoveryPolicy = Literal["reconcile", "replay_safe", "non_replayable"]
 
 
 class RemoteProvider(Protocol):
@@ -30,4 +30,4 @@ class RemoteProvider(Protocol):
         """Recover durable provider state without resubmitting work."""
 
 
-__all__ = ["RemoteProvider"]
+__all__ = ["RecoveryPolicy", "RemoteProvider"]

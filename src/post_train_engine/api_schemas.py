@@ -25,8 +25,6 @@ ProviderType = Literal[
     "fake_prompt_adapter",
     "chat_completions",
     "chat_completions_prompt_adapter",
-    "openai_compatible",
-    "openai_compatible_prompt_adapter",
 ]
 JobType = Literal["rollout_generation", "candidate_adaptation", "evaluation"]
 JobState = Literal["queued", "running", "succeeded", "failed", "timeout", "cancelled"]
@@ -352,8 +350,6 @@ def is_chat_completions_provider_type(provider_type: str) -> bool:
     return provider_type in {
         "chat_completions",
         "chat_completions_prompt_adapter",
-        "openai_compatible",
-        "openai_compatible_prompt_adapter",
     }
 
 

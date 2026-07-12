@@ -9,6 +9,7 @@ from post_train_engine.runtime_evidence import (
     ExecutionTopology,
     PhaseCostRecord,
     PolicyUse,
+    measure_runtime_pair,
     summarize_costs,
 )
 
@@ -70,3 +71,32 @@ def test_topology_and_policy_staleness_fail_closed() -> None:
             consumed_policy_step=13,
             max_staleness_steps=2,
         )
+
+
+def test_runtime_pair_balances_order_and_uses_conservative_speedup() -> None:
+    order: list[str] = []
+    clock_values = iter([0.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 6.0])
+
+    def baseline() -> list[str]:
+        order.append("baseline")
+        return ["same-output"]
+
+    def optimized() -> list[str]:
+        order.append("optimized")
+        return ["same-output"]
+
+    evidence = measure_runtime_pair(
+        baseline=baseline,
+        optimized=optimized,
+        synchronize=lambda: None,
+        reduce_seconds=lambda value: value,
+        clock=lambda: next(clock_values),
+        minimum_speedup=1.05,
+    )
+
+    assert order == ["optimized", "baseline", "optimized", "optimized", "baseline"]
+    assert evidence.baseline_seconds == (2.0, 2.0)
+    assert evidence.optimized_seconds == (1.0, 1.0)
+    assert evidence.conservative_speedup == 2.0
+    assert evidence.output_parity is True
+    assert evidence.certifying is True

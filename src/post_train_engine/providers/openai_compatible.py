@@ -288,10 +288,6 @@ def _handle(request: JobRequest, provider_id: str, *, response_id: str) -> JobHa
 
 
 def _adapter_kind(provider_type: str) -> str:
-    if provider_type == "openai_compatible":
-        return "openai_compatible_prompt_adapter"
-    if provider_type == "openai_compatible_prompt_adapter":
-        return provider_type
     return "chat_completions_prompt_adapter"
 
 

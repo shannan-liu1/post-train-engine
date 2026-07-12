@@ -109,6 +109,32 @@ def load_gsm8k(
     return examples
 
 
+def embedded_gsm8k_examples() -> list[GSM8KExample]:
+    """Return the immutable tiny GSM8K fixture used by local and RunPod smoke runs."""
+    rows = [
+        ("If Ana has 2 apples and buys 3, how many apples?", "5"),
+        ("What is 4 plus 4?", "8"),
+        ("What is 5 plus 6?", "11"),
+        ("What is 7 minus 1?", "6"),
+        ("What is 3 times 4?", "12"),
+        ("What is 12 divided by 3?", "4"),
+        ("What is 9 plus 10?", "19"),
+        ("What is 8 minus 5?", "3"),
+    ]
+    return [
+        GSM8KExample(
+            id=f"gsm8k/train/{idx:06d}",
+            split="train",
+            question=question,
+            gold_solution=f"embedded solution #### {answer}",
+            gold_answer=answer,
+            source="embedded_gsm8k_tiny",
+            metadata={"dataset_revision": "embedded-gsm8k-tiny-v1"},
+        )
+        for idx, (question, answer) in enumerate(rows)
+    ]
+
+
 def extract_gold_answer(gold_solution: str) -> str:
     """Extract answer after GSM8K's #### marker."""
 

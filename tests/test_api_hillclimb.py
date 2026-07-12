@@ -431,18 +431,17 @@ def test_hyperbolic_api_smoke_config_uses_named_secret_env(tmp_path: Path) -> No
     assert resolved.env_redacted["PTE_REMOTE_HYPERBOLIC_GPU"]["value"] == "[REDACTED]"
 
 
-def test_legacy_openai_compatible_provider_type_still_validates() -> None:
+def test_legacy_openai_compatible_provider_type_is_rejected() -> None:
     from post_train_engine.api_schemas import ProviderSpec
 
-    spec = ProviderSpec(
-        type="openai_compatible",
-        provider_id="legacy-chat-completions",
-        base_url_env="PTE_REMOTE_BASE_URL",
-        api_key_env="PTE_REMOTE_API_KEY",
-        model_env="PTE_REMOTE_MODEL",
-    )
-
-    assert spec.type == "openai_compatible"
+    with pytest.raises(ValueError, match="type"):
+        ProviderSpec(
+            type="openai_compatible",
+            provider_id="legacy-chat-completions",
+            base_url_env="PTE_REMOTE_BASE_URL",
+            api_key_env="PTE_REMOTE_API_KEY",
+            model_env="PTE_REMOTE_MODEL",
+        )
 
 
 def test_eval_result_requires_complete_first_sample_coverage() -> None:
@@ -472,7 +471,8 @@ def test_eval_result_requires_complete_first_sample_coverage() -> None:
 
 
 def test_grade_generations_fails_closed_on_unknown_provider_example_id() -> None:
-    from post_train_engine.api_hillclimb import _embedded_gsm8k_examples, _grade_generations
+    from post_train_engine.api_hillclimb import _grade_generations
+    from post_train_engine.tasks.gsm8k import embedded_gsm8k_examples
     from post_train_engine.api_schemas import Candidate, JobHandle, JobResult, JobStatus
 
     handle = JobHandle(
@@ -499,7 +499,7 @@ def test_grade_generations_fails_closed_on_unknown_provider_example_id() -> None
     with pytest.raises(ValueError, match="provider returned unknown example_id"):
         _grade_generations(
             candidate=Candidate(candidate_id="candidate", model_id="fake"),
-            examples=_embedded_gsm8k_examples()[:1],
+            examples=embedded_gsm8k_examples()[:1],
             generation_result=result,
             prompt_style="thinking_tags",
         )

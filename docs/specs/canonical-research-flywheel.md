@@ -6,7 +6,7 @@ Owner: repository user
 
 Tracking authority: this document
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## Problem Statement
 
@@ -229,6 +229,14 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | U-048 | SQLite coordinates one local authority but is not a multi-host consensus system. | Treating it as distributed consensus can permit split-brain claims across machines or network filesystems. | Certify SQLite only for one host and one database authority; preserve an explicit control-plane adapter seam for later multi-host deployment. | accepted scope boundary |
 | U-049 | The lock selected Pydantic 1 even though the code requires Pydantic 2, and an unused vLLM extra forced an obsolete CUDA build on Windows. | A locked clean environment failed during test collection and could not reproduce local evidence. | Require `pydantic>=2,<3`; delete speculative vLLM extras until an output-equivalent benchmark justifies them; refresh the lock. | implemented locally |
 | U-050 | Checked-in 300-step RunPod configs could spend materially without campaign authority. | A researcher or agent could run an expensive non-certifying experiment by mistake. | Delete executable 300-step defaults; retain one one-step, two-A40, ephemeral smoke. Generate full configs only from claimed proposals. | implemented locally |
+| U-051 | A single scalar-first runtime trial gave the optimized path warmed caches and certified any speedup above one. | Order bias and noise could create a false R4 claim. | Warm shared execution, synchronize CUDA, run paired ABBA trials, and certify only `min(baseline) / max(optimized) >= 1.05` with exact output parity. | implemented locally; remote timing pending |
+| U-052 | An attempt-local RunPod deadline ignored settled spend from prior attempts under the same user authorization. | Repeated attempts could exceed the campaign's total dollar cap. | Bind settled campaign spend into `RunPodBudget` and subtract it plus reserve before calculating the hard deadline. | implemented locally |
+| U-053 | Paid preflight applied a full timeout to every command, continued after failure, and lost its report on `TimeoutExpired`. | A failed gate could consume most of the budget without durable evidence. | Remove duplicated local checks, enforce one aggregate deadline, stop at the first failure, catch timeouts, and always persist the receipt. | implemented locally |
+| U-054 | Unconstrained editable installation could replace the image's compatible Torch/CUDA stack. | Dependency resolution could break CUDA after allocation or make the run irreproducible. | Install a `uv.lock`-bound non-Torch requirements file, install the project with `--no-deps`, and verify image Torch and CUDA remain unchanged. | implemented locally |
+| U-055 | A successful Pod-create response without an ID raised before deterministic-name reconciliation. | A live Pod could continue billing after the client abandoned it. | Persist ambiguous state and reconcile by deterministic name before returning or failing. | implemented locally |
+| U-056 | SSH instructions treated every account key as temporary although the operator chose a dedicated persistent service identity. | Teardown could delete the canonical key and force repeated manual setup. | Record the identity lifecycle explicitly; retain persistent service keys and delete only task-scoped keys. | implemented operationally |
+| U-057 | Pod creation could succeed before the durable create receipt failed to write. | The process could exit while an unjournaled Pod continued billing. | Delete the known Pod on any post-create receipt persistence failure and preserve the original failure. | implemented locally |
+| U-058 | A missing remote executable raised before the paid preflight recorded the failed gate. | The durable report lacked the actionable cause of a remote setup failure. | Convert operating-system launch errors into typed failed-gate evidence and stop immediately. | implemented locally |
 
 ## Progress Ledger
 
@@ -240,10 +248,10 @@ Record each discovered risk in the register below. Fix it in the current slice w
 | 3. Canonical RunEngine | partial | F9-F11, F14 | One config dispatcher, shared stage order, central manifest and promotion, and removal of shadow orchestration | Move consequential compiler and adapter preparation behind engine stages |
 | 4. Evidence-backed training | partial | F12-F13, F15 | MethodTrainingRequest, consumption-time TrainingView hash checks, policy-versioned GRPO traces, a role-aware training trace query that excludes sealed evaluation roles, measured frontier selection, and semantic RunBundle GRPO validation | Bind replay sampling decisions to explicit policy lineage and measured outcomes |
 | 5. Campaign control plane | partial | C1-C7 | Explanation-bound proposals, renewable fenced leases, actual-cost rechecks, two-phase provider settlement, atomic Incumbent CAS, exposure accounting, and explicit compiler certification modes | Add automatic proposal-to-config materialization after pure compiler work |
-| 6. Cost and runtime | in progress | R1-R4 | Hard $1.50 control-plane policy, exact Secure 2xA40 ephemeral request, create-rate deadline, delayed billing receipts, corrected lock, output-equivalence tests, and dynamic CUDA validation | Push the exact reviewed commit, then run R4 and only the one-step smoke if R4 passes |
+| 6. Cost and runtime | in progress | R1-R4 | Cumulative $1.50 control-plane policy, exact Secure 2xA40 ephemeral request, create-rate deadline, malformed-response reconciliation, delayed billing receipts, Torch-preserving frozen RunPod requirements, fail-fast aggregate preflight, conservative paired runtime evidence, output-equivalence tests, and dynamic CUDA validation | After an explicit paid-run instruction, run R4 and only the one-step smoke if R4 passes and settled spend leaves budget |
 | 7. Extensibility | partial | E1-E3 | Exact-math engine task and typed SFT, DPO, GRPO, OPD, and OPSD contracts | Prove executable production paths rather than isolated contract surfaces |
 | 8. Agent and distributed scale | partial | R5-R6, E4-E5 | Renewable fenced leases, one-host authority scope, topology and staleness contracts, composition proposals, and bounded stage barriers | Finish post-receipt fault injection; add multi-host consensus only when required |
-| 9. Final compliance and fresh-eyes review | in progress | All criteria | Apache-2.0, locked tests, Ruff, build, secret scanning, and the adversarial risk register | Complete fresh-eyes review and preserve honest external blockers |
+| 9. Final compliance and fresh-eyes review | in progress | All criteria | Apache-2.0, 303 locked tests, Ruff, build, secret scanning, two post-change fresh-eyes passes, and the adversarial risk register | Preserve honest external blockers and collect remote certification evidence only under explicit authorization |
 
 ## Research Decisions
 

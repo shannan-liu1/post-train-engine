@@ -52,6 +52,7 @@ from post_train_engine.training_views import (
 )
 from post_train_engine.tasks.gsm8k import (
     GSM8KExample,
+    embedded_gsm8k_examples,
     format_prompt,
     load_gsm8k,
     parse_model_answer,
@@ -825,7 +826,7 @@ def _load_and_split_dataset(
     cfg: HillClimbConfig,
 ) -> tuple[list[GSM8KExample], list[GSM8KExample]]:
     if cfg.dataset.source == "embedded_gsm8k_tiny":
-        examples = _embedded_gsm8k_examples()
+        examples = embedded_gsm8k_examples()
         dataset_revision = "embedded-gsm8k-tiny-v1"
     elif cfg.dataset.source == "huggingface_gsm8k":
         examples = load_gsm8k("train", cfg.dataset.dataset_name)
@@ -1241,31 +1242,6 @@ def _example_json(example: GSM8KExample, prompt_style: str, split_role: str) -> 
         "prompt": format_prompt(example.question, prompt_style),  # type: ignore[arg-type]
         "metadata": dict(example.metadata),
     }
-
-
-def _embedded_gsm8k_examples() -> list[GSM8KExample]:
-    rows = [
-        ("If Ana has 2 apples and buys 3, how many apples?", "5"),
-        ("What is 4 plus 4?", "8"),
-        ("What is 5 plus 6?", "11"),
-        ("What is 7 minus 1?", "6"),
-        ("What is 3 times 4?", "12"),
-        ("What is 12 divided by 3?", "4"),
-        ("What is 9 plus 10?", "19"),
-        ("What is 8 minus 5?", "3"),
-    ]
-    return [
-        GSM8KExample(
-            id=f"gsm8k/train/{idx:06d}",
-            split="train",
-            question=question,
-            gold_solution=f"embedded solution #### {answer}",
-            gold_answer=answer,
-            source="embedded_gsm8k_tiny",
-            metadata={"dataset_revision": "embedded-gsm8k-tiny-v1"},
-        )
-        for idx, (question, answer) in enumerate(rows)
-    ]
 
 
 __all__ = [

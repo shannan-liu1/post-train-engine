@@ -56,7 +56,11 @@ def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) 
 
     receipt = control.create_pod(
         _request(),
-        budget=RunPodBudget(target_spend_usd=1.5, reserve_usd=0.15),
+        budget=RunPodBudget(
+            target_spend_usd=1.5,
+            settled_spend_usd=0.0,
+            reserve_usd=0.15,
+        ),
     )
 
     assert receipt.pod_id == "pod-1"
@@ -65,6 +69,21 @@ def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) 
     journal = json.loads((tmp_path / "runpod_operation.json").read_text("utf-8"))
     assert journal["state"] == "created"
     assert journal["receipt"]["pod_rate_usd_per_hour"] == 0.44
+
+
+def test_budget_deadline_subtracts_settled_campaign_spend() -> None:
+    budget = RunPodBudget(
+        target_spend_usd=1.5,
+        settled_spend_usd=0.4,
+        reserve_usd=0.15,
+    )
+
+    assert budget.hard_deadline_seconds(0.44) == 7772
+
+
+def test_budget_requires_explicit_settled_campaign_spend() -> None:
+    with pytest.raises(ValueError, match="settled_spend_usd"):
+        RunPodBudget(target_spend_usd=1.5)
 
 
 def test_create_reconciles_ambiguous_submission_without_second_post(
@@ -80,9 +99,32 @@ def test_create_reconciles_ambiguous_submission_without_second_post(
     control = RunPodControlPlane(transport, journal)
 
     with pytest.raises(AmbiguousPodCreationError):
-        control.create_pod(_request(), budget=RunPodBudget(target_spend_usd=1.5))
+        control.create_pod(
+            _request(),
+            budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+        )
     receipt = control.create_pod(
-        _request(), budget=RunPodBudget(target_spend_usd=1.5)
+        _request(),
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+    )
+
+    assert receipt.pod_id == "pod-1"
+    assert [call[0] for call in transport.calls] == ["POST", "GET"]
+
+
+def test_create_reconciles_success_response_without_pod_id(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            {"name": "pte-r4-deadbeef", "costPerHr": 0.44},
+            [{"id": "pod-1", "name": "pte-r4-deadbeef", "costPerHr": 0.44}],
+        ]
+    )
+
+    receipt = RunPodControlPlane(
+        transport, tmp_path / "runpod_operation.json"
+    ).create_pod(
+        _request(),
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
     )
 
     assert receipt.pod_id == "pod-1"
@@ -105,6 +147,7 @@ def test_create_deletes_pod_when_rate_cannot_fit_minimum_runtime(
             _request(),
             budget=RunPodBudget(
                 target_spend_usd=1.5,
+                settled_spend_usd=0.0,
                 reserve_usd=0.15,
                 minimum_runtime_seconds=1800,
             ),
@@ -167,7 +210,38 @@ def test_malformed_create_rate_deletes_known_pod(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="authoritative Pod rate"):
         RunPodControlPlane(
             transport, tmp_path / "runpod_operation.json"
-        ).create_pod(_request(), budget=RunPodBudget(target_spend_usd=1.5))
+        ).create_pod(
+            _request(),
+            budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+        )
+
+    assert transport.calls[-1][:2] == ("DELETE", "/pods/pod-1")
+
+
+def test_create_receipt_write_failure_deletes_known_pod(tmp_path: Path) -> None:
+    class FailingReceiptControlPlane(RunPodControlPlane):
+        writes = 0
+
+        def _write_journal(self, body):
+            self.writes += 1
+            if self.writes == 2:
+                raise OSError("receipt disk failure")
+            super()._write_journal(body)
+
+    transport = FakeTransport(
+        [
+            {"id": "pod-1", "name": "pte-r4-deadbeef", "costPerHr": 0.44},
+            {},
+        ]
+    )
+
+    with pytest.raises(OSError, match="receipt disk failure"):
+        FailingReceiptControlPlane(
+            transport, tmp_path / "runpod_operation.json"
+        ).create_pod(
+            _request(),
+            budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+        )
 
     assert transport.calls[-1][:2] == ("DELETE", "/pods/pod-1")
 
@@ -183,7 +257,10 @@ def test_create_rejects_non_secure_or_persistent_request_before_api(
     with pytest.raises(ValueError, match="Secure Cloud"):
         RunPodControlPlane(
             transport, tmp_path / "runpod_operation.json"
-        ).create_pod(request, budget=RunPodBudget(target_spend_usd=1.5))
+        ).create_pod(
+            request,
+            budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+        )
 
     assert transport.calls == []
 
@@ -195,7 +272,13 @@ def test_created_journal_cannot_be_replayed_under_different_budget(
         [{"id": "pod-1", "name": "pte-r4-deadbeef", "costPerHr": 0.44}]
     )
     control = RunPodControlPlane(transport, tmp_path / "runpod_operation.json")
-    control.create_pod(_request(), budget=RunPodBudget(target_spend_usd=1.5))
+    control.create_pod(
+        _request(),
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+    )
 
     with pytest.raises(ValueError, match="different budget"):
-        control.create_pod(_request(), budget=RunPodBudget(target_spend_usd=1.0))
+        control.create_pod(
+            _request(),
+            budget=RunPodBudget(target_spend_usd=1.0, settled_spend_usd=0.0),
+        )
