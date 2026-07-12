@@ -131,15 +131,8 @@ class RunPodAllocationPolicy(BaseModel):
             raise ValueError("RunPod request must expose SSH only")
         if request.get("supportPublicIp") is not True:
             raise ValueError("RunPod request must request a public SSH address")
-        env = request.get("env")
-        if env is not None:
-            if not isinstance(env, dict) or set(env) != {"SSH_PUBLIC_KEY"}:
-                raise ValueError(
-                    "RunPod create request may contain only task-scoped SSH_PUBLIC_KEY"
-                )
-            public_key = str(env["SSH_PUBLIC_KEY"])
-            if not public_key.startswith("ssh-ed25519 ") or "\n" in public_key:
-                raise ValueError("RunPod SSH_PUBLIC_KEY must be one ed25519 public key")
+        if "env" in request:
+            raise ValueError("RunPod create request must not persist environment values")
         image = str(request.get("imageName") or "")
         cuda_version = cuda_version_from_image(image)
         if request.get("allowedCudaVersions") != [cuda_version]:

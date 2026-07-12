@@ -15,6 +15,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
 11. Use `RunPodAllocationPolicy` and `RunPodBudget`. The current authorization is Secure Cloud, exactly two A40s, 50 GB ephemeral container disk, zero persistent volume, SSH only, and at most $1.50 total spend.
+12. Probe SSH with `BatchMode=yes`, `PasswordAuthentication=no`, one connection attempt, and a short timeout. Never allow an unattended password prompt to consume paid time.
 
 ## Image and CUDA compatibility
 
@@ -197,6 +198,7 @@ observation. A first nonempty billing response is never final evidence.
 | Private GitHub PAT could not be sent to the Pod | The execution security boundary rejected credential transmission to a third-party machine despite explicit workflow approval | Use a repository-scoped read-only deploy key through SSH agent forwarding, or require a user-controlled checkout. Never bypass the credential boundary. |
 | Watchdog had an empty Pod ID | A REST-created Pod did not export `RUNPOD_POD_ID` | Bind the create-response Pod ID literally and verify Pod-side API authentication without exposing it. |
 | Temporary private key survived teardown | Its Windows ACL granted read/write but not delete permission | Grant the task owner deletion permission and verify both key files are absent after teardown. |
+| Pod-specific `SSH_PUBLIC_KEY` did not authorize REST-created Pods | Two Secure 2xA40 Pods exposed healthy SSH endpoints but rejected the injected ed25519 key; the first non-batch probe waited on authentication | Do not rely on create-request environment injection for SSH. Verify an account-level key with `runpodctl ssh list-keys` or the RunPod console before allocation, and use batch-mode SSH so rejection fails in seconds. |
 
 ## Primary references
 

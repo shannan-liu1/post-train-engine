@@ -233,7 +233,6 @@ def build_runpod_create_request(
     plan: dict[str, Any],
     *,
     pod_name: str,
-    ssh_public_key: str | None = None,
 ) -> dict[str, Any]:
     """Compile a dry-run plan into the sole authorized REST create shape."""
 
@@ -249,7 +248,7 @@ def build_runpod_create_request(
         cuda_version_from_image(str(environment.get("image")))
     ]:
         raise ValueError("RunPod plan CUDA filter does not match its image")
-    request = {
+    return {
         "name": pod_name,
         "allowedCudaVersions": list(allowed_cuda_versions),
         "cloudType": "SECURE",
@@ -265,9 +264,6 @@ def build_runpod_create_request(
         "supportPublicIp": True,
         "volumeInGb": int(environment["volume_gb"]),
     }
-    if ssh_public_key is not None:
-        request["env"] = {"SSH_PUBLIC_KEY": ssh_public_key}
-    return request
 
 
 def _runpod_execution_from_config(
