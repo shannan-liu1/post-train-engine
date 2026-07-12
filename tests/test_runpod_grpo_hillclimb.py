@@ -36,7 +36,9 @@ from post_train_engine.runpod_grpo import (
     _write_measured_training_view,
     is_runpod_grpo_config,
     load_runpod_grpo_config,
+    run_runpod_eval_benchmark,
 )
+from post_train_engine.runtime_evidence import RuntimePairEvidence
 from post_train_engine.tasks.gsm8k import GSM8KExample
 
 
@@ -134,6 +136,68 @@ def test_batched_runpod_eval_matches_scalar_outputs(
     )
 
     assert batched_rows == scalar_rows
+
+
+def test_r4_benchmark_optimizes_model_reuse_without_changing_tensor_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import post_train_engine.runpod_grpo as runpod_module
+
+    examples = [
+        GSM8KExample(
+            id=f"ex-{value}",
+            split="test",
+            question=str(value),
+            gold_solution=f"#### {value}",
+            gold_answer=str(value),
+            source="fixture",
+        )
+        for value in (2, 4, 6, 8)
+    ]
+    calls: list[tuple[int, int]] = []
+
+    def evaluate(*, cfg, examples, **_kwargs):
+        calls.append((cfg.eval.batch_size, len(examples)))
+        return [_eval_row(example.id, correct=True) for example in examples]
+
+    def measure(*, baseline, optimized, **_kwargs):
+        baseline_output = baseline()
+        optimized_output = optimized()
+        assert baseline_output == optimized_output
+        return RuntimePairEvidence(
+            baseline_seconds=(2.0, 2.0),
+            optimized_seconds=(1.0, 1.0),
+            conservative_speedup=2.0,
+            baseline_output_parity=(True, True),
+            optimized_output_parity=(True, True),
+            output_parity=True,
+            certifying=True,
+            minimum_speedup=1.05,
+            output=optimized_output,
+        )
+
+    monkeypatch.setattr(runpod_module, "_validate_launch_topology", lambda *_args: None)
+    monkeypatch.setattr(runpod_module, "_require_cuda", lambda *_args: {})
+    monkeypatch.setattr(runpod_module, "_resolve_hub_revisions", lambda cfg: cfg)
+    monkeypatch.setattr(
+        runpod_module,
+        "_load_and_split_dataset",
+        lambda _cfg: ([], [], examples),
+    )
+    monkeypatch.setattr(runpod_module, "_evaluate_hf_model", evaluate)
+    monkeypatch.setattr(runpod_module, "runtime_environment", lambda _dist: {})
+    monkeypatch.setattr(runpod_module, "measure_runtime_pair", measure)
+
+    result = run_runpod_eval_benchmark(
+        _write_config(tmp_path),
+        tmp_path / "benchmark.json",
+    )
+
+    assert result is not None
+    assert result["optimized"]["batch_size"] == 1
+    assert result["optimized"]["strategy"] == "one_model_load_per_shard"
+    assert calls == [(1, 1), (1, 1), (1, 1), (1, 1), (1, 4)]
 
 
 def test_runpod_grpo_builds_policy_lineage_training_view(tmp_path: Path) -> None:

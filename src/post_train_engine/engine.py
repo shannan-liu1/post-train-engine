@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from post_train_engine.artifacts import require_valid_run_bundle
 from post_train_engine.campaign import CampaignStore, ProposalOutcome, recommend_from_run
@@ -594,7 +594,13 @@ class RunEngine:
         plan: RunPlan,
         stage: RunStage,
     ) -> StageReceipt:
-        receipt = StageReceipt.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            receipt = StageReceipt.model_validate_json(path.read_text(encoding="utf-8"))
+        except ValidationError as exc:
+            raise ValueError(
+                "stage receipt is incompatible with the current evidence schema; "
+                f"do not backfill historical evidence, use a new run_id: {path}"
+            ) from exc
         if receipt.plan_hash != plan.plan_hash or receipt.stage != stage:
             raise ValueError(f"stage receipt does not match RunPlan: {path}")
         run_dir = path.parent.parent.resolve()

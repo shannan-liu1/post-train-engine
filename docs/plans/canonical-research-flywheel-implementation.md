@@ -152,7 +152,7 @@ Further cycles:
 3. Work leases and concurrent claim tests.
 4. Deterministic next-experiment recommendations from failure and evidence categories.
 5. Phase-level cost instrumentation and exact-contract baseline caches.
-6. Batched evaluation and model reuse with equivalence tests.
+6. Model reuse with exact equivalence tests; evaluate batching only as a separate candidate.
 7. Second executable-verifier task through the canonical TaskAdapter.
 8. SFT, DPO, and GRPO adapter parity.
 9. Agent collaboration and mechanism-combination proposals.
@@ -174,21 +174,22 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after the final local code change: 307 tests pass.
+- [x] Full tests and Ruff pass after the final local code change: 312 tests pass.
 - [x] Two fresh-eyes passes found and fixed allocation, billing, identity, dependency, runtime-certification, preflight, and provider-handle defects; the final targeted and full gates pass.
 
 The adversarial review reopened production certification at the promotion-contract,
 sealed-evidence, replay-lineage, receipt-idempotency, campaign-wiring, lease-fencing,
 provider-cost, dependency-locking, and distributed-failure boundaries. U-029 through
-U-065 in the governing spec own those findings. Local tests certify implemented
+U-067 in the governing spec own those findings. Local tests certify implemented
 mechanics only. They do not certify a production-safe research flywheel.
 
 R4 remains open after a Secure two-A40 attempt measured a 1.973 conservative speedup
-but failed exact output parity. GRPO did not run. A later remote attempt must diagnose
-the scalar-versus-batched BF16 generation drift, receive explicit user authorization,
-select exactly one source-delivery mode from `docs/runpod_deployment.md`, and bind the
-CUDA allocation filter to the chosen image. No local review or commit authorizes a
-second RunPod action.
+but failed exact output parity. GRPO did not run. Local diagnosis found that the
+candidate combined model reuse with tensor-shape batching, so benchmark v3 now
+isolates model reuse at batch size one. A later remote attempt must receive explicit
+user authorization, select exactly one source-delivery mode from
+`docs/runpod_deployment.md`, and bind the CUDA allocation filter to the chosen image.
+No local review or commit authorizes a second RunPod action.
 
 ## Risks And Escape Hatches
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,10 @@ from post_train_engine.runpod_control_plane import (
     AmbiguousPodCreationError,
     RunPodBudget,
     RunPodControlPlane,
+)
+from post_train_engine.runpod_watchdog import (
+    launch_local_deletion_watchdog,
+    run_local_deletion_watchdog,
 )
 
 
@@ -315,3 +320,130 @@ def test_created_journal_cannot_be_replayed_under_different_budget(
             _request(),
             budget=RunPodBudget(target_spend_usd=1.0, settled_spend_usd=0.0),
         )
+
+
+def test_local_watchdog_launches_detached_without_serializing_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    class Process:
+        pid = 1234
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    def spawn(command: list[str], **kwargs: Any) -> Process:
+        calls.append((command, kwargs))
+        return Process()
+
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-child")
+    receipt = launch_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=tmp_path / "watchdog.json",
+        log_path=tmp_path / "watchdog.log",
+        api_key="super-secret",
+        spawn=spawn,
+    )
+
+    command, kwargs = calls[0]
+    assert receipt["state"] == "armed"
+    assert receipt["pod_id"] == "pod-1"
+    assert receipt["pid"] == 1234
+    assert receipt["delete_at_unix"] == 1120.0
+    assert "super-secret" not in " ".join(command)
+    assert kwargs["env"]["RUNPOD_API_KEY"] == "super-secret"
+    assert "UNRELATED_SECRET" not in kwargs["env"]
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["close_fds"] is True
+
+
+def test_local_watchdog_deletes_literal_journal_pod_and_records_result(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([{}, []])
+    sleeps: list[float] = []
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=receipt_path,
+        api_key="super-secret",
+        sleep=sleeps.append,
+        clock=lambda: 1020.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert sleeps == [100.0]
+    assert transport.calls == [
+        ("DELETE", "/pods/pod-1", None),
+        ("GET", "/pods", None),
+    ]
+    assert result["state"] == "deleted"
+    assert result["pod_id"] == "pod-1"
+    assert "super-secret" not in receipt_path.read_text("utf-8")
+
+
+def test_local_watchdog_reconciles_a_lost_delete_response_by_provider_absence(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([TimeoutError("response lost"), []])
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=receipt_path,
+        api_key="super-secret",
+        sleep=lambda _seconds: None,
+        clock=lambda: 1120.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "absent"
+    operation = json.loads(journal.read_text("utf-8"))
+    assert operation["state"] == "deleted"
+    assert operation["deletion_outcome"] == "provider_absent"

@@ -580,6 +580,21 @@ def test_run_engine_rejects_mutated_receipt_artifact_on_resume(tmp_path: Path) -
         RunEngine().execute(plan, FailingStageAdapter())
 
 
+def test_run_engine_rejects_legacy_receipt_with_actionable_new_run_id(
+    tmp_path: Path,
+) -> None:
+    plan = _fixture_plan(tmp_path / "legacy-receipt")
+    RunEngine().execute(plan, FakeStageAdapter())
+    (Path(plan.output_dir) / "manifest.json").unlink()
+    receipt_path = Path(plan.output_dir) / "state" / "prepare.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    del receipt["artifact_sha256"]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="incompatible.*new run_id"):
+        RunEngine().execute(plan, FailingStageAdapter())
+
+
 def test_run_engine_coordinates_distributed_stages_with_one_writer(
     tmp_path: Path,
 ) -> None:

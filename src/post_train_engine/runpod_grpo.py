@@ -2356,7 +2356,7 @@ def run_runpod_eval_benchmark(
     config_path: str | Path,
     out_path: str | Path,
 ) -> dict[str, Any] | None:
-    """Certify batched evaluation with warmed, order-balanced runtime evidence."""
+    """Certify model reuse with warmed, order-balanced runtime evidence."""
     cfg = load_runpod_grpo_config(config_path)
     dist = DistributedContext.from_env()
     _validate_launch_topology(cfg, dist)
@@ -2368,6 +2368,7 @@ def run_runpod_eval_benchmark(
     scalar_cfg = cfg.model_copy(
         update={"eval": cfg.eval.model_copy(update={"batch_size": 1})}
     )
+    optimized_cfg = scalar_cfg
 
     def evaluate_scalar() -> list[dict[str, Any]]:
         local_rows = []
@@ -2384,7 +2385,7 @@ def run_runpod_eval_benchmark(
 
     def evaluate_optimized() -> list[dict[str, Any]]:
         local_rows = _evaluate_hf_model(
-            cfg=cfg,
+            cfg=optimized_cfg,
             model_ref=cfg.model.base_model_id,
             examples=local_examples,
             dist=dist,
@@ -2413,7 +2414,7 @@ def run_runpod_eval_benchmark(
         separators=(",", ":"),
     )
     result: dict[str, Any] = {
-        "schema_version": "runpod_eval_runtime_benchmark_v2",
+        "schema_version": "runpod_eval_runtime_benchmark_v3",
         "certifying": evidence.certifying,
         "config": str(Path(config_path)),
         "model_id": cfg.model.base_model_id,
@@ -2434,9 +2435,9 @@ def run_runpod_eval_benchmark(
             "max_rank_wall_seconds_trials": list(evidence.baseline_seconds),
         },
         "optimized": {
-            "strategy": "one_model_load_per_shard_with_batching",
+            "strategy": "one_model_load_per_shard",
             "model_load_count_per_rank": 1,
-            "batch_size": cfg.eval.batch_size,
+            "batch_size": optimized_cfg.eval.batch_size,
             "max_rank_wall_seconds_trials": list(evidence.optimized_seconds),
         },
         "measurement_order": ["baseline", "optimized", "optimized", "baseline"],

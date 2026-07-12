@@ -290,6 +290,20 @@ class RunPodControlPlane:
         if not pod_id:
             raise ValueError("pod_id must be non-empty")
         self.transport.request("DELETE", f"/pods/{pod_id}")
+        self._record_deleted(pod_id, outcome="delete_accepted")
+
+    def verify_pod_absent(self, pod_id: str) -> bool:
+        """Reconcile provider state and close the journal only after absence."""
+
+        if not pod_id:
+            raise ValueError("pod_id must be non-empty")
+        active_pods = _list_rows(self.transport.request("GET", "/pods"))
+        if any(str(row.get("id")) == pod_id for row in active_pods):
+            return False
+        self._record_deleted(pod_id, outcome="provider_absent")
+        return True
+
+    def _record_deleted(self, pod_id: str, *, outcome: str) -> None:
         journal = self._read_journal()
         receipt = None if journal is None else journal.get("receipt")
         if isinstance(receipt, dict) and str(receipt.get("pod_id")) != pod_id:
@@ -301,6 +315,7 @@ class RunPodControlPlane:
                     "state": "deleted",
                     "deleted_pod_id": pod_id,
                     "deleted_at_unix": time.time(),
+                    "deletion_outcome": outcome,
                 }
             )
 
