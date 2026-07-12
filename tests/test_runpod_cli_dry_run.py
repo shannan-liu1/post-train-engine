@@ -158,9 +158,14 @@ def test_runpod_plan_derives_deployment_environment_from_runpod_config(
     assert environment["gpu_count"] == 2
     assert environment["container_disk_gb"] == 50
     assert environment["volume_gb"] == 0
-    request = build_runpod_create_request(plan, pod_name="pte-r4-deadbeef")
+    request = build_runpod_create_request(
+        plan,
+        pod_name="pte-r4-deadbeef",
+        ssh_public_key="ssh-ed25519 AAAAfixture pte-runpod-task",
+    )
     RunPodAllocationPolicy().validate_request(request)
     assert request["allowedCudaVersions"] == ["12.8"]
+    assert set(request["env"]) == {"SSH_PUBLIC_KEY"}
 
 
 def test_runpod_plan_rejects_environment_override_that_conflicts_with_config(
