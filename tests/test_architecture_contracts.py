@@ -89,6 +89,15 @@ def test_run_engine_exposes_one_resolver_first_execution_interface() -> None:
     ]
 
 
+def test_r4_has_no_standalone_mutable_script() -> None:
+    assert not (ROOT / "scripts" / "benchmark_runpod_eval.py").exists()
+    runtime_config = ROOT / "configs" / "gsm8k_runpod_r4.yaml"
+    assert runtime_config.is_file()
+    assert "kind: runpod_runtime_certification" in runtime_config.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     base = {_requirement_name(value) for value in project["project"]["dependencies"]}

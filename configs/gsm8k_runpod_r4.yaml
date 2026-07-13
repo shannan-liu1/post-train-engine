@@ -1,0 +1,5 @@
+kind: runpod_runtime_certification
+run_id: gsm8k-runpod-r4
+output_dir: runs/gsm8k-runpod-r4
+source_config: gsm8k_runpod_smoke.yaml
+overwrite: false

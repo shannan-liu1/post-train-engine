@@ -301,6 +301,17 @@ class RunPodGRPOConfig(BaseModel):
         return self.training.reward_config()
 
 
+class RunPodRuntimeCertificationConfig(BaseModel):
+    model_config = _FROZEN_FORBID
+
+    kind: Literal["runpod_runtime_certification"]
+    run_id: str = Field(..., min_length=1)
+    output_dir: str = Field(..., min_length=1)
+    source_config: str = Field(..., min_length=1)
+    overwrite: bool = False
+    max_cost_usd: float | None = Field(default=None, ge=0.0)
+
+
 @dataclass(frozen=True)
 class EvalRow:
     example_id: str
@@ -371,6 +382,15 @@ def load_runpod_grpo_config(path: str | Path) -> RunPodGRPOConfig:
     return RunPodGRPOConfig.model_validate(raw)
 
 
+def load_runpod_runtime_config(
+    path: str | Path,
+) -> RunPodRuntimeCertificationConfig:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("RunPod runtime certification config root must be a mapping")
+    return RunPodRuntimeCertificationConfig.model_validate(raw)
+
+
 def _resolve_hub_revisions(cfg: RunPodGRPOConfig) -> RunPodGRPOConfig:
     model_revision = resolve_huggingface_revision(
         cfg.model.base_model_id,
@@ -398,6 +418,71 @@ def _resolve_hub_revisions(cfg: RunPodGRPOConfig) -> RunPodGRPOConfig:
     )
 
 
+@dataclass(frozen=True)
+class _ResolvedRunPodInputs:
+    cfg: RunPodGRPOConfig
+    store: ArtifactStore | None
+    runtime_attestation: dict[str, Any]
+    train_examples: tuple[GSM8KExample, ...]
+    selection_examples: tuple[GSM8KExample, ...]
+    promotion_examples: tuple[GSM8KExample, ...]
+
+
+def _resolve_runpod_inputs(
+    requested_cfg: RunPodGRPOConfig,
+    *,
+    config_path: Path,
+    dist: DistributedContext,
+    training_required: bool,
+) -> _ResolvedRunPodInputs:
+    cfg = requested_cfg
+    _validate_launch_topology(cfg, dist)
+    if training_required:
+        _validate_grpo_runtime_shape(cfg.training, world_size=dist.world_size)
+    if training_required and dist.is_main_process:
+        _validate_hf_upload_config(cfg)
+    run_dir = Path(cfg.run.output_dir)
+    store: ArtifactStore | None = None
+    resumable = False
+    if dist.is_main_process:
+        resumable = run_dir.is_dir() and (
+            (run_dir / "manifest.json").is_file() or (run_dir / "state").is_dir()
+        )
+        store = (
+            ArtifactStore(run_dir, resume=True)
+            if resumable
+            else ArtifactStore(run_dir, overwrite=cfg.run.overwrite)
+        )
+        if not resumable:
+            store.copy_file(config_path, "config.raw.yaml")
+            store.write_json("config.resolved.json", cfg.model_dump(mode="json"))
+            store.write_text("command.txt", " ".join(sys.argv) + "\n")
+            store.write_json("environment.json", runtime_environment(dist))
+    runtime_attestation = _require_cuda(cfg)
+    resolution_path = run_dir / "resolution" / "config.resolved.json"
+    if resolution_path.is_file():
+        cfg = RunPodGRPOConfig.model_validate(_read_json_object(resolution_path))
+    else:
+        cfg = _resolve_hub_revisions(cfg)
+    if store is not None and not resolution_path.is_file():
+        store.write_json(
+            "resolution/config.resolved.json",
+            cfg.model_dump(mode="json"),
+        )
+    train, selection, promotion = _load_and_split_dataset(cfg)
+    roles = EvaluationRoles(
+        selection_example_ids=tuple(row.id for row in selection),
+        promotion_example_ids=tuple(row.id for row in promotion),
+    )
+    roles.require_training_eligible(row.id for row in train)
+    return _ResolvedRunPodInputs(
+        cfg=cfg,
+        store=store,
+        runtime_attestation=dict(runtime_attestation or {}),
+        train_examples=tuple(train),
+        selection_examples=tuple(selection),
+        promotion_examples=tuple(promotion),
+    )
 def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
     requested_cfg = load_runpod_grpo_config(config_path)
     dist = DistributedContext.from_env()
@@ -412,87 +497,45 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
     def resolve() -> RunResolution:
         nonlocal resolution
         started = time.perf_counter()
-        cfg = requested_cfg
-        _validate_launch_topology(cfg, dist)
-        _validate_grpo_runtime_shape(cfg.training, world_size=dist.world_size)
-        if dist.is_main_process:
-            _validate_hf_upload_config(cfg)
-        run_dir = Path(cfg.run.output_dir)
-        store: ArtifactStore | None = None
-        resumable = False
-        if dist.is_main_process:
-            resumable = run_dir.is_dir() and (
-                (run_dir / "manifest.json").is_file()
-                or (run_dir / "state").is_dir()
-            )
-            store = (
-                ArtifactStore(run_dir, resume=True)
-                if resumable
-                else ArtifactStore(run_dir, overwrite=cfg.run.overwrite)
-            )
-            if not resumable:
-                store.copy_file(config_path, "config.raw.yaml")
-                store.write_json(
-                    "config.resolved.json",
-                    cfg.model_dump(mode="json"),
-                )
-                store.write_text("command.txt", " ".join(sys.argv) + "\n")
-                store.write_json("environment.json", runtime_environment(dist))
-        _require_cuda(cfg)
-        resolution_path = run_dir / "resolution" / "config.resolved.json"
-        if resolution_path.is_file():
-            cfg = RunPodGRPOConfig.model_validate(
-                _read_json_object(resolution_path)
-            )
-        else:
-            cfg = _resolve_hub_revisions(cfg)
-        if store is not None and not resolution_path.is_file():
-            store.write_json(
-                "resolution/config.resolved.json",
-                cfg.model_dump(mode="json"),
-            )
-
-        train_examples, selection_examples, promotion_examples = (
-            _load_and_split_dataset(cfg)
-        )
-        roles = EvaluationRoles(
-            selection_example_ids=tuple(row.id for row in selection_examples),
-            promotion_example_ids=tuple(row.id for row in promotion_examples),
-        )
-        roles.require_training_eligible(row.id for row in train_examples)
-        plan = _compile_runpod_plan(
-            cfg,
-            dist=dist,
-            train_examples=train_examples,
-            selection_examples=selection_examples,
-            promotion_examples=promotion_examples,
-        )
-        adapter = _RunPodGRPOAdapter(
-            cfg=cfg,
+        inputs = _resolve_runpod_inputs(
+            requested_cfg,
             config_path=Path(config_path),
             dist=dist,
-            store=store,
-            train_examples=train_examples,
-            selection_examples=selection_examples,
-            promotion_examples=promotion_examples,
+            training_required=True,
+        )
+        plan = _compile_runpod_plan(
+            inputs.cfg,
+            dist=dist,
+            train_examples=inputs.train_examples,
+            selection_examples=inputs.selection_examples,
+            promotion_examples=inputs.promotion_examples,
+        )
+        adapter = _RunPodGRPOAdapter(
+            cfg=inputs.cfg,
+            config_path=Path(config_path),
+            dist=dist,
+            store=inputs.store,
+            train_examples=inputs.train_examples,
+            selection_examples=inputs.selection_examples,
+            promotion_examples=inputs.promotion_examples,
         )
         output = (
             _runpod_worker_output()
-            if store is None
+            if inputs.store is None
             else _runpod_output(
-                store,
+                inputs.store,
                 artifacts={
                     "resolved_run_config": "resolution/config.resolved.json"
                 },
                 values={
                     "dataset_resolution": plan.inputs["dataset"].resolution_state,
                     "model_resolution": plan.inputs["model"].resolution_state,
-                    "training_example_count": len(train_examples),
-                    "selection_example_count": len(selection_examples),
-                    "promotion_example_count": len(promotion_examples),
+                    "training_example_count": len(inputs.train_examples),
+                    "selection_example_count": len(inputs.selection_examples),
+                    "promotion_example_count": len(inputs.promotion_examples),
                 },
                 phase_cost=_runpod_phase_cost(
-                    cfg,
+                    inputs.cfg,
                     "resolution",
                     time.perf_counter() - started,
                 ),
@@ -511,6 +554,107 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
     run_dir = Path(resolution.plan.output_dir)
     require_nonfailed_manifest(execution.manifest, run_dir)
     return _read_json_object(run_dir / "final_report.json")
+
+
+def run_runpod_runtime_certification(config_path: str | Path) -> dict[str, Any]:
+    runtime_cfg = load_runpod_runtime_config(config_path)
+    source_path = (Path(config_path).resolve().parent / runtime_cfg.source_config).resolve()
+    requested_cfg = load_runpod_grpo_config(source_path)
+    requested_cfg = requested_cfg.model_copy(
+        update={
+            "run": requested_cfg.run.model_copy(
+                update={
+                    "certification_mode": "non_certifying_smoke",
+                    "run_id": runtime_cfg.run_id,
+                    "output_dir": runtime_cfg.output_dir,
+                    "overwrite": runtime_cfg.overwrite,
+                    "campaign": None,
+                }
+            )
+        }
+    )
+    dist = DistributedContext.from_env()
+    state = _distributed_state(dist)
+    coordinator = (
+        _AccelerateRunCoordinator(dist, state) if dist.is_distributed else None
+    )
+    resolution: RunResolution | None = None
+
+    def resolve() -> RunResolution:
+        nonlocal resolution
+        started = time.perf_counter()
+        inputs = _resolve_runpod_inputs(
+            requested_cfg,
+            config_path=source_path,
+            dist=dist,
+            training_required=False,
+        )
+        plan = _compile_runpod_plan(
+            inputs.cfg,
+            dist=dist,
+            train_examples=inputs.train_examples,
+            selection_examples=inputs.selection_examples,
+            promotion_examples=inputs.promotion_examples,
+        ).model_copy(
+            update={
+                "candidate_id": f"{runtime_cfg.run_id}-runtime-candidate",
+                "max_cost_usd": runtime_cfg.max_cost_usd,
+                "metadata": {
+                    "execution_mode": "runpod_runtime_certification",
+                    "execution": inputs.cfg.execution.model_dump(mode="json"),
+                    "distributed": dist.to_json(),
+                    "training_allowed": False,
+                },
+            }
+        )
+        adapter = _RunPodRuntimeCertificationAdapter(
+            cfg=inputs.cfg,
+            runtime_config_path=Path(config_path),
+            dist=dist,
+            distributed_state=state,
+            store=inputs.store,
+            runtime_attestation=inputs.runtime_attestation,
+            train_examples=inputs.train_examples,
+            selection_examples=inputs.selection_examples,
+            promotion_examples=inputs.promotion_examples,
+        )
+        output = (
+            _runpod_worker_output()
+            if inputs.store is None
+            else _runpod_output(
+                inputs.store,
+                artifacts={
+                    "resolved_run_config": "resolution/config.resolved.json"
+                },
+                values={
+                    "runtime_attestation": inputs.runtime_attestation,
+                    "training_allowed": False,
+                },
+                phase_cost=_runpod_phase_cost(
+                    inputs.cfg,
+                    "resolution",
+                    time.perf_counter() - started,
+                ),
+            )
+        )
+        resolution = RunResolution(plan=plan, adapter=adapter, output=output)
+        return resolution
+
+    execution = RunEngine().execute(
+        resolve,
+        coordinator=coordinator,
+        resolution_timeout_seconds=requested_cfg.run.distributed_timeout_seconds,
+    )
+    if resolution is None:
+        raise RuntimeError("RunEngine completed without retaining its resolution")
+    run_dir = Path(resolution.plan.output_dir)
+    require_nonfailed_manifest(execution.manifest, run_dir)
+    report = _read_json_object(run_dir / "final_report.json")
+    if not bool(report.get("runtime_certified")):
+        raise RuntimeError(
+            "R4 runtime certification failed; inspect the canonical Run bundle"
+        )
+    return report
 
 class _AccelerateRunCoordinator:
     def __init__(self, dist: DistributedContext, state: Any) -> None:
@@ -2384,117 +2528,319 @@ def _event(store: ArtifactStore | None, event: str, payload: Mapping[str, Any]) 
     )
 
 
-def run_runpod_eval_benchmark(
-    config_path: str | Path,
-    out_path: str | Path,
-) -> dict[str, Any] | None:
-    """Certify model reuse with warmed, order-balanced runtime evidence."""
-    cfg = load_runpod_grpo_config(config_path)
-    dist = DistributedContext.from_env()
-    _validate_launch_topology(cfg, dist)
-    state = _distributed_state(dist)
-    runtime_attestation = _require_cuda(cfg)
-    cfg = _resolve_hub_revisions(cfg)
-    _train, _selection, promotion = _load_and_split_dataset(cfg)
-    local_examples = _shard_sequence(promotion, dist)
-    scalar_cfg = cfg.model_copy(
-        update={"eval": cfg.eval.model_copy(update={"batch_size": 1})}
-    )
-    optimized_cfg = scalar_cfg
+class _RunPodRuntimeCertificationAdapter:
+    """Non-training adapter that certifies model reuse inside RunEngine."""
 
-    def evaluate_scalar() -> list[dict[str, Any]]:
-        local_rows = []
-        for example in local_examples:
-            local_rows.extend(
-                _evaluate_hf_model(
-                    cfg=scalar_cfg,
-                    model_ref=cfg.model.base_model_id,
-                    examples=[example],
-                    dist=dist,
+    def __init__(
+        self,
+        *,
+        cfg: RunPodGRPOConfig,
+        runtime_config_path: Path,
+        dist: DistributedContext,
+        distributed_state: Any | None,
+        store: ArtifactStore | None,
+        runtime_attestation: Mapping[str, Any],
+        train_examples: Sequence[GSM8KExample],
+        selection_examples: Sequence[GSM8KExample],
+        promotion_examples: Sequence[GSM8KExample],
+    ) -> None:
+        self.cfg = cfg
+        self.runtime_config_path = runtime_config_path
+        self.dist = dist
+        self.distributed_state = distributed_state
+        self.store = store
+        self.runtime_attestation = dict(runtime_attestation)
+        self.train_examples = list(train_examples)
+        self.selection_examples = list(selection_examples)
+        self.promotion_examples = list(promotion_examples)
+
+    def execute_stage(
+        self,
+        stage: RunStage,
+        plan: RunPlan,
+        prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        handlers = {
+            "prepare": self._prepare,
+            "data": self._data,
+            "evidence": self._evidence,
+            "train": self._train,
+            "select": self._select,
+            "evaluate": self._evaluate,
+            "finalize": self._finalize,
+        }
+        if stage not in handlers:
+            raise ValueError(f"RunEngine owns stage {stage!r}")
+        return handlers[stage](plan, prior)
+
+    def _prepare(
+        self,
+        _plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        self.store.copy_file(self.runtime_config_path, "runtime_config.raw.yaml")
+        self.store.write_json("config.resolved.json", self.cfg.model_dump(mode="json"))
+        self.store.write_json("environment.json", runtime_environment(self.dist))
+        self.store.write_text("command.txt", " ".join(sys.argv) + "\n")
+        self.store.write_json(
+            "candidates/baseline.json",
+            {
+                "candidate_id": "baseline",
+                "model_id": self.cfg.model.base_model_id,
+                "adapter_kind": "base",
+            },
+        )
+        return _runpod_output(
+            self.store,
+            artifacts={
+                "runtime_config_raw": "runtime_config.raw.yaml",
+                "config_resolved": "config.resolved.json",
+                "environment": "environment.json",
+                "command": "command.txt",
+                "baseline_candidate": "candidates/baseline.json",
+            },
+            values={"training_allowed": False},
+        )
+
+    def _data(
+        self,
+        _plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        _write_dataset_artifacts(
+            self.store,
+            self.cfg,
+            self.train_examples,
+            self.selection_examples,
+            self.promotion_examples,
+        )
+        return _runpod_output(
+            self.store,
+            artifacts={
+                "dataset_splits": "datasets/splits.json",
+                "train_examples": "datasets/train.jsonl",
+                "selection_examples": "datasets/selection.jsonl",
+                "promotion_examples": "datasets/promotion.jsonl",
+            },
+        )
+
+    def _evidence(
+        self,
+        _plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        self.store.write_json("runtime_attestation.json", self.runtime_attestation)
+        return _runpod_output(
+            self.store,
+            artifacts={"runtime_attestation": "runtime_attestation.json"},
+            values={"training_allowed": False},
+        )
+
+    def _train(
+        self,
+        _plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        self.store.write_json(
+            "non_training_outcome.json",
+            {
+                "outcome": "runtime_certification_only",
+                "training_invoked": False,
+            },
+        )
+        return _runpod_output(
+            self.store,
+            artifacts={"non_training_outcome": "non_training_outcome.json"},
+            values={"training_outcome": "not_allowed"},
+        )
+
+    def _select(
+        self,
+        plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        self.store.write_json(
+            "candidates/candidate.json",
+            {
+                "candidate_id": plan.candidate_id,
+                "model_id": self.cfg.model.base_model_id,
+                "parent_id": "baseline",
+                "adapter_kind": "runtime_equivalent_baseline",
+            },
+        )
+        return _runpod_output(
+            self.store,
+            artifacts={"candidate": "candidates/candidate.json"},
+            values={"selected_checkpoint_path": self.cfg.model.base_model_id},
+        )
+
+    def _evaluate(
+        self,
+        plan: RunPlan,
+        _prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        started = time.perf_counter()
+        local_examples = _shard_sequence(self.promotion_examples, self.dist)
+        scalar_cfg = self.cfg.model_copy(
+            update={"eval": self.cfg.eval.model_copy(update={"batch_size": 1})}
+        )
+
+        def evaluate_scalar() -> list[dict[str, Any]]:
+            local_rows: list[EvalRow] = []
+            for example in local_examples:
+                local_rows.extend(
+                    _evaluate_hf_model(
+                        cfg=scalar_cfg,
+                        model_ref=self.cfg.model.base_model_id,
+                        examples=[example],
+                        dist=self.dist,
+                    )
                 )
+            return [
+                row.to_json() for row in _gather_eval_rows(local_rows, self.dist)
+            ]
+
+        def evaluate_optimized() -> list[dict[str, Any]]:
+            local_rows = _evaluate_hf_model(
+                cfg=scalar_cfg,
+                model_ref=self.cfg.model.base_model_id,
+                examples=local_examples,
+                dist=self.dist,
             )
-        return [row.to_json() for row in _gather_eval_rows(local_rows, dist)]
+            return [
+                row.to_json() for row in _gather_eval_rows(local_rows, self.dist)
+            ]
 
-    def evaluate_optimized() -> list[dict[str, Any]]:
-        local_rows = _evaluate_hf_model(
-            cfg=optimized_cfg,
-            model_ref=cfg.model.base_model_id,
-            examples=local_examples,
-            dist=dist,
+        def synchronize() -> None:
+            _wait_for_everyone(self.distributed_state)
+            import torch
+
+            torch.cuda.synchronize()
+
+        evidence = measure_runtime_pair(
+            baseline=evaluate_scalar,
+            optimized=evaluate_optimized,
+            synchronize=synchronize,
+            reduce_seconds=lambda seconds: _max_rank_seconds(seconds, self.dist),
         )
-        return [row.to_json() for row in _gather_eval_rows(local_rows, dist)]
-
-    def synchronize() -> None:
-        _wait_for_everyone(state)
-        import torch
-
-        torch.cuda.synchronize()
-
-    evidence = measure_runtime_pair(
-        baseline=evaluate_scalar,
-        optimized=evaluate_optimized,
-        synchronize=synchronize,
-        reduce_seconds=lambda seconds: _max_rank_seconds(seconds, dist),
-    )
-    if not dist.is_main_process:
-        return None
-
-    optimized_payload = evidence.output
-    payload = json.dumps(
-        optimized_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    result: dict[str, Any] = {
-        "schema_version": "runpod_eval_runtime_benchmark_v3",
-        "certifying": evidence.certifying,
-        "config": str(Path(config_path)),
-        "model_id": cfg.model.base_model_id,
-        "model_revision": cfg.model.resolved_revision,
-        "dataset_revision": (
-            "embedded-gsm8k-tiny-v1"
-            if cfg.dataset.source == "embedded_gsm8k_tiny"
-            else cfg.dataset.resolved_revision
-        ),
-        "topology": dist.to_json(),
-        "environment": runtime_environment(dist),
-        "runtime_attestation": runtime_attestation,
-        "example_count": len(promotion),
-        "baseline": {
-            "strategy": "one_model_load_per_example",
-            "model_load_count_per_rank": len(local_examples),
-            "batch_size": 1,
-            "max_rank_wall_seconds_trials": list(evidence.baseline_seconds),
-        },
-        "optimized": {
-            "strategy": "one_model_load_per_shard",
-            "model_load_count_per_rank": 1,
-            "batch_size": optimized_cfg.eval.batch_size,
-            "max_rank_wall_seconds_trials": list(evidence.optimized_seconds),
-        },
-        "measurement_order": ["baseline", "optimized", "optimized", "baseline"],
-        "trial_output_parity": {
-            "reference": "warmup_optimized",
-            "baseline": list(evidence.baseline_output_parity),
-            "optimized": list(evidence.optimized_output_parity),
-        },
-        "warmup_strategy": "optimized",
-        "minimum_speedup": evidence.minimum_speedup,
-        "speedup": evidence.conservative_speedup,
-        "output_parity": evidence.output_parity,
-        "output_sha256": "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-    }
-    out = Path(out_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
-    if not evidence.output_parity:
-        raise RuntimeError("model-reuse evaluation output drifted from baseline")
-    if not evidence.certifying:
-        raise RuntimeError(
-            "conservative paired runtime speedup did not meet the certification margin; "
-            "inspect benchmark artifact"
+        if self.store is None:
+            return _runpod_worker_output()
+        rows = [EvalRow(**row) for row in evidence.output]
+        payload = json.dumps(evidence.output, sort_keys=True, separators=(",", ":"))
+        result: dict[str, Any] = {
+            "schema_version": "runpod_eval_runtime_benchmark_v3",
+            "certifying": evidence.certifying,
+            "model_id": self.cfg.model.base_model_id,
+            "model_revision": self.cfg.model.resolved_revision,
+            "dataset_revision": (
+                "embedded-gsm8k-tiny-v1"
+                if self.cfg.dataset.source == "embedded_gsm8k_tiny"
+                else self.cfg.dataset.resolved_revision
+            ),
+            "topology": self.dist.to_json(),
+            "runtime_attestation": self.runtime_attestation,
+            "example_count": len(self.promotion_examples),
+            "baseline": {
+                "strategy": "one_model_load_per_example",
+                "model_load_count_per_rank": len(local_examples),
+                "batch_size": 1,
+                "max_rank_wall_seconds_trials": list(evidence.baseline_seconds),
+            },
+            "optimized": {
+                "strategy": "one_model_load_per_shard",
+                "model_load_count_per_rank": 1,
+                "batch_size": scalar_cfg.eval.batch_size,
+                "max_rank_wall_seconds_trials": list(evidence.optimized_seconds),
+            },
+            "measurement_order": [
+                "baseline",
+                "optimized",
+                "optimized",
+                "baseline",
+            ],
+            "trial_output_parity": {
+                "reference": "warmup_optimized",
+                "baseline": list(evidence.baseline_output_parity),
+                "optimized": list(evidence.optimized_output_parity),
+            },
+            "warmup_strategy": "optimized",
+            "minimum_speedup": evidence.minimum_speedup,
+            "speedup": evidence.conservative_speedup,
+            "output_parity": evidence.output_parity,
+            "output_sha256": "sha256:"
+            + hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        }
+        self.store.write_json("runtime_benchmark.json", result)
+        _write_eval_outputs(self.store, "baseline", rows)
+        _write_eval_outputs(self.store, "candidate", rows)
+        self.store.write_json(
+            "evals/baseline.json",
+            _runpod_promotion_artifact(
+                "baseline",
+                rows,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
         )
-    return result
+        self.store.write_json(
+            "evals/candidate.json",
+            _runpod_promotion_artifact(
+                plan.candidate_id,
+                rows,
+                evaluation_contract_hash=plan.evaluation_contract.contract_hash,
+            ).to_dict(),
+        )
+        return _runpod_output(
+            self.store,
+            artifacts={
+                "runtime_benchmark": "runtime_benchmark.json",
+                "baseline_eval": "evals/baseline.json",
+                "candidate_eval": "evals/candidate.json",
+            },
+            values={"runtime_certified": evidence.certifying},
+            phase_cost=_runpod_phase_cost(
+                self.cfg,
+                "runtime_certification",
+                time.perf_counter() - started,
+            ),
+        )
+
+    def _finalize(
+        self,
+        plan: RunPlan,
+        prior: dict[str, StageOutput],
+    ) -> StageOutput:
+        if self.store is None:
+            return _runpod_worker_output()
+        benchmark = _read_json_object(prior["evaluate"].artifacts["runtime_benchmark"])
+        promotion = _read_json_object(
+            prior["promote"].artifacts["promotion_decision"]
+        )
+        report = {
+            "run_id": plan.run_id,
+            "runtime_certified": bool(benchmark["certifying"]),
+            "runtime_benchmark": benchmark,
+            "training_invoked": False,
+            "promotion": promotion,
+        }
+        self.store.write_json("final_report.json", report)
+        return _runpod_output(
+            self.store,
+            artifacts={"final_report_json": "final_report.json"},
+            values={
+                "runtime_certified": report["runtime_certified"],
+                "decision": promotion["decision"],
+            },
+        )
 
 
 def _max_rank_seconds(seconds: float, dist: DistributedContext) -> float:
@@ -2509,6 +2855,7 @@ def _max_rank_seconds(seconds: float, dist: DistributedContext) -> float:
 
 
 __all__ = [
+    "RunPodRuntimeCertificationConfig",
     "RunPodGRPOConfig",
     "DistributedContext",
     "_align_model_with_tokenizer",
@@ -2524,7 +2871,8 @@ __all__ = [
     "_validate_launch_topology",
     "is_runpod_grpo_config",
     "load_runpod_grpo_config",
+    "load_runpod_runtime_config",
     "run_runpod_grpo_hillclimb",
-    "run_runpod_eval_benchmark",
+    "run_runpod_runtime_certification",
     "runtime_environment",
 ]

@@ -66,7 +66,7 @@ from post_train_engine.training_views import (
 )
 from post_train_engine.training.optimizers import DEFAULT_OPTIMIZER_FRAMEWORK
 
-Runner = Callable[[Mapping[str, Any], Path], RunManifest]
+Runner = Callable[[Mapping[str, Any], Path], RunManifest | dict[str, Any]]
 
 
 def register_run_parser(
@@ -227,8 +227,18 @@ def _run_gsm8k_local_smoke(
     return run_local_gsm8k_smoke(raw, config_path=config_path)
 
 
+def _run_runpod_runtime_certification(
+    _raw: Mapping[str, Any],
+    config_path: Path,
+) -> dict[str, Any]:
+    from post_train_engine.runpod_grpo import run_runpod_runtime_certification
+
+    return run_runpod_runtime_certification(config_path)
+
+
 RUNNERS: dict[str, Runner] = {
     "gsm8k_local_smoke": _run_gsm8k_local_smoke,
+    "runpod_runtime_certification": _run_runpod_runtime_certification,
 }
 
 

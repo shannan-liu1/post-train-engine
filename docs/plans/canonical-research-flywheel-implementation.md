@@ -174,22 +174,24 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after engine-owned resolution: 315 tests pass.
+- [x] Full tests and Ruff pass after canonical runtime certification: 317 tests pass.
 - [x] API and RunPod consequential resolution enter the typed RunEngine `resolve` phase before the immutable RunPlan and adapter stages.
+- [x] R4 runs through `pte run` as a non-training RunEngine adapter and records runtime evidence without model-promotion authority.
 - [x] Two fresh-eyes passes found and fixed allocation, billing, identity, dependency, runtime-certification, preflight, and provider-handle defects; the final targeted and full gates pass.
 
 The adversarial review reopened production certification at the promotion-contract,
 sealed-evidence, replay-lineage, receipt-idempotency, campaign-wiring, lease-fencing,
 provider-cost, dependency-locking, and distributed-failure boundaries. U-029 through
-U-071 in the governing spec own those findings. Local tests certify implemented
+U-071 in the governing spec records the canonical R4 repair. Local tests certify implemented
 mechanics only. They do not certify a production-safe research flywheel.
 
-R4 remains open after a Secure two-A40 attempt measured a 1.973 conservative speedup
+Remote R4 certification remains open after a Secure two-A40 attempt measured a 1.973 conservative speedup
 but failed exact output parity. GRPO did not run. Local diagnosis found that the
 candidate combined model reuse with tensor-shape batching, so benchmark v3 now
 isolates model reuse at batch size one. A later remote attempt must receive explicit
 user authorization, select exactly one source-delivery mode from
 `docs/runpod_deployment.md`, and bind the CUDA allocation filter to the chosen image.
+The retry must use `configs/gsm8k_runpod_r4.yaml` through `pte run`, not a standalone script.
 No local review or commit authorizes a second RunPod action.
 
 ## Risks And Escape Hatches

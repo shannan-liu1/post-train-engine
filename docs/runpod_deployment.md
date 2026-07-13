@@ -189,7 +189,7 @@ fenced campaign proposal and binding provider billing settlement.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
-8. Do not run the paid benchmark while U-071 remains open. First move runtime certification into typed RunEngine stages; then launch that canonical Run with `accelerate launch --num_processes 2`.
+8. Launch R4 only through `accelerate launch --num_processes 2 -m post_train_engine.cli run --config configs/gsm8k_runpod_r4.yaml --no-env`. Confirm its canonical RunManifest reports `runtime_certified: true` before any GRPO smoke.
 9. Require exit code zero, exact output parity, paired ABBA trials, conservative `speedup >= 1.05`, and `certifying: true` under benchmark schema v3. The current candidate isolates model reuse with scalar tensor shapes. Do not re-enable batching until a separate exact-contract experiment proves output equivalence.
 10. Download the JSON artifact and logs before teardown.
 

@@ -36,7 +36,6 @@ from post_train_engine.runpod_grpo import (
     _write_measured_training_view,
     is_runpod_grpo_config,
     load_runpod_grpo_config,
-    run_runpod_eval_benchmark,
 )
 from post_train_engine.runtime_evidence import RuntimePairEvidence
 from post_train_engine.tasks.gsm8k import GSM8KExample
@@ -138,9 +137,11 @@ def test_evaluator_preserves_order_for_a_batch_invariant_model(
     assert batched_rows == scalar_rows
 
 
-def test_r4_benchmark_optimizes_model_reuse_without_changing_tensor_shape(
+@pytest.mark.parametrize("runtime_certifying", [True, False])
+def test_r4_benchmark_uses_canonical_non_training_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    runtime_certifying: bool,
 ) -> None:
     import post_train_engine.runpod_grpo as runpod_module
 
@@ -172,7 +173,7 @@ def test_r4_benchmark_optimizes_model_reuse_without_changing_tensor_shape(
             baseline_output_parity=(True, True),
             optimized_output_parity=(True, True),
             output_parity=True,
-            certifying=True,
+            certifying=runtime_certifying,
             minimum_speedup=1.05,
             output=optimized_output,
         )
@@ -188,13 +189,31 @@ def test_r4_benchmark_optimizes_model_reuse_without_changing_tensor_shape(
     monkeypatch.setattr(runpod_module, "_evaluate_hf_model", evaluate)
     monkeypatch.setattr(runpod_module, "runtime_environment", lambda _dist: {})
     monkeypatch.setattr(runpod_module, "measure_runtime_pair", measure)
-
-    result = run_runpod_eval_benchmark(
-        _write_config(tmp_path, {"eval": {"batch_size": 4}}),
-        tmp_path / "benchmark.json",
+    monkeypatch.setattr(
+        runpod_module,
+        "_train_grpo",
+        lambda *_args, **_kwargs: pytest.fail("R4 must never invoke training"),
     )
 
-    assert result is not None
+    source_config = _write_config(tmp_path, {"eval": {"batch_size": 4}})
+    runtime_config = _write_runtime_config(tmp_path, source_config)
+
+    command = ["run", "--config", str(runtime_config), "--no-env"]
+    if runtime_certifying:
+        main(command)
+    else:
+        with pytest.raises(RuntimeError, match="R4 runtime certification failed"):
+            main(command)
+
+    run_dir = tmp_path / "runs" / "gsm8k-runpod-r4"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    result = json.loads(
+        (run_dir / "runtime_benchmark.json").read_text(encoding="utf-8")
+    )
+    assert manifest["metadata"]["stage_order"] == list(CANONICAL_STAGE_ORDER)
+    assert manifest["metadata"]["execution_mode"] == "runpod_runtime_certification"
+    assert manifest["status"] == "rejected"
+    assert result["certifying"] is runtime_certifying
     assert result["optimized"]["batch_size"] == 1
     assert result["optimized"]["strategy"] == "one_model_load_per_shard"
     assert calls == [(1, 1), (1, 1), (1, 1), (1, 1), (1, 4)]
@@ -846,6 +865,23 @@ def _write_config(
     _deep_update(body, overrides or {})
     path = tmp_path / "gsm8k_runpod_test.yaml"
     path.write_text(yaml.safe_dump(body, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _write_runtime_config(tmp_path: Path, source_config: Path) -> Path:
+    path = tmp_path / "gsm8k_runpod_r4.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "kind": "runpod_runtime_certification",
+                "run_id": "gsm8k-runpod-r4",
+                "output_dir": str(tmp_path / "runs" / "gsm8k-runpod-r4"),
+                "source_config": source_config.name,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
