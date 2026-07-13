@@ -195,6 +195,8 @@ fenced campaign proposal and binding provider billing settlement.
 
 Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 
+When dependencies change, run the export command recorded at the top of `requirements/runpod.txt`, then restore `# uv-lock-sha256: <sha256 of normalized uv.lock>` within its first three lines. `runpod_preflight.py --constraints-only` and the architecture tests reject a stale or missing binding.
+
 ## Teardown and evidence
 
 Teardown runs after success, failure, timeout, or interruption:

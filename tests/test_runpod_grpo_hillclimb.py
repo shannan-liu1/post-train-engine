@@ -219,6 +219,27 @@ def test_r4_benchmark_uses_canonical_non_training_run(
     assert calls == [(1, 1), (1, 1), (1, 1), (1, 1), (1, 4)]
 
 
+def test_r4_config_rejects_absolute_source_and_grpo_output_collision(
+    tmp_path: Path,
+) -> None:
+    source_config = _write_config(tmp_path)
+    runtime_config = _write_runtime_config(tmp_path, source_config)
+    body = yaml.safe_load(runtime_config.read_text(encoding="utf-8"))
+    body["source_config"] = str(source_config.resolve())
+    runtime_config.write_text(yaml.safe_dump(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_config must be relative"):
+        main(["run", "--config", str(runtime_config), "--no-env"])
+
+    source = load_runpod_grpo_config(source_config)
+    body["source_config"] = source_config.name
+    body["output_dir"] = source.run.output_dir
+    runtime_config.write_text(yaml.safe_dump(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="distinct from the GRPO output_dir"):
+        main(["run", "--config", str(runtime_config), "--no-env"])
+
+
 def test_runpod_grpo_builds_policy_lineage_training_view(tmp_path: Path) -> None:
     cfg = load_runpod_grpo_config(_write_config(tmp_path))
     train, selection, promotion = _load_and_split_dataset(cfg)

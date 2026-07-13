@@ -51,22 +51,15 @@ def test_retired_standalone_promotion_command_is_not_registered(
     assert "invalid choice: 'promote'" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["probe", "eval"])
-def test_model_execution_is_not_registered_under_task_utility_cli(
-    command: str,
+def test_task_utility_cli_is_not_registered(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as excinfo:
-        main(["gsm8k", command])
+        main(["gsm8k"])
 
     assert excinfo.value.code == 2
-    assert f"invalid choice: '{command}'" in capsys.readouterr().err
-
-
-def test_task_utility_module_has_no_independent_main() -> None:
-    from post_train_engine.cli import gsm8k
-
-    assert not hasattr(gsm8k, "main")
+    assert "invalid choice: 'gsm8k'" in capsys.readouterr().err
+    assert not (ROOT / "src" / "post_train_engine" / "cli" / "gsm8k.py").exists()
 
 
 def test_package_exposes_only_the_canonical_console_script() -> None:
@@ -98,6 +91,17 @@ def test_r4_has_no_standalone_mutable_script() -> None:
     )
 
 
+def test_dead_shadow_execution_and_superseded_docs_stay_deleted() -> None:
+    import post_train_engine
+
+    assert post_train_engine.__all__ == []
+    assert not (ROOT / "src" / "post_train_engine" / "generation.py").exists()
+    assert not (ROOT / "src" / "post_train_engine" / "evals" / "run_eval.py").exists()
+    assert not (ROOT / "docs" / "lean_flywheel_plan.md").exists()
+    for retired_config_family in ("probe", "tasks", "evals"):
+        assert not any((ROOT / "configs" / retired_config_family).rglob("*"))
+
+
 def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     base = {_requirement_name(value) for value in project["project"]["dependencies"]}
@@ -109,6 +113,7 @@ def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:
     assert {"accelerate", "peft", "trl"} <= rlvr
     assert base.isdisjoint(rlvr)
     assert "wandb" not in base | rlvr
+    assert {"pandas", "scikit-learn", "scipy", "tqdm"}.isdisjoint(base)
 
     lock = ROOT / "uv.lock"
     constraints = (ROOT / "requirements" / "runpod.txt").read_text(encoding="utf-8")

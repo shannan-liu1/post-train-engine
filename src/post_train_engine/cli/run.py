@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 import yaml
 
-from post_train_engine.cli.gsm8k import probe_gsm8k_examples
+from post_train_engine.tasks.gsm8k_probe import probe_gsm8k_examples
 from post_train_engine.config import HuggingFaceLifecycleConfig, ModelLifecycleConfig
 from post_train_engine.data.overlap import (
     EvalSplitManifest,

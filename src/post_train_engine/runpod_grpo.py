@@ -311,6 +311,13 @@ class RunPodRuntimeCertificationConfig(BaseModel):
     overwrite: bool = False
     max_cost_usd: float | None = Field(default=None, ge=0.0)
 
+    @field_validator("source_config")
+    @classmethod
+    def _source_config_is_relative(cls, value: str) -> str:
+        if Path(value).is_absolute():
+            raise ValueError("source_config must be relative to the R4 config")
+        return value
+
 
 @dataclass(frozen=True)
 class EvalRow:
@@ -560,6 +567,10 @@ def run_runpod_runtime_certification(config_path: str | Path) -> dict[str, Any]:
     runtime_cfg = load_runpod_runtime_config(config_path)
     source_path = (Path(config_path).resolve().parent / runtime_cfg.source_config).resolve()
     requested_cfg = load_runpod_grpo_config(source_path)
+    if Path(runtime_cfg.output_dir).resolve() == Path(
+        requested_cfg.run.output_dir
+    ).resolve():
+        raise ValueError("R4 output_dir must be distinct from the GRPO output_dir")
     requested_cfg = requested_cfg.model_copy(
         update={
             "run": requested_cfg.run.model_copy(

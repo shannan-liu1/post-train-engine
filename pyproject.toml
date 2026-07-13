@@ -13,14 +13,10 @@ dependencies = [
     "datasets",
     "huggingface_hub",
     "numpy",
-    "pandas",
     "pydantic>=2,<3",
     "pyyaml",
     "safetensors",
-    "scikit-learn",
-    "scipy",
     "torch",
-    "tqdm",
     "transformers",
 ]
 
