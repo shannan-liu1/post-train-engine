@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 import tomllib
 from pathlib import Path
@@ -74,6 +75,18 @@ def test_package_exposes_only_the_canonical_console_script() -> None:
     assert project["project"]["scripts"] == {
         "pte": "post_train_engine.cli.main:main"
     }
+
+
+def test_run_engine_exposes_one_resolver_first_execution_interface() -> None:
+    from post_train_engine.engine import RunEngine
+
+    assert not hasattr(RunEngine, "resolve_and_execute")
+    assert list(inspect.signature(RunEngine.execute).parameters) == [
+        "self",
+        "resolver",
+        "coordinator",
+        "resolution_timeout_seconds",
+    ]
 
 
 def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:

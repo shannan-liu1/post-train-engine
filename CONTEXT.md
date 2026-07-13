@@ -17,7 +17,7 @@ This file defines the canonical language for the post-training research flywheel
 : A set of experiments that share every contract field except the declared ablation axes.
 
 **RunPlan**
-: The fully resolved, secret-redacted, immutable execution contract produced from an experiment specification.
+: The fully resolved, secret-redacted, immutable execution contract produced by the RunEngine `resolve` phase from an experiment specification.
 
 **Run**
 : One attempt to execute a RunPlan. A Run ends in `failed`, `rejected`, or `promoted`; interrupted work remains `running` until resumed or explicitly failed.
@@ -61,14 +61,15 @@ This file defines the canonical language for the post-training research flywheel
 ## Invariants
 
 1. `pte run --config <path>` is the only mutable execution entry point.
-2. Compatibility commands delegate to the same RunEngine implementation.
-3. Compute, task, and method adapters never decide promotion.
-4. Promotion examples never enter training, selection, prompts, teacher context, or replay.
-5. Checkpoint selection and promotion use disjoint examples.
-6. Every TrainingView preserves source Trace identifiers and SplitRoles.
-7. Every Trace records the policy version that generated it.
-8. Weighted objectives diagnose and rank. The strict PromotionDecision owns acceptance.
-9. Missing required evidence fails closed.
-10. Every paid Run records measured cost or an explicit non-certifying missing-cost state.
-11. Only an atomic promotion transaction may replace the Campaign Incumbent.
-12. Rejected, failed, and negative results remain durable campaign evidence.
+2. RunEngine owns consequential input resolution before it freezes the RunPlan.
+3. Compatibility commands delegate to the same RunEngine implementation.
+4. Compute, task, and method adapters never decide promotion.
+5. Promotion examples never enter training, selection, prompts, teacher context, or replay.
+6. Checkpoint selection and promotion use disjoint examples.
+7. Every TrainingView preserves source Trace identifiers and SplitRoles.
+8. Every Trace records the policy version that generated it.
+9. Weighted objectives diagnose and rank. The strict PromotionDecision owns acceptance.
+10. Missing required evidence fails closed.
+11. Every paid Run records measured cost or an explicit non-certifying missing-cost state.
+12. Only an atomic promotion transaction may replace the Campaign Incumbent.
+13. Rejected, failed, and negative results remain durable campaign evidence.

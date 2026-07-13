@@ -174,7 +174,8 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after the repository-wide review changes: 312 tests pass.
+- [x] Full tests and Ruff pass after engine-owned resolution: 315 tests pass.
+- [x] API and RunPod consequential resolution enter the typed RunEngine `resolve` phase before the immutable RunPlan and adapter stages.
 - [x] Two fresh-eyes passes found and fixed allocation, billing, identity, dependency, runtime-certification, preflight, and provider-handle defects; the final targeted and full gates pass.
 
 The adversarial review reopened production certification at the promotion-contract,

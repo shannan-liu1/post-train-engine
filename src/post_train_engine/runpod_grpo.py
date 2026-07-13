@@ -33,13 +33,13 @@ from pydantic import (
     model_validator,
 )
 
-from post_train_engine.artifacts import require_valid_run_bundle
 from post_train_engine.artifact_store import ArtifactStore
 from post_train_engine.config import HuggingFaceLifecycleConfig, ModelLifecycleConfig
 from post_train_engine.engine import (
     CampaignBinding,
     RunEngine,
     RunPlan,
+    RunResolution,
     RunStage,
     StageOutput,
     require_nonfailed_manifest,
@@ -399,84 +399,116 @@ def _resolve_hub_revisions(cfg: RunPodGRPOConfig) -> RunPodGRPOConfig:
 
 
 def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
-    cfg = load_runpod_grpo_config(config_path)
+    requested_cfg = load_runpod_grpo_config(config_path)
     dist = DistributedContext.from_env()
-    _validate_launch_topology(cfg, dist)
-    _validate_grpo_runtime_shape(cfg.training, world_size=dist.world_size)
-    if dist.is_main_process:
-        _validate_hf_upload_config(cfg)
     state = _distributed_state(dist)
-    run_dir = Path(cfg.run.output_dir)
-    store: ArtifactStore | None = None
-    resumable = False
-    if dist.is_main_process:
-        resumable = run_dir.is_dir() and (
-            (run_dir / "manifest.json").is_file() or (run_dir / "state").is_dir()
-        )
-        store = (
-            ArtifactStore(run_dir, resume=True)
-            if resumable
-            else ArtifactStore(run_dir, overwrite=cfg.run.overwrite)
-        )
-    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
-    if (run_dir / "manifest.json").is_file():
-        bundle = require_valid_run_bundle(run_dir)
-        require_nonfailed_manifest(bundle.manifest, run_dir)
-        return _read_json_object(run_dir / "final_report.json")
-
-    if store is not None and not resumable:
-        _event(
-            store,
-            "run_started",
-            {"config": str(config_path), "distributed": dist.to_json()},
-        )
-        store.copy_file(config_path, "config.raw.yaml")
-        store.write_json("config.resolved.json", cfg.model_dump(mode="json"))
-        store.write_text("command.txt", " ".join(sys.argv) + "\n")
-        store.write_json("environment.json", runtime_environment(dist))
-    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
-    _require_cuda(cfg)
-    if store is not None and not resumable:
-        cfg = _resolve_hub_revisions(cfg)
-        store.write_json("config.resolved.json", cfg.model_dump(mode="json"))
-    elif store is not None:
-        cfg = RunPodGRPOConfig.model_validate(
-            _read_json_object(run_dir / "config.resolved.json")
-        )
-    _wait_for_everyone(state, timeout_seconds=cfg.run.distributed_timeout_seconds)
-    if store is None:
-        cfg = RunPodGRPOConfig.model_validate(
-            _read_json_object(run_dir / "config.resolved.json")
-        )
-
-    train_examples, selection_examples, promotion_examples = _load_and_split_dataset(cfg)
-    roles = EvaluationRoles(
-        selection_example_ids=tuple(row.id for row in selection_examples),
-        promotion_example_ids=tuple(row.id for row in promotion_examples),
-    )
-    roles.require_training_eligible(row.id for row in train_examples)
-    plan = _compile_runpod_plan(
-        cfg,
-        dist=dist,
-        train_examples=train_examples,
-        selection_examples=selection_examples,
-        promotion_examples=promotion_examples,
-    )
-    adapter = _RunPodGRPOAdapter(
-        cfg=cfg,
-        config_path=Path(config_path),
-        dist=dist,
-        store=store,
-        train_examples=train_examples,
-        selection_examples=selection_examples,
-        promotion_examples=promotion_examples,
-    )
     coordinator = (
         _AccelerateRunCoordinator(dist, state)
         if dist.is_distributed
         else None
     )
-    execution = RunEngine().execute(plan, adapter, coordinator=coordinator)
+    resolution: RunResolution | None = None
+
+    def resolve() -> RunResolution:
+        nonlocal resolution
+        started = time.perf_counter()
+        cfg = requested_cfg
+        _validate_launch_topology(cfg, dist)
+        _validate_grpo_runtime_shape(cfg.training, world_size=dist.world_size)
+        if dist.is_main_process:
+            _validate_hf_upload_config(cfg)
+        run_dir = Path(cfg.run.output_dir)
+        store: ArtifactStore | None = None
+        resumable = False
+        if dist.is_main_process:
+            resumable = run_dir.is_dir() and (
+                (run_dir / "manifest.json").is_file()
+                or (run_dir / "state").is_dir()
+            )
+            store = (
+                ArtifactStore(run_dir, resume=True)
+                if resumable
+                else ArtifactStore(run_dir, overwrite=cfg.run.overwrite)
+            )
+            if not resumable:
+                store.copy_file(config_path, "config.raw.yaml")
+                store.write_json(
+                    "config.resolved.json",
+                    cfg.model_dump(mode="json"),
+                )
+                store.write_text("command.txt", " ".join(sys.argv) + "\n")
+                store.write_json("environment.json", runtime_environment(dist))
+        _require_cuda(cfg)
+        resolution_path = run_dir / "resolution" / "config.resolved.json"
+        if resolution_path.is_file():
+            cfg = RunPodGRPOConfig.model_validate(
+                _read_json_object(resolution_path)
+            )
+        else:
+            cfg = _resolve_hub_revisions(cfg)
+        if store is not None and not resolution_path.is_file():
+            store.write_json(
+                "resolution/config.resolved.json",
+                cfg.model_dump(mode="json"),
+            )
+
+        train_examples, selection_examples, promotion_examples = (
+            _load_and_split_dataset(cfg)
+        )
+        roles = EvaluationRoles(
+            selection_example_ids=tuple(row.id for row in selection_examples),
+            promotion_example_ids=tuple(row.id for row in promotion_examples),
+        )
+        roles.require_training_eligible(row.id for row in train_examples)
+        plan = _compile_runpod_plan(
+            cfg,
+            dist=dist,
+            train_examples=train_examples,
+            selection_examples=selection_examples,
+            promotion_examples=promotion_examples,
+        )
+        adapter = _RunPodGRPOAdapter(
+            cfg=cfg,
+            config_path=Path(config_path),
+            dist=dist,
+            store=store,
+            train_examples=train_examples,
+            selection_examples=selection_examples,
+            promotion_examples=promotion_examples,
+        )
+        output = (
+            _runpod_worker_output()
+            if store is None
+            else _runpod_output(
+                store,
+                artifacts={
+                    "resolved_run_config": "resolution/config.resolved.json"
+                },
+                values={
+                    "dataset_resolution": plan.inputs["dataset"].resolution_state,
+                    "model_resolution": plan.inputs["model"].resolution_state,
+                    "training_example_count": len(train_examples),
+                    "selection_example_count": len(selection_examples),
+                    "promotion_example_count": len(promotion_examples),
+                },
+                phase_cost=_runpod_phase_cost(
+                    cfg,
+                    "resolution",
+                    time.perf_counter() - started,
+                ),
+            )
+        )
+        resolution = RunResolution(plan=plan, adapter=adapter, output=output)
+        return resolution
+
+    execution = RunEngine().execute(
+        resolve,
+        coordinator=coordinator,
+        resolution_timeout_seconds=requested_cfg.run.distributed_timeout_seconds,
+    )
+    if resolution is None:
+        raise RuntimeError("RunEngine completed without retaining its resolution")
+    run_dir = Path(resolution.plan.output_dir)
     require_nonfailed_manifest(execution.manifest, run_dir)
     return _read_json_object(run_dir / "final_report.json")
 

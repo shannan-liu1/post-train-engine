@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from post_train_engine.engine import RunEngine, RunPlan
+from post_train_engine.engine import RunEngine, RunPlan, RunResolution, StageOutput
 from post_train_engine.evals.contract import EvalContract
 from post_train_engine.evidence_safety import (
     VerifierSeparation,
@@ -68,7 +68,17 @@ def test_second_executable_verifier_task_runs_through_engine(tmp_path: Path) -> 
         },
     )
 
-    execution = RunEngine().execute(plan, ExactMathRunAdapter())
+    adapter = ExactMathRunAdapter()
+    execution = RunEngine().execute(
+        lambda: RunResolution(
+            plan=plan,
+            adapter=adapter,
+            output=StageOutput(
+                values={"resolution_mode": "embedded_fixture"},
+                cost_usd=0.0,
+            ),
+        )
+    )
 
     assert execution.manifest.task_name == "exact_math_tool"
     assert execution.manifest.status == "rejected"

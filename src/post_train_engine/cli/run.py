@@ -38,6 +38,7 @@ from post_train_engine.evidence_safety import (
 from post_train_engine.engine import (
     RunEngine,
     RunPlan,
+    RunResolution,
     RunStage,
     StageOutput,
     require_nonfailed_manifest,
@@ -143,7 +144,16 @@ def run_local_gsm8k_smoke(
     """Write a deterministic GSM8K dry-run bundle without model inference."""
 
     plan, adapter = _compile_local_gsm8k_smoke(raw_config, config_path=config_path)
-    execution = RunEngine().execute(plan, adapter)
+    execution = RunEngine().execute(
+        lambda: RunResolution(
+            plan=plan,
+            adapter=adapter,
+            output=StageOutput(
+                values={"resolution_mode": "embedded_fixture"},
+                cost_usd=0.0,
+            ),
+        )
+    )
     require_nonfailed_manifest(execution.manifest, plan.output_dir)
     return execution.manifest
 

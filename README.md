@@ -16,7 +16,7 @@ have complete production evidence.
 
 1. `pte run --config <path>` is the only mutable experiment command.
 2. `pte hillclimb` is a compatibility alias that delegates to the same config dispatcher and `RunEngine`.
-3. Every Run traverses `prepare`, `data`, `evidence`, `train`, `select`, `evaluate`, `promote`, and `finalize`.
+3. Every Run traverses `resolve`, `prepare`, `data`, `evidence`, `train`, `select`, `evaluate`, `promote`, and `finalize`.
 4. `RunEngine` alone writes the final `RunManifest` and invokes strict promotion.
 5. Method adapters consume validated `TrainingView` evidence. They cannot decide promotion or mutate the Incumbent.
 6. Selection and promotion examples remain disjoint.
@@ -80,9 +80,9 @@ accelerate launch --num_processes 2 -m post_train_engine.cli run \
   --config configs/gsm8k_runpod_smoke.yaml
 ```
 
-The RunPod path currently combines pre-engine compilation with `RunEngine` stages
-for these operations. U-038 tracks moving every consequential preparation step
-behind the engine boundary.
+The RunPod path enters the engine-owned `resolve` phase before it freezes the
+immutable `RunPlan`. The phase owns CUDA attestation, immutable Hub revision
+resolution, dataset loading, scientific partitions, a typed receipt, and cost.
 
 1. Resolve immutable Hugging Face model and dataset revisions.
 2. Assign disjoint train, selection, and promotion roles.
@@ -148,7 +148,7 @@ The exact-math task proves a second executable-verifier task through the same en
 
 ```text
 src/post_train_engine/
-  engine.py                 canonical RunPlan and eight-stage RunEngine
+  engine.py                 canonical RunPlan and nine-stage RunEngine
   run_bundle.py             portable RunManifest and RunBundle validation
   campaign.py               SQLite proposals, leases, outcomes, and Incumbent
   api_hillclimb.py           API provider adapter

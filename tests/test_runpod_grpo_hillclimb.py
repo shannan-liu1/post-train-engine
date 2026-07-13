@@ -565,6 +565,25 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
 
     config = _write_config(tmp_path)
     cfg = load_runpod_grpo_config(config)
+    engine_entered = False
+    original_execute = runpod_module.RunEngine.execute
+    original_load = runpod_module._load_and_split_dataset
+
+    def execute_inside_engine(self, resolver, **kwargs):
+        nonlocal engine_entered
+        engine_entered = True
+        return original_execute(self, resolver, **kwargs)
+
+    def load_inside_engine(value):
+        assert engine_entered
+        return original_load(value)
+
+    monkeypatch.setattr(
+        runpod_module.RunEngine,
+        "execute",
+        execute_inside_engine,
+    )
+    monkeypatch.setattr(runpod_module, "_load_and_split_dataset", load_inside_engine)
 
     monkeypatch.setattr(runpod_module, "_require_cuda", lambda _cfg: None)
     monkeypatch.setattr(
@@ -628,6 +647,8 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
     monkeypatch.setattr(runpod_module, "_train_grpo", fake_train_grpo)
 
     main(["hillclimb", "--config", str(config)])
+
+    assert engine_entered
 
     run_dir = Path(cfg.run.output_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))

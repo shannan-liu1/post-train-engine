@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -35,6 +36,7 @@ from post_train_engine.run_bundle import (
 )
 
 RunStage = Literal[
+    "resolve",
     "prepare",
     "data",
     "evidence",
@@ -45,6 +47,7 @@ RunStage = Literal[
     "finalize",
 ]
 CANONICAL_STAGE_ORDER: tuple[RunStage, ...] = (
+    "resolve",
     "prepare",
     "data",
     "evidence",
@@ -53,6 +56,9 @@ CANONICAL_STAGE_ORDER: tuple[RunStage, ...] = (
     "evaluate",
     "promote",
     "finalize",
+)
+ADAPTER_STAGE_ORDER: tuple[RunStage, ...] = tuple(
+    stage for stage in CANONICAL_STAGE_ORDER if stage not in {"resolve", "promote"}
 )
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 
@@ -237,6 +243,15 @@ class RunExecution(BaseModel):
     stage_receipts: tuple[StageReceipt, ...]
 
 
+@dataclass(frozen=True)
+class RunResolution:
+    """Resolved immutable plan and adapter produced inside RunEngine."""
+
+    plan: RunPlan
+    adapter: RunStageAdapter
+    output: StageOutput
+
+
 class RunStageAdapter(Protocol):
     def execute_stage(
         self,
@@ -266,10 +281,54 @@ class RunEngine:
 
     def execute(
         self,
+        resolver: Callable[[], RunResolution],
+        *,
+        coordinator: RunCoordinator | None = None,
+        resolution_timeout_seconds: float = 120.0,
+    ) -> RunExecution:
+        """Resolve consequential inputs, freeze the RunPlan, and execute it."""
+
+        started = time.perf_counter()
+        resolution: RunResolution | None = None
+        local_error: Exception | None = None
+        try:
+            resolution = resolver()
+        except Exception as exc:
+            local_error = exc
+        distributed_errors = (
+            ()
+            if coordinator is None
+            else coordinator.collect_errors(
+                None
+                if local_error is None
+                else f"{type(local_error).__name__}: {local_error}",
+                resolution_timeout_seconds,
+            )
+        )
+        if local_error is not None:
+            raise local_error
+        if distributed_errors:
+            raise RuntimeError(
+                "distributed resolution failed: " + "; ".join(distributed_errors)
+            )
+        if resolution is None:
+            raise RuntimeError("resolver produced no RunResolution")
+        return self._execute(
+            resolution.plan,
+            resolution.adapter,
+            coordinator=coordinator,
+            resolution_output=resolution.output,
+            resolution_duration_seconds=time.perf_counter() - started,
+        )
+
+    def _execute(
+        self,
         plan: RunPlan,
         adapter: RunStageAdapter,
         *,
-        coordinator: RunCoordinator | None = None,
+        coordinator: RunCoordinator | None,
+        resolution_output: StageOutput,
+        resolution_duration_seconds: float,
     ) -> RunExecution:
         run_dir = Path(plan.output_dir).resolve()
         manifest_path = run_dir / "manifest.json"
@@ -378,7 +437,9 @@ class RunEngine:
             if execute_stage:
                 started = time.perf_counter()
                 try:
-                    if stage == "promote":
+                    if stage == "resolve":
+                        output = resolution_output if is_writer else None
+                    elif stage == "promote":
                         output = (
                             self._promote(run_dir, plan, prior)
                             if is_writer
@@ -420,7 +481,11 @@ class RunEngine:
                 receipt = StageReceipt(
                     stage=stage,
                     plan_hash=plan.plan_hash,
-                    duration_seconds=time.perf_counter() - started,
+                    duration_seconds=(
+                        resolution_duration_seconds
+                        if stage == "resolve"
+                        else time.perf_counter() - started
+                    ),
                     output=output,
                     artifact_sha256=_hash_stage_artifacts(run_dir, output),
                 )
@@ -1051,11 +1116,13 @@ def _cost_certification_metadata(
 
 
 __all__ = [
+    "ADAPTER_STAGE_ORDER",
     "CANONICAL_STAGE_ORDER",
     "RunEngine",
     "RunCoordinator",
     "RunExecution",
     "RunPlan",
+    "RunResolution",
     "RunStage",
     "RunStageAdapter",
     "require_nonfailed_manifest",

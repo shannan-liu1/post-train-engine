@@ -25,6 +25,7 @@ from post_train_engine.artifact_store import ArtifactStore
 from post_train_engine.engine import (
     RunEngine,
     RunPlan,
+    RunResolution,
     RunStage,
     StageOutput,
     require_nonfailed_manifest,
@@ -152,12 +153,34 @@ def run_hillclimb(
     *,
     env_path: str | Path | None = ".env",
 ) -> dict[str, Any]:
-    resolved = load_hillclimb_config(config_path, env_path=env_path)
-    plan, adapter = _compile_api_hillclimb(
-        resolved,
-        config_path=Path(config_path),
-    )
-    execution = RunEngine().execute(plan, adapter)
+    resolution: RunResolution | None = None
+
+    def resolve() -> RunResolution:
+        nonlocal resolution
+        resolved = load_hillclimb_config(config_path, env_path=env_path)
+        plan, adapter = _compile_api_hillclimb(
+            resolved,
+            config_path=Path(config_path),
+        )
+        resolution = RunResolution(
+            plan=plan,
+            adapter=adapter,
+            output=StageOutput(
+                values={
+                    "dataset_resolution": plan.inputs["dataset"].resolution_state,
+                    "model_resolution": plan.inputs["model"].resolution_state,
+                    "training_example_count": len(plan.training_example_ids),
+                    "promotion_example_count": len(plan.promotion_example_ids),
+                },
+                cost_usd=0.0,
+            ),
+        )
+        return resolution
+
+    execution = RunEngine().execute(resolve)
+    if resolution is None:
+        raise RuntimeError("RunEngine completed without retaining its resolution")
+    plan = resolution.plan
     require_nonfailed_manifest(execution.manifest, plan.output_dir)
     report = json.loads(
         (Path(plan.output_dir) / "final_report.json").read_text(encoding="utf-8")

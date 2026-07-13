@@ -146,6 +146,38 @@ def test_hillclimb_dryrun_writes_full_api_first_run_bundle(tmp_path: Path) -> No
     assert status["run_id"] == "gsm8k-dryrun"
 
 
+def test_api_dataset_resolution_runs_inside_run_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import post_train_engine.api_hillclimb as api_hillclimb
+
+    config = _write_dryrun_config(tmp_path)
+    engine_entered = False
+    original_execute = api_hillclimb.RunEngine.execute
+    original_load = api_hillclimb._load_and_split_dataset
+
+    def execute_inside_engine(self, resolver, **kwargs):
+        nonlocal engine_entered
+        engine_entered = True
+        return original_execute(self, resolver, **kwargs)
+
+    def load_inside_engine(cfg):
+        assert engine_entered
+        return original_load(cfg)
+
+    monkeypatch.setattr(
+        api_hillclimb.RunEngine,
+        "execute",
+        execute_inside_engine,
+    )
+    monkeypatch.setattr(api_hillclimb, "_load_and_split_dataset", load_inside_engine)
+
+    api_hillclimb.run_hillclimb(config, env_path=None)
+
+    assert engine_entered
+
+
 def test_hillclimb_rerun_preserves_finalized_run_even_when_legacy_overwrite_is_true(
     tmp_path: Path,
 ) -> None:

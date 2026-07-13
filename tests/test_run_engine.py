@@ -8,9 +8,14 @@ from threading import Barrier, BrokenBarrierError, Lock
 import pytest
 
 from post_train_engine.engine import (
+    ADAPTER_STAGE_ORDER,
     CANONICAL_STAGE_ORDER,
+    RunCoordinator,
     RunEngine,
+    RunExecution,
+    RunResolution,
     RunPlan,
+    RunStageAdapter,
     StageOutput,
 )
 from post_train_engine.runpod_control_plane import PodBillingReceipt
@@ -229,6 +234,26 @@ class ThreadCoordinator:
         return result
 
 
+def _execute(
+    plan: RunPlan,
+    adapter: RunStageAdapter,
+    *,
+    coordinator: RunCoordinator | None = None,
+) -> RunExecution:
+    return RunEngine().execute(
+        lambda: RunResolution(
+            plan=plan,
+            adapter=adapter,
+            output=StageOutput(
+                values={"resolution_mode": "test_fixture"},
+                cost_usd=0.0,
+            ),
+        ),
+        coordinator=coordinator,
+        resolution_timeout_seconds=plan.distributed_timeout_seconds,
+    )
+
+
 class WorkerStageAdapter:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -386,13 +411,11 @@ def test_run_engine_owns_stage_order_manifest_and_resume(tmp_path: Path) -> None
     )
     adapter = FakeStageAdapter()
 
-    first = RunEngine().execute(plan, adapter)
+    first = _execute(plan, adapter)
     second_adapter = FakeStageAdapter()
-    second = RunEngine().execute(plan, second_adapter)
+    second = _execute(plan, second_adapter)
 
-    assert adapter.calls == [
-        stage for stage in CANONICAL_STAGE_ORDER if stage != "promote"
-    ]
+    assert adapter.calls == list(ADAPTER_STAGE_ORDER)
     assert second_adapter.calls == []
     assert first.manifest == second.manifest
     assert first.manifest.status == "rejected"
@@ -407,19 +430,49 @@ def test_run_engine_owns_stage_order_manifest_and_resume(tmp_path: Path) -> None
     assert all(receipt.duration_seconds >= 0 for receipt in first.stage_receipts)
 
 
+def test_run_engine_owns_resolution_before_adapter_stages(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "resolved-run")
+    adapter = FakeStageAdapter()
+    resolver_calls = 0
+
+    def resolve() -> RunResolution:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return RunResolution(
+            plan=plan,
+            adapter=adapter,
+            output=StageOutput(
+                values={"dataset_resolution": "exact"},
+                cost_usd=0.0,
+            ),
+        )
+
+    execution = RunEngine().execute(resolve)
+
+    assert resolver_calls == 1
+    assert [receipt.stage for receipt in execution.stage_receipts] == list(
+        CANONICAL_STAGE_ORDER
+    )
+    assert execution.stage_receipts[0].output.values == {
+        "dataset_resolution": "exact"
+    }
+    assert adapter.calls == list(ADAPTER_STAGE_ORDER)
+    assert "stage_receipt_resolve" in execution.manifest.artifacts
+
+
 def test_run_engine_rejects_stage_artifacts_outside_run_root(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "contained-run")
     adapter = ExternalArtifactAdapter(tmp_path / "external.txt")
 
     with pytest.raises(ValueError, match="outside run directory"):
-        RunEngine().execute(plan, adapter)
+        _execute(plan, adapter)
 
     assert adapter.calls == []
 
 
 def test_run_engine_seals_promotion_rows_from_normal_surfaces(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "sealed-evaluation")
-    execution = RunEngine().execute(plan, FakeStageAdapter())
+    execution = _execute(plan, FakeStageAdapter())
     bundle = RunBundle.load(plan.output_dir)
 
     for name in ("baseline_eval", "candidate_eval"):
@@ -438,12 +491,12 @@ def test_run_engine_rejects_substituted_evaluation_rows(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "substituted-evaluation-rows")
 
     with pytest.raises(ValueError, match="rows do not match"):
-        RunEngine().execute(plan, SubstitutedEvaluationRowsAdapter())
+        _execute(plan, SubstitutedEvaluationRowsAdapter())
 
 
 def test_report_rejects_mutated_artifact_instead_of_consuming_it(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "mutated-report-artifact")
-    execution = RunEngine().execute(plan, FakeStageAdapter())
+    execution = _execute(plan, FakeStageAdapter())
     decision = Path(plan.output_dir) / execution.manifest.artifacts[
         "promotion_decision"
     ].path
@@ -499,7 +552,7 @@ def test_run_engine_fails_closed_when_budgeted_stage_cost_is_unknown(
     plan = _fixture_plan(tmp_path / "unknown-cost", max_cost_usd=1.0)
 
     with pytest.raises(ValueError, match="cannot certify cost budget"):
-        RunEngine().execute(plan, MissingCostStageAdapter())
+        _execute(plan, MissingCostStageAdapter())
 
 
 def test_certifying_run_requires_campaign_authority(tmp_path: Path) -> None:
@@ -537,7 +590,7 @@ def test_certifying_run_requires_exact_input_identities(tmp_path: Path) -> None:
 def test_non_certifying_smoke_can_never_promote(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "non-certifying-smoke")
 
-    execution = RunEngine().execute(plan, FakeStageAdapter())
+    execution = _execute(plan, FakeStageAdapter())
 
     assert execution.manifest.status == "rejected"
     assert execution.manifest.metadata["certification_mode"] == "non_certifying_smoke"
@@ -554,7 +607,7 @@ def test_run_engine_persists_terminal_stage_failure_bundle(tmp_path: Path) -> No
     plan = _fixture_plan(tmp_path / "failed-run")
 
     with pytest.raises(RuntimeError, match="terminal fixture failure"):
-        RunEngine().execute(plan, FailingStageAdapter())
+        _execute(plan, FailingStageAdapter())
 
     bundle = RunBundle.load(plan.output_dir)
     assert bundle.manifest.status == "failed"
@@ -564,27 +617,27 @@ def test_run_engine_persists_terminal_stage_failure_bundle(tmp_path: Path) -> No
     diagnostics = write_run_diagnostics(plan.output_dir)
     assert summary["promotion_decision"] == "failed"
     assert diagnostics["primary_category"] == "stage_failure"
-    resumed = RunEngine().execute(plan, FailingStageAdapter())
+    resumed = _execute(plan, FailingStageAdapter())
     assert resumed.manifest.status == "failed"
 
 
 def test_run_engine_rejects_mutated_receipt_artifact_on_resume(tmp_path: Path) -> None:
     plan = _fixture_plan(tmp_path / "mutated-receipt")
-    RunEngine().execute(plan, FakeStageAdapter())
+    _execute(plan, FakeStageAdapter())
     (Path(plan.output_dir) / "manifest.json").unlink()
 
     prepare_artifact = Path(plan.output_dir) / "artifacts" / "prepare.json"
     prepare_artifact.write_text('{"stage":"tampered"}', encoding="utf-8")
 
     with pytest.raises(ValueError, match="artifact hash mismatch"):
-        RunEngine().execute(plan, FailingStageAdapter())
+        _execute(plan, FailingStageAdapter())
 
 
 def test_run_engine_rejects_legacy_receipt_with_actionable_new_run_id(
     tmp_path: Path,
 ) -> None:
     plan = _fixture_plan(tmp_path / "legacy-receipt")
-    RunEngine().execute(plan, FakeStageAdapter())
+    _execute(plan, FakeStageAdapter())
     (Path(plan.output_dir) / "manifest.json").unlink()
     receipt_path = Path(plan.output_dir) / "state" / "prepare.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -592,7 +645,7 @@ def test_run_engine_rejects_legacy_receipt_with_actionable_new_run_id(
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(ValueError, match="incompatible.*new run_id"):
-        RunEngine().execute(plan, FailingStageAdapter())
+        _execute(plan, FailingStageAdapter())
 
 
 def test_run_engine_coordinates_distributed_stages_with_one_writer(
@@ -635,7 +688,7 @@ def test_run_engine_coordinates_distributed_stages_with_one_writer(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         main_future = pool.submit(
-            RunEngine().execute,
+            _execute,
             plan,
             main_adapter,
             coordinator=ThreadCoordinator(
@@ -647,7 +700,7 @@ def test_run_engine_coordinates_distributed_stages_with_one_writer(
             ),
         )
         worker_future = pool.submit(
-            RunEngine().execute,
+            _execute,
             plan,
             worker_adapter,
             coordinator=ThreadCoordinator(
@@ -661,7 +714,7 @@ def test_run_engine_coordinates_distributed_stages_with_one_writer(
         main_execution = main_future.result(timeout=20)
         worker_execution = worker_future.result(timeout=20)
 
-    expected_calls = [stage for stage in CANONICAL_STAGE_ORDER if stage != "promote"]
+    expected_calls = list(ADAPTER_STAGE_ORDER)
     assert main_adapter.calls == expected_calls
     assert worker_adapter.calls == expected_calls
     assert worker_execution.manifest == main_execution.manifest
@@ -692,13 +745,13 @@ def test_run_engine_propagates_distributed_stage_failure_without_deadlock(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         main_future = pool.submit(
-            RunEngine().execute,
+            _execute,
             plan,
             FailingStageAdapter(),
             coordinator=main_coordinator,
         )
         worker_future = pool.submit(
-            RunEngine().execute,
+            _execute,
             plan,
             WorkerStageAdapter(),
             coordinator=worker_coordinator,
@@ -726,7 +779,7 @@ def test_run_engine_bounds_wait_when_distributed_peer_disappears(tmp_path: Path)
     )
 
     with pytest.raises(BrokenBarrierError):
-        RunEngine().execute(plan, FakeStageAdapter(), coordinator=coordinator)
+        _execute(plan, FakeStageAdapter(), coordinator=coordinator)
 
 
 def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
@@ -812,8 +865,8 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
         },
     )
 
-    first = RunEngine().execute(plan, PromotingStageAdapter())
-    second = RunEngine().execute(plan, PromotingStageAdapter())
+    first = _execute(plan, PromotingStageAdapter())
+    second = _execute(plan, PromotingStageAdapter())
 
     assert first.manifest.status == "promoted"
     assert second.manifest == first.manifest
@@ -856,7 +909,7 @@ def test_run_engine_atomically_finalizes_campaign_and_reconciles_rerun(
             primary_delta=0.2,
         ),
     )
-    third = RunEngine().execute(plan, PromotingStageAdapter())
+    third = _execute(plan, PromotingStageAdapter())
     assert third.manifest == first.manifest
 
 
@@ -906,7 +959,7 @@ def test_campaign_prepare_failure_does_not_consume_suite_exposure(
     plan = RunPlan.model_validate(raw)
 
     with pytest.raises(RuntimeError, match="prepare fixture failure"):
-        RunEngine().execute(plan, PrepareFailingAdapter())
+        _execute(plan, PrepareFailingAdapter())
 
     assert campaign.get_outcome(proposal_id).status == "failed"
     assert campaign.suite_exposure("campaign-1", "suite-1", "v1") == 0
@@ -960,7 +1013,7 @@ def test_run_engine_stages_provider_billing_before_campaign_promotion(
     }
     plan = RunPlan.model_validate(raw)
 
-    execution = RunEngine().execute(plan, PromotingStageAdapter())
+    execution = _execute(plan, PromotingStageAdapter())
 
     assert execution.manifest.status == "pending_settlement"
     assert campaign.current_incumbent("campaign-1")["candidate_id"] == "seed"
