@@ -121,9 +121,15 @@ The command reads `RUNPOD_API_KEY` from the process environment or the local
 `.env`, reads the literal Pod ID and absolute deletion deadline from the create
 journal, and starts a detached local worker. It never places the API key in the
 child command or an artifact, and it excludes unrelated environment secrets from
-the child. Require `state: armed`, verify the recorded PID is alive, and keep the
-trusted workstation awake until provider deletion is verified. Do not hand-write
-another task-local watchdog.
+the child. If the absolute deadline is already too close, the launcher deletes
+and verifies the Pod synchronously instead of racing an `armed` receipt against
+terminal evidence. At the deadline, the worker retries deletion and provider
+absence verification three times. Exhaustion leaves the operation journal in
+`delete_unverified`, never a false terminal state. Require `state: armed`, verify
+the recorded PID is alive, and keep the trusted workstation awake until provider
+deletion is verified. If the operation journal becomes unreadable during failure
+handling, the independent watchdog receipt still records the failure and journal
+error type. Do not hand-write another task-local watchdog.
 
 ## Source delivery contract
 
@@ -183,7 +189,7 @@ fenced campaign proposal and binding provider billing settlement.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
-8. Run the benchmark with `accelerate launch --num_processes 2`.
+8. Do not run the paid benchmark while U-071 remains open. First move runtime certification into typed RunEngine stages; then launch that canonical Run with `accelerate launch --num_processes 2`.
 9. Require exit code zero, exact output parity, paired ABBA trials, conservative `speedup >= 1.05`, and `certifying: true` under benchmark schema v3. The current candidate isolates model reuse with scalar tensor shapes. Do not re-enable batching until a separate exact-contract experiment proves output equivalence.
 10. Download the JSON artifact and logs before teardown.
 
@@ -230,6 +236,7 @@ observation. A first nonempty billing response is never final evidence.
 | Deleted Pod left the operation journal in `created` state | Teardown evidence was split across an ad hoc sidecar while the canonical control-plane record remained stale | Update the operation journal atomically after a successful provider delete and retain the Pod ID and deletion time. |
 | Failed R4 artifact collapsed all trial drift into one boolean | The artifact could not distinguish baseline instability from optimized-path drift | Record warmup-relative parity separately for both baseline and both optimized ABBA trials without exposing completions. |
 | Local watchdog started from an ignored task script | The safety-critical process had no canonical launcher, absolute deadline, or secret-minimized child environment | Use `pte runpod watchdog`, require its armed receipt, and keep the trusted host awake until teardown is verified. |
+| Watchdog used one absence check, could overwrite terminal evidence when launched after its deadline, and lost its failure receipt if the journal update failed | Eventual consistency, late launch, or journal corruption could leave a billable Pod with misleading or missing local evidence | Delete expired targets synchronously, retry provider deletion and absence verification three times, retain `delete_unverified` on exhaustion, and write the independent watchdog receipt even when journal repair fails. |
 
 ## Primary references
 

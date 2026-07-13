@@ -102,7 +102,10 @@ Multi-rank workers execute the same non-promotion stages. Rank zero alone writes
 
 ## Runtime benchmark
 
-R4 requires measured GPU evidence. Run this on the same topology as the smoke config:
+R4 requires measured GPU evidence. The current script is a fail-closed,
+non-promoting verification utility, not a canonical Run. U-071 blocks another paid
+certification attempt until this measurement enters typed RunEngine stages. The
+historical development invocation below does not grant standing authorization:
 
 ```bash
 accelerate launch --num_processes 2 scripts/benchmark_runpod_eval.py \
@@ -110,7 +113,7 @@ accelerate launch --num_processes 2 scripts/benchmark_runpod_eval.py \
   --out runs/runtime-benchmarks/gsm8k-runpod-smoke.json
 ```
 
-The benchmark fails unless batched one-load-per-shard evaluation exactly matches one-load-per-example outputs and improves max-rank wall time. Its JSON artifact records resolved revisions, topology, environment, timings, load counts, output hash, and certifying status.
+The benchmark fails unless one-load-per-shard model reuse with scalar tensor shapes exactly matches one-load-per-example outputs and improves max-rank wall time. Its JSON artifact records resolved revisions, topology, environment, timings, load counts, output hash, and certifying status. Batching remains disabled until a separate exact-contract GPU experiment proves equivalence.
 
 ## Run bundle
 

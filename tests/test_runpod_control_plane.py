@@ -360,6 +360,7 @@ def test_local_watchdog_launches_detached_without_serializing_api_key(
         log_path=tmp_path / "watchdog.log",
         api_key="super-secret",
         spawn=spawn,
+        clock=lambda: 1001.0,
     )
 
     command, kwargs = calls[0]
@@ -372,6 +373,42 @@ def test_local_watchdog_launches_detached_without_serializing_api_key(
     assert "UNRELATED_SECRET" not in kwargs["env"]
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["close_fds"] is True
+
+
+def test_expired_watchdog_target_deletes_synchronously_without_spawning(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([{}, []])
+
+    result = launch_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=tmp_path / "watchdog.json",
+        log_path=tmp_path / "watchdog.log",
+        api_key="super-secret",
+        spawn=lambda *_args, **_kwargs: pytest.fail("expired target must not spawn"),
+        clock=lambda: 1120.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "deleted"
+    assert transport.calls == [
+        ("DELETE", "/pods/pod-1", None),
+        ("GET", "/pods", None),
+    ]
 
 
 def test_local_watchdog_deletes_literal_journal_pod_and_records_result(
@@ -447,3 +484,138 @@ def test_local_watchdog_reconciles_a_lost_delete_response_by_provider_absence(
     operation = json.loads(journal.read_text("utf-8"))
     assert operation["state"] == "deleted"
     assert operation["deletion_outcome"] == "provider_absent"
+
+
+def test_local_watchdog_retries_until_provider_confirms_absence(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([{}, [{"id": "pod-1"}], {}, []])
+    sleeps: list[float] = []
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=receipt_path,
+        api_key="super-secret",
+        sleep=sleeps.append,
+        clock=lambda: 1120.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "deleted"
+    assert sleeps == [0.0, 2.0]
+    assert [call[:2] for call in transport.calls] == [
+        ("DELETE", "/pods/pod-1"),
+        ("GET", "/pods"),
+        ("DELETE", "/pods/pod-1"),
+        ("GET", "/pods"),
+    ]
+
+
+def test_local_watchdog_records_unverified_state_after_retry_exhaustion(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport(
+        [
+            {},
+            [{"id": "pod-1"}],
+            {},
+            [{"id": "pod-1"}],
+            {},
+            [{"id": "pod-1"}],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="still reports the Pod active"):
+        run_local_deletion_watchdog(
+            journal_path=journal,
+            receipt_path=receipt_path,
+            api_key="super-secret",
+            sleep=lambda _seconds: None,
+            clock=lambda: 1120.0,
+            transport_factory=lambda _key: transport,
+        )
+
+    operation = json.loads(journal.read_text("utf-8"))
+    assert operation["state"] == "delete_unverified"
+
+
+def test_local_watchdog_persists_failure_when_journal_update_is_corrupt(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "created",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 120,
+                    "recorded_at_unix": 1000.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class CorruptingTransport(FakeTransport):
+        def request(self, method, path, body=None):
+            result = super().request(method, path, body)
+            if len(self.calls) == 6:
+                journal.write_text("{", encoding="utf-8")
+            return result
+
+    transport = CorruptingTransport(
+        [
+            {},
+            [{"id": "pod-1"}],
+            {},
+            [{"id": "pod-1"}],
+            {},
+            [{"id": "pod-1"}],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="still reports the Pod active"):
+        run_local_deletion_watchdog(
+            journal_path=journal,
+            receipt_path=receipt_path,
+            api_key="super-secret",
+            sleep=lambda _seconds: None,
+            clock=lambda: 1120.0,
+            transport_factory=lambda _key: transport,
+        )
+
+    receipt = json.loads(receipt_path.read_text("utf-8"))
+    assert receipt["state"] == "failed"
+    assert receipt["journal_error_type"] == "JSONDecodeError"

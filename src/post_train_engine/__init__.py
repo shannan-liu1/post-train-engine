@@ -15,7 +15,6 @@ from post_train_engine.evals.promotion import (
     PromotionGateConfig,
     SliceGateConfig,
     canary_decision_from_artifact,
-    decide_promotion,
     eval_report_to_artifact,
 )
 from post_train_engine.evals.suites import (
@@ -90,7 +89,6 @@ __all__ = [
     "ModelLifecycleConfig",
     "canary_decision_from_artifact",
     "compute_gsm8k_reward",
-    "decide_promotion",
     "eval_report_to_artifact",
     "evaluate_model",
     "write_eval_report",

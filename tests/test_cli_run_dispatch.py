@@ -21,6 +21,43 @@ def test_run_cli_reports_supported_runner_kinds(tmp_path: Path) -> None:
         main(["run", "--config", str(config)])
 
 
+def test_run_cli_rejects_unknown_explicit_kind_before_shape_fallback(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        Path("configs/gsm8k_tiny_dryrun.yaml").read_text(encoding="utf-8")
+    )
+    raw["kind"] = "typo_api_runner"
+    config = tmp_path / "ambiguous.yaml"
+    config.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported run config kind 'typo_api_runner'"):
+        main(["run", "--config", str(config)])
+
+
+@pytest.mark.parametrize("schema_version", ["runpod_grpo_hillclimb_v1", ""])
+def test_run_cli_rejects_conflicting_config_discriminators(
+    tmp_path: Path,
+    schema_version: str,
+) -> None:
+    config = tmp_path / "conflicting.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "kind": "gsm8k_local_smoke",
+                "schema_version": schema_version,
+                "run_id": "conflicting",
+                "out_dir": str(tmp_path / "run"),
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conflicting run config discriminators"):
+        main(["run", "--config", str(config)])
+
+
 def test_run_cli_accepts_api_hillclimb_config_through_canonical_dispatch(
     tmp_path: Path,
 ) -> None:

@@ -97,18 +97,38 @@ def execute_run_config(
 ) -> RunManifest | dict[str, Any]:
     raw = _load_config(config_path)
     kind = str(raw.get("kind") or "")
-    runner = RUNNERS.get(kind)
-    if runner is not None:
+    schema_version = str(raw.get("schema_version") or "")
+    api_shape = {"run", "dataset", "baseline", "providers"}.issubset(raw)
+    if "kind" in raw:
+        runner = RUNNERS.get(kind)
+        if runner is None:
+            raise _unsupported_run_config(kind)
+        if "schema_version" in raw or api_shape:
+            raise ValueError(
+                "conflicting run config discriminators: explicit kind cannot be "
+                "combined with a schema_version or legacy API shape"
+            )
         return runner(raw, Path(config_path))
-    if raw.get("schema_version") == "runpod_grpo_hillclimb_v1":
+    if "schema_version" in raw:
+        if schema_version != "runpod_grpo_hillclimb_v1":
+            raise ValueError(f"unsupported run config schema_version {schema_version!r}")
+        if api_shape:
+            raise ValueError(
+                "conflicting run config discriminators: RunPod schema cannot be "
+                "combined with the legacy API shape"
+            )
         from post_train_engine.runpod_grpo import run_runpod_grpo_hillclimb
 
         return run_runpod_grpo_hillclimb(config_path)
-    if {"run", "dataset", "baseline", "providers"}.issubset(raw):
+    if api_shape:
         from post_train_engine.api_hillclimb import run_hillclimb
 
         return run_hillclimb(config_path, env_path=env_path)
-    raise ValueError(
+    raise _unsupported_run_config(kind)
+
+
+def _unsupported_run_config(kind: str) -> ValueError:
+    return ValueError(
         f"unsupported run config kind {kind!r}; "
         f"supported run kinds: {', '.join(sorted(RUNNERS))}, "
         "api_hillclimb, runpod_grpo_hillclimb",

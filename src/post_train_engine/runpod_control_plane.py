@@ -303,6 +303,31 @@ class RunPodControlPlane:
         self._record_deleted(pod_id, outcome="provider_absent")
         return True
 
+    def record_delete_unverified(self, pod_id: str) -> None:
+        """Keep the journal non-terminal when provider absence is unproven."""
+
+        if not pod_id:
+            raise ValueError("pod_id must be non-empty")
+        journal = self._read_journal()
+        receipt = None if journal is None else journal.get("receipt")
+        if isinstance(receipt, dict) and str(receipt.get("pod_id")) != pod_id:
+            return
+        if journal is not None:
+            retained = {
+                key: value
+                for key, value in journal.items()
+                if key not in {"deleted_at_unix", "deleted_pod_id"}
+            }
+            self._write_journal(
+                {
+                    **retained,
+                    "state": "delete_unverified",
+                    "delete_unverified_pod_id": pod_id,
+                    "delete_unverified_at_unix": time.time(),
+                    "deletion_outcome": "provider_absence_unverified",
+                }
+            )
+
     def _record_deleted(self, pod_id: str, *, outcome: str) -> None:
         journal = self._read_journal()
         receipt = None if journal is None else journal.get("receipt")

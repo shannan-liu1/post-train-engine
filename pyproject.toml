@@ -26,7 +26,6 @@ dependencies = [
 
 [project.scripts]
 pte = "post_train_engine.cli.main:main"
-post-train-eval-hf = "post_train_engine.evals.hf_cli:main"
 
 [project.optional-dependencies]
 dev = [

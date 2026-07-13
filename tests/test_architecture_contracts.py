@@ -13,9 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_only_canonical_promotion_module_exposes_decision_authority() -> None:
+    import post_train_engine
     from post_train_engine import api_hillclimb
     from post_train_engine.evals import harness
 
+    assert not hasattr(post_train_engine, "decide_promotion")
     assert not hasattr(api_hillclimb, "decide_api_promotion")
     assert not hasattr(harness, "PromotionPolicy")
     assert not hasattr(harness, "PromotionReport")
@@ -46,6 +48,32 @@ def test_retired_standalone_promotion_command_is_not_registered(
 
     assert excinfo.value.code == 2
     assert "invalid choice: 'promote'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["probe", "eval"])
+def test_model_execution_is_not_registered_under_task_utility_cli(
+    command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["gsm8k", command])
+
+    assert excinfo.value.code == 2
+    assert f"invalid choice: '{command}'" in capsys.readouterr().err
+
+
+def test_task_utility_module_has_no_independent_main() -> None:
+    from post_train_engine.cli import gsm8k
+
+    assert not hasattr(gsm8k, "main")
+
+
+def test_package_exposes_only_the_canonical_console_script() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert project["project"]["scripts"] == {
+        "pte": "post_train_engine.cli.main:main"
+    }
 
 
 def test_runpod_dependencies_are_frozen_without_replacing_image_torch() -> None:

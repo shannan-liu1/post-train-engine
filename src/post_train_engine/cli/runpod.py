@@ -75,7 +75,13 @@ def cmd_runpod_watchdog(args: argparse.Namespace) -> None:
         log_path=args.log,
         api_key=resolver.require(RUNPOD_API_KEY_ENV, secret=True),
     )
-    print(
-        f"armed local RunPod deletion watchdog pid={receipt['pid']} "
-        f"pod_id={receipt['pod_id']} deadline={receipt['hard_deadline_seconds']}s"
-    )
+    if receipt["state"] == "armed":
+        print(
+            f"armed local RunPod deletion watchdog pid={receipt['pid']} "
+            f"pod_id={receipt['pod_id']} deadline={receipt['hard_deadline_seconds']}s"
+        )
+    else:
+        print(
+            f"RunPod watchdog resolved expired target pod_id={receipt['pod_id']} "
+            f"state={receipt['state']}"
+        )

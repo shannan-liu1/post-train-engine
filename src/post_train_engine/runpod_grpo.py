@@ -2456,7 +2456,7 @@ def run_runpod_eval_benchmark(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     if not evidence.output_parity:
-        raise RuntimeError("batched evaluation output drifted from scalar evaluation")
+        raise RuntimeError("model-reuse evaluation output drifted from baseline")
     if not evidence.certifying:
         raise RuntimeError(
             "conservative paired runtime speedup did not meet the certification margin; "

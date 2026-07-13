@@ -8,7 +8,6 @@ import json
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +16,7 @@ from post_train_engine.data_builders.gsm8k_curriculum import (
     write_gsm8k_curriculum,
 )
 from post_train_engine.difficulty import bucket_probe_artifact
-from post_train_engine.evals.promotion import EvalArtifact, EvalExampleResult
-from post_train_engine.generation import (
-    DEFAULT_ROLLOUT_BACKEND,
-    GenerationFn,
-    build_generation_fn,
-)
+from post_train_engine.generation import GenerationFn
 from post_train_engine.ledger import make_run_ledger_entry, write_ledger_entry
 from post_train_engine.probe import (
     EarlyExitConfig,
@@ -31,7 +25,6 @@ from post_train_engine.probe import (
     full_filter_reason,
     read_probe_jsonl,
     should_continue_after_early,
-    write_probe_jsonl,
 )
 from post_train_engine.rewards.gsm8k import GSM8KRewardConfig, compute_gsm8k_reward
 from post_train_engine.tasks.gsm8k import (
@@ -64,58 +57,12 @@ def _register_gsm8k_commands(
     make_splits.add_argument("--out", required=True)
     make_splits.set_defaults(func=cmd_make_splits)
 
-    probe = gsm8k_sub.add_parser("probe")
-    probe.add_argument("--model", required=True)
-    probe.add_argument("--checkpoint-id", default="base")
-    probe.add_argument("--split-file", required=True)
-    probe.add_argument("--split", required=True)
-    probe.add_argument("--sample-size", type=int)
-    probe.add_argument("--rollouts", type=int, default=16)
-    probe.add_argument("--early-rollouts", type=int, default=4)
-    probe.add_argument("--temperature", type=float, default=1.0)
-    probe.add_argument("--top-p", type=float, default=0.97)
-    probe.add_argument("--max-new-tokens", type=int, default=512)
-    probe.add_argument("--prompt-style", default="thinking_tags")
-    probe.add_argument(
-        "--generation-backend",
-        choices=["vllm", "hf"],
-        default=DEFAULT_ROLLOUT_BACKEND,
-    )
-    probe.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    probe.add_argument("--vllm-dtype", default="auto")
-    probe.add_argument("--trust-remote-code", action="store_true")
-    probe.add_argument("--seed", type=int, default=1000)
-    probe.add_argument("--out", required=True)
-    probe.set_defaults(func=cmd_probe)
-
     curriculum = gsm8k_sub.add_parser("build-curriculum")
     curriculum.add_argument("--probe", required=True)
     curriculum.add_argument("--splits", required=True)
     curriculum.add_argument("--out-dir", required=True)
     curriculum.add_argument("--prompt-style", default="thinking_tags")
     curriculum.set_defaults(func=cmd_build_curriculum)
-
-    eval_parser = gsm8k_sub.add_parser("eval")
-    eval_parser.add_argument("--model", required=True)
-    eval_parser.add_argument("--split-file", required=True)
-    eval_parser.add_argument("--split", required=True)
-    eval_parser.add_argument("--greedy", action="store_true")
-    eval_parser.add_argument("--sampled-rollouts", type=int, default=0)
-    eval_parser.add_argument("--temperature", type=float, default=1.0)
-    eval_parser.add_argument("--top-p", type=float, default=0.97)
-    eval_parser.add_argument("--max-new-tokens", type=int, default=512)
-    eval_parser.add_argument("--prompt-style", default="thinking_tags")
-    eval_parser.add_argument(
-        "--generation-backend",
-        choices=["vllm", "hf"],
-        default=DEFAULT_ROLLOUT_BACKEND,
-    )
-    eval_parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1)
-    eval_parser.add_argument("--vllm-dtype", default="auto")
-    eval_parser.add_argument("--trust-remote-code", action="store_true")
-    eval_parser.add_argument("--seed", type=int, default=1000)
-    eval_parser.add_argument("--out", required=True)
-    eval_parser.set_defaults(func=cmd_eval)
 
 
 def cmd_make_splits(args: argparse.Namespace) -> None:
@@ -143,44 +90,6 @@ def cmd_make_splits(args: argparse.Namespace) -> None:
         dataset_revision=dataset_revision,
         split_hash=splits.split_hash,
         artifact_paths={"splits": str(out)},
-        seeds=[args.seed],
-    )
-
-
-def cmd_probe(args: argparse.Namespace) -> None:
-    _validate_probe_args(args)
-    split_artifact = _load_split_file(args.split_file)
-    examples = _load_examples_for_split(split_artifact, args.split)
-    if args.sample_size is not None:
-        examples = examples[: args.sample_size]
-    generation_config = _generation_config_from_args(args, greedy=False)
-    generate = _build_generation_fn_from_args(args, default_greedy=False)
-    rows = probe_gsm8k_examples(
-        examples,
-        generate,
-        run_id=f"probe_{int(time.time())}",
-        bucket_source_split=args.split,
-        model_id=args.model,
-        checkpoint_id=args.checkpoint_id,
-        prompt_style=args.prompt_style,
-        generation_config=generation_config,
-        early_exit=EarlyExitConfig(g_total=args.rollouts, g_early=args.early_rollouts),
-        seed=args.seed,
-    )
-    out = Path(args.out)
-    write_probe_jsonl(rows, out)
-    _write_default_ledger(
-        out,
-        run_id=rows[0].run_id if rows else "probe_empty",
-        command=sys.argv,
-        base_model=args.model,
-        checkpoint=args.checkpoint_id,
-        dataset=split_artifact.get("dataset"),
-        dataset_revision=split_artifact.get("dataset_revision"),
-        split_hash=split_artifact.get("split_hash"),
-        prompt_template=args.prompt_style,
-        reward_config=asdict(GSM8KRewardConfig(max_new_tokens=args.max_new_tokens)),
-        artifact_paths={"probe": str(out)},
         seeds=[args.seed],
     )
 
@@ -215,73 +124,6 @@ def cmd_build_curriculum(args: argparse.Namespace) -> None:
         split_hash=split_artifact.get("split_hash"),
         prompt_template=args.prompt_style,
         artifact_paths={"curriculum": str(args.out_dir)},
-    )
-
-
-def cmd_eval(args: argparse.Namespace) -> None:
-    if not args.greedy:
-        raise ValueError("gsm8k eval requires --greedy for greedy_exact_accuracy@1")
-    _validate_eval_args(args)
-    split_artifact = _load_split_file(args.split_file)
-    examples = _load_examples_for_split(split_artifact, args.split)
-    raw_generate = _build_generation_fn_from_args(args, default_greedy=args.greedy)
-
-    def greedy_generate(
-        example: GSM8KExample,
-        rollout_id: int,
-        prompt: str,
-        config: Mapping[str, Any],
-    ) -> str | Mapping[str, Any]:
-        return raw_generate(
-            example,
-            rollout_id,
-            prompt,
-            {**dict(config), "greedy": True},
-        )
-
-    sampled_generate: GenerationFn | None = None
-    if args.sampled_rollouts > 0:
-
-        def sampled_generate(
-            example: GSM8KExample,
-            rollout_id: int,
-            prompt: str,
-            config: Mapping[str, Any],
-        ) -> str | Mapping[str, Any]:
-            return raw_generate(
-                example,
-                rollout_id,
-                prompt,
-                {**dict(config), "greedy": False},
-            )
-
-    artifact = evaluate_gsm8k_examples(
-        examples,
-        greedy_generate,
-        artifact_id=Path(args.out).stem,
-        model_id=args.model,
-        prompt_style=args.prompt_style,
-        generation_config=_generation_config_from_args(
-            args,
-            greedy=bool(args.greedy),
-            sampled_rollouts=args.sampled_rollouts,
-        ),
-        sampled_generate=sampled_generate,
-    )
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(artifact.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-    _write_default_ledger(
-        out,
-        run_id=artifact.artifact_id,
-        command=sys.argv,
-        base_model=args.model,
-        dataset=split_artifact.get("dataset"),
-        dataset_revision=split_artifact.get("dataset_revision"),
-        split_hash=split_artifact.get("split_hash"),
-        prompt_template=args.prompt_style,
-        artifact_paths={"eval": str(out)},
-        seeds=[args.seed],
     )
 
 
@@ -380,90 +222,6 @@ def probe_gsm8k_examples(
     return tuple(rows)
 
 
-def evaluate_gsm8k_examples(
-    examples: Sequence[GSM8KExample],
-    generate: GenerationFn,
-    *,
-    artifact_id: str,
-    model_id: str,
-    prompt_style: str,
-    generation_config: Mapping[str, Any],
-    sampled_generate: GenerationFn | None = None,
-) -> EvalArtifact:
-    results: list[EvalExampleResult] = []
-    sampled_by_example: list[list[bool]] = []
-    sampled_rollouts = int(generation_config.get("sampled_rollouts", 0) or 0)
-    if sampled_rollouts < 0:
-        raise ValueError("sampled_rollouts must be non-negative")
-    for example in examples:
-        prompt = format_prompt(example.question, prompt_style)
-        generated = generate(example, 0, prompt, generation_config)
-        fields = _rollout_to_probe_fields(
-            example,
-            generated,
-            rollout_id=0,
-            parse_mode="strict",
-        )
-        results.append(
-            EvalExampleResult(
-                example_id=example.id,
-                correct=bool(fields["correct"]),
-                parse_ok=bool(fields["parse_ok"]),
-                tokens=int(fields["completion_tokens"]),
-            )
-        )
-        sampled_correct: list[bool] = []
-        if sampled_rollouts:
-            sampler = sampled_generate or generate
-            for rollout_id in range(sampled_rollouts):
-                sampled_fields = _rollout_to_probe_fields(
-                    example,
-                    sampler(example, rollout_id + 1, prompt, generation_config),
-                    rollout_id=rollout_id + 1,
-                    parse_mode="strict",
-                )
-                sampled_correct.append(bool(sampled_fields["correct"]))
-        sampled_by_example.append(sampled_correct)
-    accuracy = sum(row.correct for row in results) / len(results) if results else 0.0
-    parse_rate = sum(row.parse_ok for row in results) / len(results) if results else 0.0
-    mean_tokens = (
-        sum(float(row.tokens or 0) for row in results) / len(results) if results else 0.0
-    )
-    metrics = {
-        "greedy_exact_accuracy@1": accuracy,
-        "parse_success@1": parse_rate,
-        "mean_tokens": mean_tokens,
-    }
-    if sampled_rollouts:
-        sampled_values = [
-            correct for per_example in sampled_by_example for correct in per_example
-        ]
-        metrics["sampled_exact_accuracy@1"] = (
-            sum(sampled_values) / len(sampled_values) if sampled_values else 0.0
-        )
-        metrics[f"sampled_pass@{sampled_rollouts}"] = (
-            sum(any(per_example) for per_example in sampled_by_example)
-            / len(sampled_by_example)
-            if sampled_by_example
-            else 0.0
-        )
-    return EvalArtifact(
-        artifact_id=artifact_id,
-        primary_metric="greedy_exact_accuracy@1",
-        examples=tuple(results),
-        metrics=metrics,
-        metadata={"model_id": model_id, "generation_config": dict(generation_config)},
-    )
-
-
-def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="pte gsm8k")
-    subparsers = parser.add_subparsers(dest="gsm8k_command", required=True)
-    _register_gsm8k_commands(subparsers)
-    args = parser.parse_args(argv)
-    args.func(args)
-
-
 def _rollout_to_probe_fields(
     example: GSM8KExample,
     generated: str | Mapping[str, Any],
@@ -503,86 +261,11 @@ def _rollout_to_probe_fields(
     }
 
 
-def _generation_config_from_args(
-    args: argparse.Namespace,
-    *,
-    greedy: bool,
-    sampled_rollouts: int | None = None,
-) -> dict[str, Any]:
-    config = {
-        "backend": args.generation_backend,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_new_tokens": args.max_new_tokens,
-        "greedy": greedy,
-        "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
-        "vllm_dtype": args.vllm_dtype,
-        "trust_remote_code": args.trust_remote_code,
-        "seed": args.seed,
-    }
-    if sampled_rollouts is not None:
-        config["sampled_rollouts"] = sampled_rollouts
-    return config
-
-
-def _validate_probe_args(args: argparse.Namespace) -> None:
-    _require_positive_int(args.rollouts, "rollouts")
-    _require_positive_int(args.early_rollouts, "early-rollouts")
-    if args.early_rollouts > args.rollouts:
-        raise ValueError("early-rollouts cannot exceed rollouts")
-    _require_generation_args(args)
-    if args.sample_size is not None:
-        _require_positive_int(args.sample_size, "sample-size")
-
-
-def _validate_eval_args(args: argparse.Namespace) -> None:
-    _require_generation_args(args)
-    if args.sampled_rollouts < 0:
-        raise ValueError("sampled-rollouts must be non-negative")
-
-
-def _require_generation_args(args: argparse.Namespace) -> None:
-    _require_positive_int(args.max_new_tokens, "max-new-tokens")
-    _require_positive_int(args.vllm_tensor_parallel_size, "vllm-tensor-parallel-size")
-    if args.temperature < 0.0:
-        raise ValueError("temperature must be non-negative")
-    if not 0.0 < args.top_p <= 1.0:
-        raise ValueError("top-p must be > 0 and <= 1")
-
-
-def _require_positive_int(value: int, name: str) -> None:
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
-
-
-def _build_generation_fn_from_args(
-    args: argparse.Namespace,
-    *,
-    default_greedy: bool,
-) -> GenerationFn:
-    return build_generation_fn(
-        args.model,
-        backend=args.generation_backend,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        default_greedy=default_greedy,
-        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
-        vllm_dtype=args.vllm_dtype,
-        trust_remote_code=args.trust_remote_code,
-    )
-
-
 def _load_split_file(path: str | Path) -> dict[str, Any]:
     body = json.loads(Path(path).read_text(encoding="utf-8"))
     if "splits" not in body:
         raise ValueError("split file must include splits")
     return body
-
-
-def _load_examples_for_split(split_artifact: Mapping[str, Any], split_name: str) -> list[GSM8KExample]:
-    ids = split_artifact["splits"][split_name]
-    return _load_examples_for_ids(split_artifact, ids)
 
 
 def _load_examples_for_ids(

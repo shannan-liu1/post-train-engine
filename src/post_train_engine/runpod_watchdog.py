@@ -20,6 +20,9 @@ from post_train_engine.runpod_control_plane import (
 )
 
 RUNPOD_API_KEY_ENV = "RUNPOD_API_KEY"
+_DELETE_VERIFY_ATTEMPTS = 3
+_DELETE_VERIFY_DELAY_SECONDS = 2.0
+_MINIMUM_DETACHED_LEAD_SECONDS = 5.0
 _CHILD_ENV_ALLOWLIST = frozenset(
     {
         "APPDATA",
@@ -51,6 +54,8 @@ def launch_local_deletion_watchdog(
     log_path: str | Path,
     api_key: str,
     spawn: Callable[..., SpawnedProcess] = subprocess.Popen,
+    clock: Callable[[], float] = time.time,
+    transport_factory: Callable[[str], RunPodTransport] = RunPodRESTTransport,
 ) -> dict[str, Any]:
     """Launch the provider-authoritative watchdog without serializing its key."""
 
@@ -63,6 +68,15 @@ def launch_local_deletion_watchdog(
     pod_id, deadline_seconds, delete_at_unix = _watchdog_target(operation)
     receipt.parent.mkdir(parents=True, exist_ok=True)
     log.parent.mkdir(parents=True, exist_ok=True)
+    if delete_at_unix - clock() <= _MINIMUM_DETACHED_LEAD_SECONDS:
+        return run_local_deletion_watchdog(
+            journal_path=journal,
+            receipt_path=receipt,
+            api_key=api_key,
+            sleep=lambda _seconds: None,
+            clock=clock,
+            transport_factory=transport_factory,
+        )
     _write_json_atomic(
         receipt,
         {
@@ -132,44 +146,55 @@ def run_local_deletion_watchdog(
     pod_id, _deadline_seconds, delete_at_unix = _watchdog_target(operation)
     sleep(max(0.0, delete_at_unix - clock()))
     control = RunPodControlPlane(transport_factory(api_key), journal)
-    delete_error: BaseException | None = None
+    last_error: Exception | None = None
+    for attempt in range(_DELETE_VERIFY_ATTEMPTS):
+        delete_error: Exception | None = None
+        try:
+            control.delete_pod(pod_id)
+        except Exception as exc:
+            delete_error = exc
+            last_error = exc
+        try:
+            absent = control.verify_pod_absent(pod_id)
+        except Exception as exc:
+            absent = False
+            last_error = exc
+        if absent:
+            result = {
+                "state": "absent" if delete_error is not None else "deleted",
+                "pod_id": pod_id,
+                "delete_attempts": attempt + 1,
+                "recorded_at_unix": time.time(),
+            }
+            _write_json_atomic(receipt, result)
+            return result
+        if attempt + 1 < _DELETE_VERIFY_ATTEMPTS:
+            sleep(_DELETE_VERIFY_DELAY_SECONDS)
+
+    journal_error: Exception | None = None
     try:
-        control.delete_pod(pod_id)
-    except BaseException as exc:
-        delete_error = exc
-    try:
-        absent = control.verify_pod_absent(pod_id)
-    except BaseException as exc:
-        result = {
-            "state": "failed",
-            "pod_id": pod_id,
-            "error_type": type(exc).__name__,
-            "error": str(exc),
-            "recorded_at_unix": time.time(),
-        }
-        _write_json_atomic(receipt, result)
-        raise
-    if not absent:
-        result = {
-            "state": "failed",
-            "pod_id": pod_id,
-            "error_type": (
-                type(delete_error).__name__
-                if delete_error is not None
-                else "PodStillActiveError"
-            ),
-            "error": "provider still reports the Pod active after deletion",
-            "recorded_at_unix": time.time(),
-        }
-        _write_json_atomic(receipt, result)
-        raise RuntimeError(result["error"]) from delete_error
+        control.record_delete_unverified(pod_id)
+    except Exception as exc:
+        journal_error = exc
     result = {
-        "state": "absent" if delete_error is not None else "deleted",
+        "state": "failed",
         "pod_id": pod_id,
+        "delete_attempts": _DELETE_VERIFY_ATTEMPTS,
+        "error_type": (
+            type(last_error).__name__
+            if last_error is not None
+            else "PodStillActiveError"
+        ),
+        "error": "provider still reports the Pod active after deletion retries",
+        **(
+            {"journal_error_type": type(journal_error).__name__}
+            if journal_error is not None
+            else {}
+        ),
         "recorded_at_unix": time.time(),
     }
     _write_json_atomic(receipt, result)
-    return result
+    raise RuntimeError(result["error"]) from (journal_error or last_error)
 
 
 def _load_created_operation(path: Path) -> dict[str, Any]:

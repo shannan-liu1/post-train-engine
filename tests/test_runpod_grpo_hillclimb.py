@@ -42,7 +42,7 @@ from post_train_engine.runtime_evidence import RuntimePairEvidence
 from post_train_engine.tasks.gsm8k import GSM8KExample
 
 
-def test_batched_runpod_eval_matches_scalar_outputs(
+def test_evaluator_preserves_order_for_a_batch_invariant_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,7 +190,7 @@ def test_r4_benchmark_optimizes_model_reuse_without_changing_tensor_shape(
     monkeypatch.setattr(runpod_module, "measure_runtime_pair", measure)
 
     result = run_runpod_eval_benchmark(
-        _write_config(tmp_path),
+        _write_config(tmp_path, {"eval": {"batch_size": 4}}),
         tmp_path / "benchmark.json",
     )
 
