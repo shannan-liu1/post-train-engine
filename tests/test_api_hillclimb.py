@@ -308,6 +308,7 @@ def test_artifact_store_overwrite_refuses_managed_junction(
         Path,
         "is_junction",
         lambda path: path == existing,
+        raising=False,
     )
 
     with pytest.raises(ValueError, match="non-directory run path"):

@@ -40,6 +40,7 @@ def test_retention_policy_refuses_linked_checkpoint_directory(
         Path,
         "is_junction",
         lambda path: path == linked,
+        raising=False,
     )
 
     with pytest.raises(ValueError, match="linked checkpoint directory"):
