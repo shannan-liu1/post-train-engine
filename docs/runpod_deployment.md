@@ -80,6 +80,13 @@ The minimum request shape below is an example. Substitute the selected image and
 
 Choose `SECURE` or `COMMUNITY` deliberately. Repository upload approval must cover the selected trust boundary.
 
+Send the canonical `post-train-engine/0.0.1` User-Agent on every RunPod REST and
+GraphQL request. RunPod's Cloudflare policy rejects Python urllib's default
+browser signature with HTTP 403 Error 1010 before the mutation reaches RunPod.
+Treat bounded GraphQL 4xx responses as definitive create rejections, not
+ambiguous submissions. Preserve ambiguous reconciliation for transport failures
+and GraphQL execution errors where the provider may have accepted the mutation.
+
 ## SSH lifecycle
 
 RunPod injects account SSH keys at Pod creation. Prefer one dedicated persistent service identity for repeated Codex operations. A task-scoped identity is optional and temporary. Register either identity before creating the Pod.
@@ -261,6 +268,7 @@ pte runpod attempt settle --journal <operation.json> --pod-id <id> `
 | Failed R4 artifact collapsed all trial drift into one boolean | The artifact could not distinguish baseline instability from optimized-path drift | Record warmup-relative parity separately for both baseline and both optimized ABBA trials without exposing completions. |
 | Local watchdog started from an ignored task script | The safety-critical process had no canonical launcher, absolute deadline, or secret-minimized child environment | Use `pte runpod watchdog`, require its armed receipt, and keep the trusted host awake until teardown is verified. |
 | Watchdog used one absence check, could overwrite terminal evidence when launched after its deadline, and lost its failure receipt if the journal update failed | Eventual consistency, late launch, or journal corruption could leave a billable Pod with misleading or missing local evidence | Delete expired targets synchronously, retry provider deletion and absence verification three times, retain `delete_unverified` on exhaustion, and write the independent watchdog receipt even when journal repair fails. |
+| GraphQL create returned HTTP 403 Error 1010 while REST inventory and GraphQL identity queries succeeded | RunPod's Cloudflare policy blocked Python urllib's default browser signature before the mutation reached RunPod | Send the canonical application User-Agent, surface bounded 4xx response details, record `rejected` rather than `ambiguous`, and confirm zero Pods through REST inventory. |
 
 ## Primary references
 

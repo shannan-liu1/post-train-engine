@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,7 @@ from post_train_engine.runpod_control_plane import (
     PodCreateReceipt,
     RunPodBudget,
     RunPodControlPlane,
+    RunPodCreateRejectedError,
     RunPodProviderTransport,
 )
 from post_train_engine.runpod_watchdog import (
@@ -101,6 +104,7 @@ def test_provider_transport_uses_graphql_provider_termination_for_create(
     request = captured[0][0]
     payload = json.loads(request.data)
     assert request.full_url == "https://api.runpod.io/graphql"
+    assert request.get_header("User-agent") == "post-train-engine/0.0.1"
     assert payload["variables"]["input"]["terminateAfter"] == body["terminateAfter"]
     assert payload["variables"]["input"]["gpuTypeId"] == "NVIDIA A40"
     assert result["id"] == "pod-1"
@@ -127,6 +131,34 @@ def test_runpod_transport_rejects_oversized_response(
 
     with pytest.raises(RuntimeError, match="response exceeded"):
         RunPodProviderTransport("secret").request("GET", "/pods")
+
+
+def test_graphql_http_rejection_preserves_bounded_provider_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = urllib.error.HTTPError(
+        "https://api.runpod.io/graphql",
+        403,
+        "Forbidden",
+        {},
+        BytesIO(b'Error 1010: browser signature banned; token=secret-value'),
+    )
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(
+        RunPodCreateRejectedError,
+        match="HTTP 403: Error 1010: browser signature banned",
+    ) as exc_info:
+        RunPodProviderTransport("secret-value").request(
+            "POST",
+            "/pods",
+            {**_request(), "terminateAfter": "2026-07-18T00:00:00Z"},
+        )
+
+    assert "secret-value" not in str(exc_info.value)
 
 
 def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) -> None:
@@ -329,6 +361,24 @@ def test_create_reconciles_ambiguous_submission_without_second_post(
 
     assert receipt.pod_id == "pod-1"
     assert [call[0] for call in transport.calls] == ["POST", "GET"]
+
+
+def test_create_records_definitive_rejection_without_ambiguous_reconciliation(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    transport = FakeTransport([RunPodCreateRejectedError("HTTP 403")])
+    control = RunPodControlPlane(transport, journal)
+
+    with pytest.raises(RunPodCreateRejectedError, match="HTTP 403"):
+        control.create_pod(
+            _request(),
+            budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+            arm_watchdog=_arm_watchdog,
+        )
+
+    assert [call[0] for call in transport.calls] == ["POST"]
+    assert json.loads(journal.read_text(encoding="utf-8"))["state"] == "rejected"
 
 
 def test_create_reconciles_success_response_without_pod_id(tmp_path: Path) -> None:
@@ -794,6 +844,41 @@ def test_local_watchdog_reconciles_and_deletes_late_ambiguous_create(
         ("GET", "/pods"),
         ("GET", "/pods"),
     ]
+
+
+def test_local_watchdog_closes_definitively_rejected_create(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "rejected",
+                "pod_name": "pte-r4-deadbeef",
+                "intent_at_unix": 1000.0,
+                "budget": {
+                    "minimum_runtime_seconds": 60,
+                    "max_runtime_seconds": 1200,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([[]])
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=receipt_path,
+        api_key="secret",
+        sleep=lambda _seconds: None,
+        clock=lambda: 1060.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "absent"
+    assert result["pod_name"] == "pte-r4-deadbeef"
+    assert [call[:2] for call in transport.calls] == [("GET", "/pods")]
 
 
 def test_local_watchdog_keeps_reconciling_ambiguous_create_until_provider_ttl(

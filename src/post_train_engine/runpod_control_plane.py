@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import time
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
@@ -14,11 +15,13 @@ from urllib.request import Request
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from post_train_engine.api_schemas import redact_secret_text
 from post_train_engine.http_transport import open_no_redirect, read_bounded_response
 from post_train_engine.runpod import cuda_version_from_image
 
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 _MAX_USER_AUTHORIZED_SPEND_USD = 1.5
+_RUNPOD_USER_AGENT = "post-train-engine/0.0.1"
 
 
 class RunPodTransport(Protocol):
@@ -67,6 +70,7 @@ class RunPodRESTTransport:
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Accept": "application/json",
+                "User-Agent": _RUNPOD_USER_AGENT,
                 **({"Content-Type": "application/json"} if data is not None else {}),
             },
         )
@@ -131,15 +135,27 @@ class RunPodProviderTransport(RunPodRESTTransport):
                 "Authorization": f"Bearer {self._api_key}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
+                "User-Agent": _RUNPOD_USER_AGENT,
             },
         )
-        with open_no_redirect(request, timeout=self._timeout_seconds) as response:
-            raw = json.loads(read_bounded_response(response).decode("utf-8"))
+        try:
+            with open_no_redirect(request, timeout=self._timeout_seconds) as response:
+                raw = json.loads(read_bounded_response(response).decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = redact_secret_text(
+                exc.read(501).decode("utf-8", errors="replace")[:500]
+            )
+            if 400 <= exc.code < 500:
+                raise RunPodCreateRejectedError(
+                    f"RunPod GraphQL create rejected with HTTP {exc.code}: {body}"
+                ) from exc
+            raise
         errors = raw.get("errors") if isinstance(raw, dict) else None
         if isinstance(errors, list) and errors:
             message = errors[0].get("message") if isinstance(errors[0], dict) else None
             raise RuntimeError(
-                f"RunPod GraphQL create failed: {message or 'unknown error'}"
+                "RunPod GraphQL create failed: "
+                + redact_secret_text(str(message or "unknown error"))[:500]
             )
         data = raw.get("data") if isinstance(raw, dict) else None
         pod = data.get("podFindAndDeployOnDemand") if isinstance(data, dict) else None
@@ -263,6 +279,10 @@ class AmbiguousPodCreationError(RuntimeError):
     """The create request may have succeeded, so an automatic replay is unsafe."""
 
 
+class RunPodCreateRejectedError(RuntimeError):
+    """The provider definitively rejected a create request before allocation."""
+
+
 class RunPodControlPlane:
     """Own one durable, bounded RunPod Pod creation operation."""
 
@@ -325,6 +345,19 @@ class RunPodControlPlane:
             }
             try:
                 raw = self.transport.request("POST", "/pods", provider_request)
+            except RunPodCreateRejectedError:
+                self._write_journal(
+                    {
+                        "state": "rejected",
+                        "intent_at_unix": intent_at_unix,
+                        "pod_name": pod_name,
+                        "request_sha256": request_sha256,
+                        "operation_sha256": operation_sha256,
+                        "budget": budget_json,
+                        "request": request,
+                    }
+                )
+                raise
             except BaseException as exc:
                 self._write_journal(
                     {
@@ -836,6 +869,7 @@ __all__ = [
     "RunPodBudget",
     "RunPodAllocationPolicy",
     "RunPodControlPlane",
+    "RunPodCreateRejectedError",
     "RunPodProviderTransport",
     "RunPodRESTTransport",
     "RunPodTransport",

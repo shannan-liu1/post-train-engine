@@ -207,6 +207,14 @@ def run_local_deletion_watchdog(
             if not pod_id:
                 raise RuntimeError("RunPod watchdog reconciliation found no Pod id")
             break
+        if operation.get("state") == "rejected" and inventory_error is None:
+            result = {
+                "state": "absent",
+                "pod_name": pod_name,
+                "recorded_at_unix": time.time(),
+            }
+            _write_json_atomic(receipt, result)
+            return result
         provider_ttl_unix = _provider_ttl_unix(operation)
         now = clock()
         if inventory_error is not None:
@@ -305,6 +313,7 @@ def _load_guarded_operation(path: Path) -> dict[str, Any]:
         "intent",
         "create_started",
         "ambiguous",
+        "rejected",
         "created",
         "delete_requested",
         "delete_unverified",
