@@ -70,7 +70,7 @@ def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) 
 
     assert receipt.pod_id == "pod-1"
     assert receipt.pod_rate_usd_per_hour == 0.44
-    assert receipt.hard_deadline_seconds == 11045
+    assert receipt.hard_deadline_seconds == 1200
     journal = json.loads((tmp_path / "runpod_operation.json").read_text("utf-8"))
     assert journal["state"] == "created"
     assert journal["receipt"]["pod_rate_usd_per_hour"] == 0.44
@@ -97,6 +97,11 @@ def test_delete_updates_the_canonical_operation_journal(tmp_path: Path) -> None:
     assert journal["deleted_pod_id"] == "pod-1"
     assert journal["deleted_at_unix"] > journal["receipt"]["recorded_at_unix"]
 
+    deleted_at = journal["deleted_at_unix"]
+    transport.responses.append([])
+    assert control.verify_pod_absent("pod-1") is True
+    assert json.loads(journal_path.read_text("utf-8"))["deleted_at_unix"] == deleted_at
+
 
 def test_corrupt_journal_cannot_block_provider_deletion(tmp_path: Path) -> None:
     journal_path = tmp_path / "runpod_operation.json"
@@ -116,7 +121,18 @@ def test_budget_deadline_subtracts_settled_campaign_spend() -> None:
         reserve_usd=0.15,
     )
 
-    assert budget.hard_deadline_seconds(0.44) == 7772
+    assert budget.hard_deadline_seconds(0.44) == 1200
+
+
+def test_budget_uses_cost_deadline_when_it_is_stricter_than_runtime_cap() -> None:
+    budget = RunPodBudget(
+        target_spend_usd=1.5,
+        settled_spend_usd=1.2,
+        reserve_usd=0.15,
+        max_runtime_seconds=1800,
+    )
+
+    assert budget.hard_deadline_seconds(0.44) == 1227
 
 
 def test_budget_requires_explicit_settled_campaign_spend() -> None:
@@ -188,6 +204,7 @@ def test_create_deletes_pod_when_rate_cannot_fit_minimum_runtime(
                 settled_spend_usd=0.0,
                 reserve_usd=0.15,
                 minimum_runtime_seconds=1800,
+                max_runtime_seconds=1800,
             ),
         )
 
@@ -226,6 +243,19 @@ def test_billing_remains_pending_until_provider_returns_pod_rows(
     assert settled.amount_usd == 0.37
     assert "grouping=podId" in transport.calls[-2][1]
     assert transport.calls[-1][:2] == ("GET", "/pods")
+
+
+def test_get_pod_requires_the_requested_provider_identity(tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [{"id": "pod-1", "publicIp": "192.0.2.10", "portMappings": {"22": 12345}}]
+    )
+
+    pod = RunPodControlPlane(
+        transport, tmp_path / "runpod_operation.json"
+    ).get_pod("pod-1")
+
+    assert pod["publicIp"] == "192.0.2.10"
+    assert transport.calls == [("GET", "/pods/pod-1", None)]
 
 
 def test_nonempty_billing_is_not_final_without_explicit_teardown_boundary(
@@ -369,7 +399,7 @@ def test_local_watchdog_launches_detached_without_serializing_api_key(
     assert receipt["pid"] == 1234
     assert receipt["delete_at_unix"] == 1120.0
     assert "super-secret" not in " ".join(command)
-    assert kwargs["env"]["RUNPOD_API_KEY"] == "super-secret"
+    assert kwargs["env"]["PTE_REMOTE_RUNPOD_ALL"] == "super-secret"
     assert "UNRELATED_SECRET" not in kwargs["env"]
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["close_fds"] is True

@@ -80,6 +80,7 @@ class RunPodBudget(BaseModel):
     settled_spend_usd: float = Field(..., ge=0.0)
     reserve_usd: float = Field(default=0.15, ge=0.0)
     minimum_runtime_seconds: int = Field(default=60, gt=0)
+    max_runtime_seconds: int = Field(default=1200, gt=0)
 
     @model_validator(mode="after")
     def _settled_spend_and_reserve_leave_execution_budget(self) -> RunPodBudget:
@@ -87,16 +88,21 @@ class RunPodBudget(BaseModel):
             raise ValueError(
                 "settled_spend_usd plus reserve_usd must be below target_spend_usd"
             )
+        if self.max_runtime_seconds < self.minimum_runtime_seconds:
+            raise ValueError(
+                "max_runtime_seconds must be at least minimum_runtime_seconds"
+            )
         return self
 
     def hard_deadline_seconds(self, pod_rate_usd_per_hour: float) -> int:
         if not math.isfinite(pod_rate_usd_per_hour) or pod_rate_usd_per_hour <= 0.0:
             raise ValueError("RunPod create receipt requires a positive finite Pod rate")
-        seconds = math.floor(
+        cost_deadline_seconds = math.floor(
             (self.target_spend_usd - self.settled_spend_usd - self.reserve_usd)
             / pod_rate_usd_per_hour
             * 3600.0
         )
+        seconds = min(cost_deadline_seconds, self.max_runtime_seconds)
         if seconds < self.minimum_runtime_seconds:
             raise ValueError(
                 "authoritative Pod rate cannot fit the minimum runtime under the spend target"
@@ -286,6 +292,19 @@ class RunPodControlPlane:
             raise
         return receipt
 
+    def list_pods(self) -> list[dict[str, Any]]:
+        """Return the provider Pod inventory for pre-create and teardown gates."""
+
+        return _list_rows(self.transport.request("GET", "/pods"))
+
+    def created_receipt(self) -> PodCreateReceipt | None:
+        """Return the durable receipt only for an unfinished created operation."""
+
+        journal = self._read_journal()
+        if journal is None or journal.get("state") != "created":
+            return None
+        return PodCreateReceipt.model_validate(journal.get("receipt"))
+
     def delete_pod(self, pod_id: str) -> None:
         if not pod_id:
             raise ValueError("pod_id must be non-empty")
@@ -302,6 +321,16 @@ class RunPodControlPlane:
             return False
         self._record_deleted(pod_id, outcome="provider_absent")
         return True
+
+    def get_pod(self, pod_id: str) -> dict[str, Any]:
+        """Return one provider Pod only when its identity matches the request."""
+
+        if not pod_id:
+            raise ValueError("pod_id must be non-empty")
+        raw = self.transport.request("GET", f"/pods/{pod_id}")
+        if not isinstance(raw, dict) or str(raw.get("id")) != pod_id:
+            raise ValueError("RunPod Pod response did not match the requested Pod id")
+        return raw
 
     def record_delete_unverified(self, pod_id: str) -> None:
         """Keep the journal non-terminal when provider absence is unproven."""
@@ -334,6 +363,11 @@ class RunPodControlPlane:
         if isinstance(receipt, dict) and str(receipt.get("pod_id")) != pod_id:
             return
         if journal is not None:
+            if (
+                journal.get("state") == "deleted"
+                and str(journal.get("deleted_pod_id")) == pod_id
+            ):
+                return
             self._write_journal(
                 {
                     **journal,
@@ -390,6 +424,7 @@ class RunPodControlPlane:
         active_pods = _list_rows(self.transport.request("GET", "/pods"))
         if any(str(row.get("id")) == pod_id for row in active_pods):
             raise ValueError("cannot finalize billing while the Pod is active")
+        self._record_deleted(pod_id, outcome="provider_absent_at_billing_settlement")
         return PodBillingReceipt(
             pod_id=pod_id,
             settlement_state="settled",
