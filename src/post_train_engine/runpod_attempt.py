@@ -328,6 +328,12 @@ class SSHRunPodRemoteExecutor:
             except (OSError, TimeoutError):
                 self._sleep_until_retry(readiness_deadline)
                 continue
+            desired_status = str(pod.get("desiredStatus") or "").upper()
+            if desired_status in {"EXITED", "TERMINATED"}:
+                detail = str(pod.get("lastStatusChange") or "no provider detail")
+                raise RuntimeError(
+                    f"RunPod entered terminal status {desired_status}: {detail[:500]}"
+                )
             host_value = pod.get("publicIp")
             mappings = pod.get("portMappings")
             port_value = mappings.get("22") if isinstance(mappings, dict) else None
@@ -840,7 +846,7 @@ def _bootstrap_script(spec: RunPodAttemptSpec) -> str:
         "> artifacts/runpod/gpu_before_install.txt; "
         'python -c "import torch; print(torch.__version__, torch.version.cuda)" '
         "> artifacts/runpod/torch_before.txt; "
-        "python -m pip install -r requirements/runpod.txt; "
+        "python -m pip install --require-hashes -r requirements/runpod.txt; "
         "python -m pip install --no-deps -e '.[rlvr]'; "
         'python -c "import torch; print(torch.__version__, torch.version.cuda)" '
         "> artifacts/runpod/torch_after.txt; "

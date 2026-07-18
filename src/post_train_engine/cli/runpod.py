@@ -109,7 +109,7 @@ def cmd_runpod_watchdog(args: argparse.Namespace) -> None:
         journal_path=args.journal,
         receipt_path=args.receipt,
         log_path=args.log,
-        api_key=resolver.require(RUNPOD_API_KEY_ENV, secret=True),
+        api_key=resolver.require_unambiguous(RUNPOD_API_KEY_ENV, secret=True),
     )
     identity = (
         f"pod_id={receipt['pod_id']}"
@@ -149,7 +149,7 @@ def cmd_runpod_attempt_execute(args: argparse.Namespace) -> None:
         raise ValueError("confirmed spend cap does not match the prepared attempt")
     verify_runpod_attempt_source(spec)
     resolver = EnvResolver(load_env_file(None if args.no_env else args.env))
-    api_key = resolver.require(RUNPOD_API_KEY_ENV, secret=True)
+    api_key = resolver.require_unambiguous(RUNPOD_API_KEY_ENV, secret=True)
     attempt_dir = Path(spec.attempt_dir)
     journal = attempt_dir / "runpod_operation.json"
     control = RunPodControlPlane(RunPodProviderTransport(api_key), journal)
@@ -178,7 +178,7 @@ def cmd_runpod_attempt_settle(args: argparse.Namespace) -> None:
     if args.final and args.end_time is None:
         raise ValueError("final billing settlement requires --end-time")
     resolver = EnvResolver(load_env_file(None if args.no_env else args.env))
-    api_key = resolver.require(RUNPOD_API_KEY_ENV, secret=True)
+    api_key = resolver.require_unambiguous(RUNPOD_API_KEY_ENV, secret=True)
     control = RunPodControlPlane(
         RunPodRESTTransport(api_key),
         args.journal,

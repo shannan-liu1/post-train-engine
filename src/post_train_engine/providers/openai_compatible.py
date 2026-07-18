@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from post_train_engine.api_schemas import (
     Candidate,
@@ -21,13 +22,12 @@ from post_train_engine.api_schemas import (
     JobStatus,
     redact_secret_text,
 )
+from post_train_engine.http_transport import open_no_redirect, read_bounded_response
 
 HttpTransport = Callable[
     [str, dict[str, str], dict[str, Any], float],
     dict[str, Any],
 ]
-
-
 class OpenAICompatibleProvider:
     """Synchronous provider over an OpenAI-compatible chat-completions endpoint."""
 
@@ -49,6 +49,13 @@ class OpenAICompatibleProvider:
             raise ValueError("provider_id is required")
         if not base_url:
             raise ValueError("base_url is required")
+        parsed_base_url = urlsplit(base_url)
+        if parsed_base_url.scheme != "https" or not parsed_base_url.hostname:
+            raise ValueError("base_url must use HTTPS")
+        if parsed_base_url.username or parsed_base_url.password:
+            raise ValueError("base_url must not contain credentials")
+        if parsed_base_url.query or parsed_base_url.fragment:
+            raise ValueError("base_url must not contain a query or fragment")
         if not api_key:
             raise ValueError("api_key is required")
         if not model:
@@ -230,10 +237,10 @@ def _default_transport(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
+        with open_no_redirect(request, timeout=timeout_seconds) as response:
+            raw = read_bounded_response(response).decode("utf-8")
     except urllib.error.HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
+        body_text = exc.read(501).decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {body_text[:500]}") from exc
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):

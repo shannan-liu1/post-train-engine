@@ -160,16 +160,16 @@ def run_local_deletion_watchdog(
         receipt,
         {"state": "ready", **target, "recorded_at_unix": time.time()},
     )
+    control = RunPodControlPlane(
+        transport_factory(api_key),
+        journal,
+        sleep=sleep,
+        clock=clock,
+    )
     while True:
         operation = _load_guarded_operation(journal)
         if operation.get("state") == "deleted":
-            result = {
-                "state": "absent",
-                "pod_id": operation.get("deleted_pod_id"),
-                "recorded_at_unix": time.time(),
-            }
-            _write_json_atomic(receipt, result)
-            return result
+            return _confirm_deleted_operation(control, operation, receipt)
         target = _watchdog_target(operation)
         delay = target["delete_at_unix"] - clock()
         if delay > 0.0:
@@ -183,23 +183,11 @@ def run_local_deletion_watchdog(
             target = refreshed_target
         break
 
-    control = RunPodControlPlane(
-        transport_factory(api_key),
-        journal,
-        sleep=sleep,
-        clock=clock,
-    )
     pod_id = target.get("pod_id")
     while not isinstance(pod_id, str) or not pod_id:
         operation = _load_guarded_operation(journal)
         if operation.get("state") == "deleted":
-            result = {
-                "state": "absent",
-                "pod_id": operation.get("deleted_pod_id"),
-                "recorded_at_unix": time.time(),
-            }
-            _write_json_atomic(receipt, result)
-            return result
+            return _confirm_deleted_operation(control, operation, receipt)
         refreshed_target = _watchdog_target(operation)
         pod_id = refreshed_target.get("pod_id")
         if isinstance(pod_id, str) and pod_id:
@@ -280,6 +268,34 @@ def run_local_deletion_watchdog(
         "recorded_at_unix": time.time(),
     }
     _write_json_atomic(receipt, result)
+    return result
+
+
+def _confirm_deleted_operation(
+    control: RunPodControlPlane,
+    operation: Mapping[str, Any],
+    receipt_path: Path,
+) -> dict[str, Any]:
+    deleted_pod_id = str(operation.get("deleted_pod_id") or "")
+    create_receipt = operation.get("receipt")
+    receipt_pod_id = (
+        str(create_receipt.get("pod_id") or "")
+        if isinstance(create_receipt, dict)
+        else ""
+    )
+    if deleted_pod_id and receipt_pod_id and deleted_pod_id != receipt_pod_id:
+        raise ValueError("RunPod journal Pod identity changed after creation")
+    pod_id = deleted_pod_id or receipt_pod_id
+    if not pod_id:
+        raise ValueError("deleted RunPod journal is missing the Pod id")
+    if not control.verify_pod_absent(pod_id):
+        control.delete_pod_and_verify(pod_id, attempts=_DELETE_VERIFY_ATTEMPTS)
+    result = {
+        "state": "absent",
+        "pod_id": pod_id,
+        "recorded_at_unix": time.time(),
+    }
+    _write_json_atomic(receipt_path, result)
     return result
 
 

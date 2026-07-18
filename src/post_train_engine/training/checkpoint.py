@@ -63,7 +63,7 @@ def save_checkpoint(
 
 def load_checkpoint(path: Path) -> CheckpointState:
     path = Path(path)
-    payload = torch.load(path / _STATE_FILENAME, weights_only=False)
+    payload = torch.load(path / _STATE_FILENAME, weights_only=True)
     return CheckpointState(
         model_state_dict=safetensors.torch.load_file(str(path / _MODEL_FILENAME)),
         optimizer_state_dict=payload["optimizer"],

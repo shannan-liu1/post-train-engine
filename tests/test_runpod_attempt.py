@@ -756,6 +756,44 @@ def test_ssh_remote_resume_rejects_changed_endpoint_without_repinning(
     assert known_hosts.read_bytes() == original_known_hosts
 
 
+def test_ssh_remote_fails_immediately_on_terminal_provider_status(
+    tmp_path: Path,
+) -> None:
+    class Control:
+        @staticmethod
+        def get_pod(_pod_id: str) -> dict[str, Any]:
+            return {
+                "id": "pod-1",
+                "desiredStatus": "EXITED",
+                "lastStatusChange": "container image failed to start",
+            }
+
+    key_path = tmp_path / "id_ed25519"
+    key_path.write_text("fixture", encoding="utf-8")
+    spec = RunPodAttemptSpec(
+        attempt_dir=str(tmp_path),
+        plan_sha256="sha256:" + "a" * 64,
+        repo_url="https://github.com/shannan-liu1/post-train-engine.git",
+        commit_sha="a" * 40,
+        pod_name="pte-r4-aaaaaaaaaaaa",
+        create_request={},
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+    )
+    commands: list[list[str]] = []
+    times = iter((0.0, 0.0, 0.0, 121.0, 121.0))
+
+    with pytest.raises(RuntimeError, match="EXITED.*container image failed"):
+        SSHRunPodRemoteExecutor(
+            control=Control(),
+            ssh_private_key=key_path,
+            command_runner=lambda command, **_kwargs: commands.append(command),
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(times, 121.0),
+        ).bootstrap("pod-1", spec)
+
+    assert commands == []
+
+
 def test_ssh_bootstrap_uses_one_aggregate_deadline(tmp_path: Path) -> None:
     class Control:
         @staticmethod

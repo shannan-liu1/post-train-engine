@@ -98,7 +98,7 @@ def test_runpod_plan_has_one_config_derived_allocation(tmp_path: Path) -> None:
         "container_disk_gb": 40,
         "gpu_count": 2,
         "gpu_type": "NVIDIA A40",
-        "image": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+        "image": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853",
         "volume_gb": 0,
     }
     request = build_runpod_create_request(plan, pod_name="pte-r4-deadbeef")

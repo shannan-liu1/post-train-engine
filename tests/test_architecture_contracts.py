@@ -70,6 +70,15 @@ def test_package_exposes_only_the_canonical_console_script() -> None:
     }
 
 
+def test_unknown_unknown_register_ids_are_unique_and_sequential() -> None:
+    spec = (ROOT / "docs" / "specs" / "canonical-research-flywheel.md").read_text(
+        encoding="utf-8"
+    )
+    identifiers = [int(value) for value in re.findall(r"^\| U-(\d{3}) \|", spec, re.M)]
+
+    assert identifiers == list(range(1, len(identifiers) + 1))
+
+
 def test_run_engine_exposes_one_resolver_first_execution_interface() -> None:
     from post_train_engine.engine import RunEngine
 

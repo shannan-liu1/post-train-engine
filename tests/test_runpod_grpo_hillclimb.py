@@ -1044,7 +1044,7 @@ def _write_config(
             "gpu_type": "A40",
             "gpu_count": 1,
             "container_image": (
-                "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+                "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853"
             ),
             "disk_gb": 40,
             "volume_gb": 0,

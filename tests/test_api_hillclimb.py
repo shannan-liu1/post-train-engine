@@ -649,6 +649,48 @@ def test_chat_completions_provider_fails_closed_on_malformed_response() -> None:
         provider.submit_job(request)
 
 
+def test_chat_completions_provider_rejects_plaintext_secret_endpoint() -> None:
+    from post_train_engine.providers.openai_compatible import OpenAICompatibleProvider
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        OpenAICompatibleProvider(
+            provider_id="chat-completions-test",
+            base_url="http://api.example.test/v1",
+            api_key="secret-value",
+            model="test-model",
+        )
+
+
+def test_chat_completions_transport_rejects_oversized_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from post_train_engine.providers.openai_compatible import _default_transport
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(size: int) -> bytes:
+            return b"x" * size
+
+    monkeypatch.setattr(
+        "post_train_engine.providers.openai_compatible.open_no_redirect",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RuntimeError, match="response exceeded"):
+        _default_transport(
+            url="https://api.example.test/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            body={"model": "test"},
+            timeout_seconds=1.0,
+        )
+
+
 def test_provider_submit_failure_writes_redacted_error_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -76,7 +76,8 @@ def test_preflight_verifies_normalized_lock_hash_before_remote_checks(
     requirements = tmp_path / "requirements"
     requirements.mkdir()
     (requirements / "runpod.txt").write_text(
-        f"# uv-lock-sha256: {digest}\naccelerate==1.0\n",
+        f"# uv-lock-sha256: {digest}\n"
+        "accelerate==1.0 --hash=sha256:" + "a" * 64 + "\n",
         encoding="utf-8",
     )
 
@@ -85,7 +86,8 @@ def test_preflight_verifies_normalized_lock_hash_before_remote_checks(
     assert runpod_preflight.command_specs(require_cuda=True)[0][0] == "dependency_lock"
 
     (requirements / "runpod.txt").write_text(
-        f"# uv-lock-sha256: {digest}\ntorch>=2\n",
+        f"# uv-lock-sha256: {digest}\n"
+        "torch>=2 --hash=sha256:" + "a" * 64 + "\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="image-provided Torch"):
@@ -113,6 +115,21 @@ def test_preflight_records_missing_executable_as_a_failed_gate(
     assert report["results"][0]["error_type"] == "FileNotFoundError"
 
 
+def test_constraints_reject_hashless_remote_dependencies(tmp_path: Path) -> None:
+    lock_text = "version = 1\npackage = []\n"
+    digest = hashlib.sha256(lock_text.encode("utf-8")).hexdigest()
+    (tmp_path / "uv.lock").write_text(lock_text, encoding="utf-8")
+    requirements = tmp_path / "requirements"
+    requirements.mkdir()
+    (requirements / "runpod.txt").write_text(
+        f"# uv-lock-sha256: {digest}\naccelerate==1.0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="package hashes"):
+        runpod_preflight.verify_runpod_constraints(tmp_path)
+
+
 def test_constraints_can_run_before_project_dependencies_are_installed(
     tmp_path: Path,
 ) -> None:
@@ -122,7 +139,8 @@ def test_constraints_can_run_before_project_dependencies_are_installed(
     requirements = tmp_path / "requirements"
     requirements.mkdir()
     (requirements / "runpod.txt").write_text(
-        f"# uv-lock-sha256: {digest}\naccelerate==1.0\n",
+        f"# uv-lock-sha256: {digest}\n"
+        "accelerate==1.0 --hash=sha256:" + "a" * 64 + "\n",
         encoding="utf-8",
     )
 

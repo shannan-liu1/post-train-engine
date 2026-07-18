@@ -54,6 +54,18 @@ class EnvResolver:
             raise ValueError(f"missing required {kind}: {name}")
         return value
 
+    def require_unambiguous(self, name: str, *, secret: bool) -> str:
+        process_value = os.environ.get(name)
+        file_value = self.file_values.get(name)
+        if (
+            process_value not in {None, ""}
+            and file_value not in {None, ""}
+            and process_value != file_value
+        ):
+            kind = "secret env" if secret else "env"
+            raise ValueError(f"conflicting {kind} sources: {name}")
+        return self.require(name, secret=secret)
+
     def redacted_provider_env(self, specs: list[ProviderSpec]) -> dict[str, Any]:
         env_names: set[str] = set()
         secret_names: set[str] = set()

@@ -80,6 +80,8 @@ def verify_runpod_constraints(root: str | Path = ".") -> None:
     lines = constraints.read_text(encoding="utf-8").splitlines()
     if f"# uv-lock-sha256: {digest}" not in lines[:3]:
         raise ValueError("requirements/runpod.txt does not match the normalized uv.lock")
+    if not any("--hash=sha256:" in line for line in lines):
+        raise ValueError("requirements/runpod.txt must include package hashes")
     if any(
         re.match(r"torch(?:\s|[<>=!~@\[]|$)", line.strip(), re.IGNORECASE)
         for line in lines

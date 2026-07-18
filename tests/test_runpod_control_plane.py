@@ -44,7 +44,7 @@ def _request() -> dict[str, Any]:
         "computeType": "GPU",
         "gpuTypeIds": ["NVIDIA A40"],
         "gpuCount": 2,
-        "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+        "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853",
         "allowedCudaVersions": ["12.8"],
         "containerDiskInGb": 40,
         "volumeInGb": 0,
@@ -71,7 +71,7 @@ def test_provider_transport_uses_graphql_provider_termination_for_create(
             return None
 
         @staticmethod
-        def read() -> bytes:
+        def read(_size: int) -> bytes:
             return json.dumps(
                 {
                     "data": {
@@ -88,7 +88,9 @@ def test_provider_transport_uses_graphql_provider_termination_for_create(
         captured.append((request, timeout))
         return Response()
 
-    monkeypatch.setattr("post_train_engine.runpod_control_plane.urlopen", open_request)
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect", open_request
+    )
     body = {
         **_request(),
         "terminateAfter": "2026-07-18T00:00:00Z",
@@ -102,6 +104,29 @@ def test_provider_transport_uses_graphql_provider_termination_for_create(
     assert payload["variables"]["input"]["terminateAfter"] == body["terminateAfter"]
     assert payload["variables"]["input"]["gpuTypeId"] == "NVIDIA A40"
     assert result["id"] == "pod-1"
+
+
+def test_runpod_transport_rejects_oversized_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(size: int) -> bytes:
+            return b"x" * size
+
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RuntimeError, match="response exceeded"):
+        RunPodProviderTransport("secret").request("GET", "/pods")
 
 
 def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) -> None:
@@ -858,6 +883,73 @@ def test_local_watchdog_reconciles_a_lost_delete_response_by_provider_absence(
     operation = json.loads(journal.read_text("utf-8"))
     assert operation["state"] == "deleted"
     assert operation["deletion_outcome"] == "provider_absent"
+
+
+def test_local_watchdog_rechecks_provider_when_journal_claims_deleted(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "deleted",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 1200,
+                    "recorded_at_unix": 1000.0,
+                },
+                "deleted_pod_id": "pod-1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([[], []])
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=tmp_path / "watchdog.json",
+        api_key="secret",
+        sleep=lambda _seconds: None,
+        clock=lambda: 1100.0,
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "absent"
+    assert [call[:2] for call in transport.calls] == [
+        ("GET", "/pods"),
+        ("GET", "/pods"),
+    ]
+
+
+def test_local_watchdog_rejects_deleted_pod_identity_mismatch(tmp_path: Path) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "deleted",
+                "receipt": {
+                    "pod_id": "pod-1",
+                    "hard_deadline_seconds": 1200,
+                    "recorded_at_unix": 1000.0,
+                },
+                "deleted_pod_id": "pod-other",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([])
+
+    with pytest.raises(ValueError, match="Pod identity changed"):
+        run_local_deletion_watchdog(
+            journal_path=journal,
+            receipt_path=tmp_path / "watchdog.json",
+            api_key="secret",
+            sleep=lambda _seconds: None,
+            clock=lambda: 1100.0,
+            transport_factory=lambda _key: transport,
+        )
+
+    assert transport.calls == []
 
 
 def test_local_watchdog_retries_until_provider_confirms_absence(

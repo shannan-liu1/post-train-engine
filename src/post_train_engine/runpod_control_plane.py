@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from post_train_engine.http_transport import open_no_redirect, read_bounded_response
 from post_train_engine.runpod import cuda_version_from_image
 
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
@@ -69,8 +70,8 @@ class RunPodRESTTransport:
                 **({"Content-Type": "application/json"} if data is not None else {}),
             },
         )
-        with urlopen(request, timeout=self._timeout_seconds) as response:
-            payload = response.read()
+        with open_no_redirect(request, timeout=self._timeout_seconds) as response:
+            payload = read_bounded_response(response)
         return {} if not payload else json.loads(payload.decode("utf-8"))
 
 
@@ -132,8 +133,8 @@ class RunPodProviderTransport(RunPodRESTTransport):
                 "Content-Type": "application/json",
             },
         )
-        with urlopen(request, timeout=self._timeout_seconds) as response:
-            raw = json.loads(response.read().decode("utf-8"))
+        with open_no_redirect(request, timeout=self._timeout_seconds) as response:
+            raw = json.loads(read_bounded_response(response).decode("utf-8"))
         errors = raw.get("errors") if isinstance(raw, dict) else None
         if isinstance(errors, list) and errors:
             message = errors[0].get("message") if isinstance(errors[0], dict) else None

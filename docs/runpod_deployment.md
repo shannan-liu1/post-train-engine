@@ -22,7 +22,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 ## Image and CUDA compatibility
 
 The image tag and the host CUDA capability are separate allocation inputs. Derive the RunPod filter from the pinned image tag for every deployment. For example,
-`runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` yields `12.8`.
+`runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853` yields `12.8`.
 RunPod can otherwise allocate an incompatible machine, reject the image before startup, and never expose SSH.
 
 `ManualRunPodExecution.cuda_version` is computed from `container_image`; it is not a second configurable value. Config validation rejects an image without a parseable `cudaMAJOR.MINOR` tag. Pass that computed value as the sole `allowedCudaVersions` entry.
@@ -32,7 +32,7 @@ For the example image above, the create request includes:
 ```json
 {
   "allowedCudaVersions": ["12.8"],
-  "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+  "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853"
 }
 ```
 
@@ -54,7 +54,7 @@ RunPod catalog prices and stock can race with allocation. Multi-GPU stock also d
 - Do not infer the final topology price by multiplying or dividing catalog fields.
 - Delete the Pod immediately when its authoritative rate exceeds the attempt budget.
 - A create response without an assigned machine or usable SSH mapping is not a healthy allocation.
-- Inspect provider status and image compatibility before waiting on SSH.
+- Fail immediately when RunPod reports a terminal Pod status. The CUDA allocation filter and digest-pinned image provide the pre-allocation image compatibility contract.
 
 ## Create request
 
@@ -68,11 +68,9 @@ The minimum request shape below is an example. Substitute the selected image and
   "cloudType": "SECURE",
   "computeType": "GPU",
   "containerDiskInGb": 40,
-  "globalNetworking": true,
   "gpuCount": 2,
   "gpuTypeIds": ["NVIDIA A40"],
-  "gpuTypePriority": "availability",
-  "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+  "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04@sha256:cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853",
   "interruptible": false,
   "ports": ["22/tcp"],
   "supportPublicIp": true,
@@ -149,7 +147,7 @@ fenced campaign proposal and binding provider billing settlement.
 1. Verify exact local and public source identity before loading the provider credential.
 2. Persist create intent, arm the name-based local watchdog, and submit one create request with provider-scheduled termination.
 3. Enter a new work directory that contains only the verified source.
-4. Run `python src/post_train_engine/runpod_preflight.py --constraints-only` directly so this stdlib-only gate works before project dependencies exist. Before installing anything, require CUDA, exactly two GPUs, and `A40` in both device names. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
+4. Run `python src/post_train_engine/runpod_preflight.py --constraints-only` directly so this stdlib-only gate works before project dependencies exist. Before installing anything, require CUDA, exactly two GPUs, and `A40` in both device names. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install --require-hashes -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
@@ -195,6 +193,9 @@ after certification with at least nine minutes remaining, downloads bounded
 evidence, and deletes in `finally`. A lost delete response triggers provider
 absence reconciliation instead of a second blind mutation. Teardown requires two
 consecutive provider-absence observations and rejects any unexpected active Pod.
+It also rejects conflicting `PTE_REMOTE_RUNPOD_ALL` values between the process
+environment and the selected dotenv file, so an explicit `.env` cannot silently
+target a different account.
 
 The runner refuses bootstrap unless the full bootstrap, R4, evidence, and teardown
 reserve remains. It rechecks the R4 reserve after bootstrap, caps evidence at
@@ -205,7 +206,7 @@ termination deadline has elapsed.
 
 Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 
-When dependencies change, run the export command recorded at the top of `requirements/runpod.txt`, then restore `# uv-lock-sha256: <sha256 of normalized uv.lock>` within its first three lines. `runpod_preflight.py --constraints-only` and the architecture tests reject a stale or missing binding.
+When dependencies change, run the export command recorded at the top of `requirements/runpod.txt`, then restore `# uv-lock-sha256: <sha256 of normalized uv.lock>` within its first three lines. Keep package hashes enabled. `runpod_preflight.py --constraints-only` rejects a stale, hashless, or missing binding.
 
 ## Teardown and evidence
 
@@ -264,5 +265,8 @@ pte runpod attempt settle --journal <operation.json> --pod-id <id> `
 ## Primary references
 
 - [RunPod create Pod API](https://docs.runpod.io/api-reference/pods/POST/pods)
+- [RunPod GraphQL Pod management](https://docs.runpod.io/sdks/graphql/manage-pods)
+- [Official runpodctl GraphQL client](https://github.com/runpod/runpodctl/blob/main/internal/api/graphql.go)
+- [Pinned RunPod PyTorch image digest](https://hub.docker.com/layers/runpod/pytorch/2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04/images/sha256-cb154fcca15d1d6ce858cfa672b76505e30861ef981d28ec94bd44168767d853)
 - [RunPod SSH configuration](https://docs.runpod.io/pods/configuration/use-ssh)
 - [RunPod billing](https://docs.runpod.io/accounts-billing/billing)
