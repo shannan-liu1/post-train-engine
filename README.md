@@ -99,9 +99,8 @@ resolution, dataset loading, scientific partitions, a typed receipt, and cost.
 8. Re-evaluate the selected checkpoint on independent promotion examples.
 9. Apply the current central promotion, lifecycle, cost, and campaign mechanics.
 
-This path is not production-certified. The governing spec keeps immutable
-evaluation binding, sealed-row disclosure, provider-derived costs, and distributed
-receipt-failure handling open.
+This path is not production-certified. The governing spec keeps external sealed-row
+authority, provider-derived costs, and remote execution evidence open.
 
 Multi-rank workers execute the same non-promotion stages. Rank zero alone writes intents, receipts, promotion evidence, and the final manifest.
 

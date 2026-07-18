@@ -9,14 +9,15 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 3. Use the GPU count required by the evidence claim. A one-GPU run cannot certify a two-GPU claim.
 4. Pin the container image, GPU type, and GPU count. Derive the CUDA allocation filter from the image tag. Never hardcode one global CUDA version.
 5. Verify one dedicated account SSH identity before Pod creation. Retain a persistent service identity; remove only an explicitly task-scoped temporary identity during teardown.
-6. Use exactly one audited source-delivery mode: an allowlist bundle or an exact Git commit. Never mix source modes within one attempt.
-7. Start a provider-authoritative local deletion watchdog immediately after creation. Add a Pod-side watchdog after SSH only when the Pod already has provider deletion authority; never transmit an account API key into the Pod to create that authority.
+6. Use the canonical exact-public-Git-commit source path. The attempt compiler binds the full commit and rejects private repository URLs.
+7. Persist create intent, arm the provider-authoritative local deletion watchdog, and set the provider `terminateAfter` deadline before submitting the create mutation.
 8. Delete the Pod on any failed gate. Verify zero active Pods and zero current hourly spend at teardown.
-9. Verify that the current execution environment permits the approved bundle transfer before renting a Pod. An approved user intent does not guarantee that the local sandbox permits external source upload.
-10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
+9. Before loading the RunPod credential, require a clean local worktree whose `HEAD` exactly matches public remote `main` and the prepared attempt SHA.
+10. Never upload a repository bundle, Git credential, provider key, or private SSH key to the Pod. The executor may pass the private-key path to local OpenSSH but never reads or serializes its contents.
 11. Use `RunPodAllocationPolicy` and `RunPodBudget`. Supply settled campaign spend before creation. The checked-in allocation policy permits Secure Cloud, exactly two A40s, 40 GB ephemeral container disk, zero persistent volume, and SSH only. It does not grant standing authorization. Obtain a new explicit total spend cap for every paid campaign.
 12. Probe SSH with `BatchMode=yes`, `PasswordAuthentication=no`, one connection attempt, and a short timeout. Never allow an unattended password prompt to consume paid time.
 13. Apply an independent attempt runtime ceiling. The canonical default is 20 minutes. Use the earlier of the runtime ceiling and the dollar-derived deadline.
+14. Treat the dollar budget as a fail-closed local target, not a provider-enforced absolute cap. The provider-scheduled runtime deadline is the independent backstop because the authoritative Pod rate arrives only after creation.
 
 ## Image and CUDA compatibility
 
@@ -94,22 +95,14 @@ RunPod injects account SSH keys at Pod creation. Prefer one dedicated persistent
    before reload is not persistence evidence.
 4. Create the Pod.
 5. Pin the host key in a task-specific `known_hosts` file.
-6. Confirm the local provider-deletion watchdog remains active. Start a Pod-side watchdog as the first remote command only when the Pod already has provider deletion authority.
+6. Confirm the local provider-deletion watchdog remains active. Do not create a Pod-side watchdog or send provider authority to the Pod.
 7. During teardown, retain a `persistent_service` key. Remove and delete only a `task_scoped` key, then verify all unrelated account keys remain.
 
 On Windows, grant the task owner deletion permission on a task-scoped private key. A read/write-only ACL can make teardown unable to delete it. Verify that both task-scoped key files are absent after teardown. Do not apply this deletion step to the persistent service identity.
 
-Example watchdog for a 20-minute attempt:
-
-```bash
-nohup bash -lc 'sleep 1200; runpodctl pod delete "$RUNPOD_POD_ID" || kill 1' \
-  >/workspace/pte-watchdog.log 2>&1 &
-```
-
-Do not assume that a REST-created Pod exports `RUNPOD_POD_ID`. Bind every watchdog to the literal Pod ID returned by the create response. Keep provider credentials on the trusted local machine. A local watchdog must call the provider delete API after its short deadline and record whether it deleted an active Pod or found it absent. If the Pod already exposes authenticated provider deletion, verify that authority without printing it and add a Pod-side watchdog. If Pod-side authenticated deletion is unavailable, do not transmit an account API key into the Pod and do not treat `kill 1` as sufficient because the provider may restart a Pod whose desired state remains `RUNNING`.
-
-Immediately after the create receipt becomes durable, launch the canonical local
-watchdog from the trusted workstation:
+The canonical attempt runner launches the local watchdog from the trusted
+workstation after durable intent and before provider create. The standalone
+command exists for recovery and inspection:
 
 ```powershell
 pte runpod watchdog `
@@ -119,8 +112,8 @@ pte runpod watchdog `
 ```
 
 The command reads `PTE_REMOTE_RUNPOD_ALL` from the process environment or local
-`.env`, reads the literal Pod ID and absolute deletion deadline from the create
-journal, and starts a detached local worker. It never places the API key in the
+`.env`, reads the deterministic Pod name or literal Pod ID and absolute deletion
+deadline from the create journal, and starts a detached local worker. It never places the API key in the
 child command or an artifact, and it excludes unrelated environment secrets from
 the child. If the absolute deadline is already too close, the launcher deletes
 and verifies the Pod synchronously instead of racing an `armed` receipt against
@@ -134,47 +127,17 @@ error type. Do not hand-write another task-local watchdog.
 
 ## Source delivery contract
 
-Choose one source-delivery mode before allocation and record it in the attempt plan.
-
-### Allowlist bundle mode
-
-The benchmark bundle contains only:
-
-- `src/`
-- `post_train_engine/`
-- `scripts/`
-- `configs/`
-- `requirements/`
-- `pyproject.toml`
-- `uv.lock`
-- `README.md`
-
-Exclude `__pycache__`, `*.pyc`, `.pytest_cache`, `.env*`, `.git`, `tests`, `docs`, `runs`, and local artifacts. List every archive member and reject the bundle if any forbidden path appears. Record its byte count, member count, and SHA-256 before upload. Verify the remote SHA-256 after upload.
-
-### Exact Git commit mode
-
-Use Git only when the reviewed source exists in a reachable remote repository. A local commit without a configured and verified remote is not deliverable through this mode.
+Use only an exact public Git commit. A local commit without a matching public
+`main` ref is not deliverable through this path.
 
 1. Require a clean worktree after the reviewed commit.
 2. Record the local commit with `git rev-parse HEAD`.
 3. Push that exact commit through the user-approved remote and branch workflow before allocating a Pod.
-4. On the Pod, authenticate with a user-supplied ephemeral credential. Never embed a token in a clone URL, command history, config file, or Run artifact.
-5. Clone or fetch the repository, then run `git checkout --detach <expected-sha>`.
-6. Require `git rev-parse HEAD` to equal the expected full SHA before installation or execution.
-7. Remove the ephemeral credential during teardown. Do not persist it in the image or volume.
+4. Clone the public repository without credentials, then run `git checkout --detach <expected-sha>`.
+5. Require `git rev-parse HEAD` to equal the expected full SHA and require a clean checkout before installation or execution.
 
-The execution environment must permit the chosen credential transport. Do not infer this permission from the user's approval or from a successful local Git check. If direct PAT transmission is prohibited, use a repository-scoped, read-only GitHub deploy key with SSH agent forwarding:
-
-1. Generate the deploy key outside the repository.
-2. Ask the repository owner to register only its public key with write access disabled.
-3. Verify the exact remote commit locally with that key.
-4. Keep the private key on the trusted local machine and load it into a task-local SSH agent.
-5. Connect to the Pod with agent forwarding and clone through the forwarded agent. Never copy the deploy private key to the Pod.
-6. Remove the deploy key from GitHub and delete the local private key during teardown.
-
-Prove that agent forwarding works before allocation when the environment permits a non-billable test. Otherwise treat the first paid connection as a fail-fast gate and delete immediately on failure.
-
-Treat branch names and tags as discovery aids, not execution identity. Only the detached full commit SHA certifies the source. If the remote is private, the user must explicitly approve that repository and trust boundary.
+Treat branch names and tags as discovery aids, not execution identity. Only the
+detached full commit SHA certifies the source.
 
 ## Remote execution order
 
@@ -183,10 +146,10 @@ It is a one-step non-certifying smoke. The repository intentionally ships no
 300-step paid default. Generate any full certifying config only after claiming a
 fenced campaign proposal and binding provider billing settlement.
 
-1. Start the watchdog.
-2. Deliver source through the selected mode. Verify the bundle hash or exact detached Git SHA.
+1. Verify exact local and public source identity before loading the provider credential.
+2. Persist create intent, arm the name-based local watchdog, and submit one create request with provider-scheduled termination.
 3. Enter a new work directory that contains only the verified source.
-4. Run `python src/post_train_engine/runpod_preflight.py --constraints-only` directly so this stdlib-only gate works before project dependencies exist. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
+4. Run `python src/post_train_engine/runpod_preflight.py --constraints-only` directly so this stdlib-only gate works before project dependencies exist. Before installing anything, require CUDA, exactly two GPUs, and `A40` in both device names. Record the image-provided Torch version and CUDA build. Install the frozen non-Torch environment with `python -m pip install -r requirements/runpod.txt`, then install the repository without dependency resolution using `python -m pip install --no-deps -e ".[rlvr]"`. Require the Torch version and CUDA build to remain unchanged.
 5. Run `python scripts/check_cuda_stack.py --config <config-path>`.
 6. Load every RunPod config with `load_runpod_grpo_config`.
 7. Confirm the distributed topology with `accelerate env` and a two-rank CUDA probe.
@@ -199,12 +162,12 @@ Prepare the immutable attempt only after the reviewed commit is pushed:
 ```powershell
 pte runpod plan `
   --config configs/gsm8k_runpod_smoke.yaml `
-  --out artifacts/runpod/<attempt>/runpod_plan.json `
+  --out artifacts/runpod/plans/<attempt>.json `
   --command "accelerate launch --num_processes 2 -m post_train_engine.cli run --config configs/gsm8k_runpod_r4.yaml --no-env" `
   --dry-run
 
 pte runpod attempt prepare `
-  --plan artifacts/runpod/<attempt>/runpod_plan.json `
+  --plan artifacts/runpod/plans/<attempt>.json `
   --attempt-dir artifacts/runpod/<attempt> `
   --repo-url https://github.com/shannan-liu1/post-train-engine.git `
   --commit-sha <full-reviewed-sha> `
@@ -213,7 +176,8 @@ pte runpod attempt prepare `
   --max-runtime-seconds 1200
 ```
 
-`prepare` is local-only. Inspect `attempt.json`. Paid execution requires a second,
+`prepare` is local-only. It copies the hashed plan into the otherwise empty attempt
+directory. Inspect `plan.json` and `attempt.json`. Paid execution requires a second,
 exact spend confirmation and the persistent service private key:
 
 ```powershell
@@ -224,11 +188,20 @@ pte runpod attempt execute `
 ```
 
 The attempt runner rejects any active Pod before creation. It starts the local
-watchdog before SSH, verifies a detached public Git SHA, preserves image Torch,
+watchdog before provider create, rehashes the frozen plan and referenced config,
+verifies a detached public Git SHA, preserves image Torch,
 runs the remote preflight and two-rank CUDA probe, runs R4 first, runs GRPO only
-after certification with at least seven minutes remaining, downloads bounded
+after certification with at least nine minutes remaining, downloads bounded
 evidence, and deletes in `finally`. A lost delete response triggers provider
-absence reconciliation instead of a second blind mutation.
+absence reconciliation instead of a second blind mutation. Teardown requires two
+consecutive provider-absence observations and rejects any unexpected active Pod.
+
+The runner refuses bootstrap unless the full bootstrap, R4, evidence, and teardown
+reserve remains. It rechecks the R4 reserve after bootstrap, caps evidence at
+256 MiB before SCP, pins the first SSH endpoint and host-key bytes across resume,
+and holds one atomic execution lock. If a process dies and leaves that ignored lock,
+remove it only after provider inventory proves zero active Pods or the provider
+termination deadline has elapsed.
 
 Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 

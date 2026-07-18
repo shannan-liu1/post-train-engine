@@ -54,7 +54,7 @@ Files and interfaces:
 
 - Create `src/post_train_engine/run_bundle.py` with `RunManifest`, `ArtifactRef`, `SourceIdentity`, `RunBundle`, and finalization helpers.
 - Modify `src/post_train_engine/artifacts.py`, `src/post_train_engine/reports.py`, `src/post_train_engine/diagnostics.py`, and lifecycle planning to use RunBundle.
-- Add schema-version compatibility readers for current local and API fixtures.
+- Reject unknown manifest schemas through the one canonical reader.
 
 First RED test:
 
@@ -68,7 +68,7 @@ Further cycles:
 1. Reject path traversal outside the run root for local relative artifacts.
 2. Record source clean state, tracked diff hash, and untracked source hash.
 3. Reject requested dataset revisions that do not match resolved revisions.
-4. Read existing manifest schemas into one normalized view.
+4. Reject legacy manifest schemas with an actionable new-run instruction.
 5. Finalize atomically and resume an interrupted finalization without duplicating side effects.
 
 ## Foundation Slice 2: Sealed Evaluation And Promotion
@@ -78,7 +78,7 @@ Files and interfaces:
 - Extend task split schemas with canonical SplitRoles.
 - Make all evaluation paths emit canonical EvalArtifacts.
 - Route API and RunPod decisions through `decide_promotion()`.
-- Persist PromotionSuiteState in the RunBundle and campaign index.
+- Persist suite exposure and rotation state in the canonical CampaignStore.
 
 First RED test:
 
@@ -174,7 +174,7 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after canonical runtime certification, repository deletion, and paid-attempt orchestration pass: 324 tests pass.
+- [x] Full tests and Ruff pass after canonical runtime certification, repository deletion, and paid-attempt orchestration pass: 365 tests pass.
 - [x] API and RunPod consequential resolution enter the typed RunEngine `resolve` phase before the immutable RunPlan and adapter stages.
 - [x] R4 runs through `pte run` as a non-training RunEngine adapter and records runtime evidence without model-promotion authority.
 - [x] Repository-wide deletion pass removed dead model/eval execution, inert configs, broad root exports, superseded planning text, and unused direct dependencies.
@@ -200,7 +200,7 @@ The previous Pod's provider charge settled at `$0.12157369661144912`, bringing
 cumulative settled campaign spend to `$0.5037198807985988`. The next attempt has
 at most `$0.9962801192014012` of the original `$1.50` authorization before its
 reserve and independently stops after 20 minutes. The RunPod account currently
-shows zero active Pods, a `$27.62` balance, and Secure A40 stock at `$0.44/hour`.
+last showed zero active Pods, a `$27.62` balance, and Secure A40 stock at `$0.44/hour` before this local-only review. Treat all three provider values as stale until the next explicitly authorized preflight.
 The user generated the replacement `pte-runpod` private key outside the workspace.
 RunPod retained its public half alongside the two existing keys after a full Settings
 reload. The workspace sandbox cannot read the private key, so the paid launcher must
@@ -209,7 +209,7 @@ prerequisite is satisfied; no local review or prepared attempt grants paid autho
 
 ## Risks And Escape Hatches
 
-- Risk: compatibility migrations may expand scope. Escape hatch: normalize legacy manifests at read time while writing only the canonical schema.
+- Risk: compatibility migrations may expand scope. Boundary: reject legacy manifests with an actionable new-run instruction. Do not add a second reader.
 - Risk: strict promotion requirements may block existing smoke fixtures. Escape hatch: use explicit non-certifying smoke states that can never promote.
 - Risk: SQLite work may precede stable domain contracts. Escape hatch: complete portable RunBundle and RunEngine first.
 - Risk: RunPod integration cannot be fully exercised locally. Escape hatch: require adapter contract tests with injected fakes and preserve one explicit remote verification gate.
