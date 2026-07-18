@@ -67,6 +67,11 @@ uv run pte run --config configs/gsm8k_api_smoke.yaml --env .env
 
 Follow the fail-closed [RunPod deployment contract](docs/runpod_deployment.md) before creating a Pod. In particular, the allocation request must pin an `allowedCudaVersions` value compatible with the configured image.
 
+Use `pte runpod attempt prepare` to freeze the exact public Git SHA, allocation,
+R4-first command, cumulative settled spend, and 20-minute runtime ceiling without
+contacting RunPod. `pte runpod attempt execute` requires an exact matching spend
+confirmation and owns create, watchdog, SSH, evidence download, and deletion.
+
 Run the preflight inside the target image before spending a training budget:
 
 ```bash

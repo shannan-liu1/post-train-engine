@@ -174,11 +174,12 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after canonical runtime certification and repository deletion pass: 313 tests pass.
+- [x] Full tests and Ruff pass after canonical runtime certification, repository deletion, and paid-attempt orchestration pass: 324 tests pass.
 - [x] API and RunPod consequential resolution enter the typed RunEngine `resolve` phase before the immutable RunPlan and adapter stages.
 - [x] R4 runs through `pte run` as a non-training RunEngine adapter and records runtime evidence without model-promotion authority.
 - [x] Repository-wide deletion pass removed dead model/eval execution, inert configs, broad root exports, superseded planning text, and unused direct dependencies.
 - [x] Two fresh-eyes passes found and fixed allocation, billing, identity, dependency, runtime-certification, preflight, and provider-handle defects; the final targeted and full gates pass.
+- [x] The RunPod attempt layer enforces a receipt-anchored 20-minute ceiling across resumes, zero active Pods, exact R4-first execution, immediate watchdog arming, batch-mode SSH, bounded evidence retrieval, verified deletion, and two-observation billing settlement.
 
 The adversarial review reopened production certification at the promotion-contract,
 sealed-evidence, replay-lineage, receipt-idempotency, campaign-wiring, lease-fencing,
@@ -194,6 +195,17 @@ user authorization, select exactly one source-delivery mode from
 `docs/runpod_deployment.md`, and bind the CUDA allocation filter to the chosen image.
 The retry must use `configs/gsm8k_runpod_r4.yaml` through `pte run`, not a standalone script.
 No local review or commit authorizes a second RunPod action.
+
+The previous Pod's provider charge settled at `$0.12157369661144912`, bringing
+cumulative settled campaign spend to `$0.5037198807985988`. The next attempt has
+at most `$0.9962801192014012` of the original `$1.50` authorization before its
+reserve and independently stops after 20 minutes. The RunPod account currently
+shows zero active Pods, a `$27.62` balance, and Secure A40 stock at `$0.44/hour`.
+The user generated the replacement `pte-runpod` private key outside the workspace.
+RunPod retained its public half alongside the two existing keys after a full Settings
+reload. The workspace sandbox cannot read the private key, so the paid launcher must
+consume its path without inspecting or serializing its contents. The identity
+prerequisite is satisfied; no local review or prepared attempt grants paid authority.
 
 ## Risks And Escape Hatches
 

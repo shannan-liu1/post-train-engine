@@ -16,6 +16,7 @@ Read this file before creating any RunPod Pod. Treat every check as fail closed.
 10. Prove the exact private-repository authentication mechanism before renting. A local authenticated `git ls-remote` proves repository access, but it does not prove that the execution environment permits transmitting that credential to a Pod.
 11. Use `RunPodAllocationPolicy` and `RunPodBudget`. Supply settled campaign spend before creation. The checked-in allocation policy permits Secure Cloud, exactly two A40s, 40 GB ephemeral container disk, zero persistent volume, and SSH only. It does not grant standing authorization. Obtain a new explicit total spend cap for every paid campaign.
 12. Probe SSH with `BatchMode=yes`, `PasswordAuthentication=no`, one connection attempt, and a short timeout. Never allow an unattended password prompt to consume paid time.
+13. Apply an independent attempt runtime ceiling. The canonical default is 20 minutes. Use the earlier of the runtime ceiling and the dollar-derived deadline.
 
 ## Image and CUDA compatibility
 
@@ -84,7 +85,7 @@ Choose `SECURE` or `COMMUNITY` deliberately. Repository upload approval must cov
 
 RunPod injects account SSH keys at Pod creation. Prefer one dedicated persistent service identity for repeated Codex operations. A task-scoped identity is optional and temporary. Register either identity before creating the Pod.
 
-1. Generate or select one dedicated private key outside the workspace. Record whether its lifecycle is `persistent_service` or `task_scoped`.
+1. Generate or select one dedicated private key outside the workspace. Record whether its lifecycle is `persistent_service` or `task_scoped`. Prefer operator-generated keys when the private half must remain outside the agent-readable workspace. Automation may consume the key path through SSH, but it must never read, print, copy, or serialize the private-key contents.
 2. Restrict its Windows ACL so OpenSSH accepts it.
 3. Add its public key to the existing RunPod account keys without replacing unrelated keys.
    In the RunPod console, expand the SSH public keys accordion before editing.
@@ -117,7 +118,7 @@ pte runpod watchdog `
   --log artifacts/runpod/<attempt>/watchdog.log
 ```
 
-The command reads `RUNPOD_API_KEY` from the process environment or the local
+The command reads `PTE_REMOTE_RUNPOD_ALL` from the process environment or local
 `.env`, reads the literal Pod ID and absolute deletion deadline from the create
 journal, and starts a detached local worker. It never places the API key in the
 child command or an artifact, and it excludes unrelated environment secrets from
@@ -177,7 +178,7 @@ Treat branch names and tags as discovery aids, not execution identity. Only the 
 
 ## Remote execution order
 
-The repository ships one executable paid config: `configs/gsm8k_runpod_smoke.yaml`.
+The repository ships one executable paid training config: `configs/gsm8k_runpod_smoke.yaml`.
 It is a one-step non-certifying smoke. The repository intentionally ships no
 300-step paid default. Generate any full certifying config only after claiming a
 fenced campaign proposal and binding provider billing settlement.
@@ -192,6 +193,42 @@ fenced campaign proposal and binding provider billing settlement.
 8. Launch R4 only through `accelerate launch --num_processes 2 -m post_train_engine.cli run --config configs/gsm8k_runpod_r4.yaml --no-env`. Confirm its canonical RunManifest reports `runtime_certified: true` before any GRPO smoke.
 9. Require exit code zero, exact output parity, paired ABBA trials, conservative `speedup >= 1.05`, and `certifying: true` under benchmark schema v3. The current candidate isolates model reuse with scalar tensor shapes. Do not re-enable batching until a separate exact-contract experiment proves output equivalence.
 10. Download the JSON artifact and logs before teardown.
+
+Prepare the immutable attempt only after the reviewed commit is pushed:
+
+```powershell
+pte runpod plan `
+  --config configs/gsm8k_runpod_smoke.yaml `
+  --out artifacts/runpod/<attempt>/runpod_plan.json `
+  --command "accelerate launch --num_processes 2 -m post_train_engine.cli run --config configs/gsm8k_runpod_r4.yaml --no-env" `
+  --dry-run
+
+pte runpod attempt prepare `
+  --plan artifacts/runpod/<attempt>/runpod_plan.json `
+  --attempt-dir artifacts/runpod/<attempt> `
+  --repo-url https://github.com/shannan-liu1/post-train-engine.git `
+  --commit-sha <full-reviewed-sha> `
+  --target-spend-usd 1.5 `
+  --settled-spend-usd 0.5037198807985988 `
+  --max-runtime-seconds 1200
+```
+
+`prepare` is local-only. Inspect `attempt.json`. Paid execution requires a second,
+exact spend confirmation and the persistent service private key:
+
+```powershell
+pte runpod attempt execute `
+  --attempt artifacts/runpod/<attempt>/attempt.json `
+  --ssh-private-key <absolute-service-key-path> `
+  --confirm-spend-cap-usd 1.5
+```
+
+The attempt runner rejects any active Pod before creation. It starts the local
+watchdog before SSH, verifies a detached public Git SHA, preserves image Torch,
+runs the remote preflight and two-rank CUDA probe, runs R4 first, runs GRPO only
+after certification with at least seven minutes remaining, downloads bounded
+evidence, and deletes in `finally`. A lost delete response triggers provider
+absence reconciliation instead of a second blind mutation.
 
 Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 
@@ -213,6 +250,17 @@ Billing settlement requires two matching provider observations. Record the first
 nonempty amount as provisional. After Pod absence is verified, query again with an
 explicit end time. Settle only when the second amount matches the durable first
 observation. A first nonempty billing response is never final evidence.
+
+Use the canonical settlement command for both observations:
+
+```powershell
+pte runpod attempt settle --journal <operation.json> --pod-id <id> `
+  --start-time <iso-time> --out <billing-receipt.json>
+
+pte runpod attempt settle --journal <operation.json> --pod-id <id> `
+  --start-time <iso-time> --end-time <iso-time> --final `
+  --out <billing-receipt.json>
+```
 
 ## Failures already observed
 
