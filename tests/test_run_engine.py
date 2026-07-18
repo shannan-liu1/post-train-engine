@@ -7,6 +7,8 @@ from threading import Barrier, BrokenBarrierError, Lock
 
 import pytest
 
+import post_train_engine.engine as engine_module
+
 from post_train_engine.engine import (
     ADAPTER_STAGE_ORDER,
     CANONICAL_STAGE_ORDER,
@@ -115,7 +117,9 @@ def _eval_contract(
         suite_id=suite_id,
         suite_version=suite_version,
         example_ids=example_ids,
-        example_content=[{"id": value, "prompt": f"prompt:{value}"} for value in example_ids],
+        example_content=[
+            {"id": value, "prompt": f"prompt:{value}"} for value in example_ids
+        ],
         prompt_contract={"template": "fixture-v1"},
         verifier_contract={"verifier": "exact-match-v1"},
         generation_contract={"temperature": 0.0},
@@ -176,9 +180,7 @@ def test_run_plan_rejects_promotion_rows_outside_eval_contract(tmp_path: Path) -
 def test_run_plan_rejects_separation_certificate_count_mismatch(
     tmp_path: Path,
 ) -> None:
-    raw = _fixture_plan(tmp_path / "separation-count-mismatch").model_dump(
-        mode="json"
-    )
+    raw = _fixture_plan(tmp_path / "separation-count-mismatch").model_dump(mode="json")
     raw["content_separation"] = ContentSeparationCertificate(
         training_count=1,
         protected_count=2,
@@ -193,6 +195,37 @@ def test_run_plan_rejects_separation_certificate_count_mismatch(
     ).model_dump(mode="json")
 
     with pytest.raises(ValueError, match="content separation counts"):
+        RunPlan.model_validate(raw)
+
+
+def test_run_engine_requires_canary_evidence_when_plan_declares_canaries(
+    tmp_path: Path,
+) -> None:
+    raw = _fixture_plan(tmp_path / "canary-evidence").model_dump(mode="json")
+    raw["canary_example_ids"] = ["canary-1"]
+    raw["canary_evaluation_contract"] = (
+        _eval_contract(
+            ("canary-1",),
+            suite_id="fixture-canary",
+        )
+        .model_copy(update={"role": "canary"})
+        .model_dump(mode="json")
+    )
+    raw["content_separation"]["protected_count"] = 3
+    plan = RunPlan.model_validate(raw)
+
+    with pytest.raises(ValueError, match="canary_eval"):
+        _execute(plan, FakeStageAdapter())
+
+
+def test_run_plan_requires_canary_contract_for_declared_canaries(
+    tmp_path: Path,
+) -> None:
+    raw = _fixture_plan(tmp_path / "canary-contract").model_dump(mode="json")
+    raw["canary_example_ids"] = ["canary-1"]
+    raw["content_separation"]["protected_count"] = 3
+
+    with pytest.raises(ValueError, match="canary evaluation contract"):
         RunPlan.model_validate(raw)
 
 
@@ -453,9 +486,7 @@ def test_run_engine_owns_resolution_before_adapter_stages(tmp_path: Path) -> Non
     assert [receipt.stage for receipt in execution.stage_receipts] == list(
         CANONICAL_STAGE_ORDER
     )
-    assert execution.stage_receipts[0].output.values == {
-        "dataset_resolution": "exact"
-    }
+    assert execution.stage_receipts[0].output.values == {"dataset_resolution": "exact"}
     assert adapter.calls == list(ADAPTER_STAGE_ORDER)
     assert "stage_receipt_resolve" in execution.manifest.artifacts
 
@@ -494,12 +525,14 @@ def test_run_engine_rejects_substituted_evaluation_rows(tmp_path: Path) -> None:
         _execute(plan, SubstitutedEvaluationRowsAdapter())
 
 
-def test_report_rejects_mutated_artifact_instead_of_consuming_it(tmp_path: Path) -> None:
+def test_report_rejects_mutated_artifact_instead_of_consuming_it(
+    tmp_path: Path,
+) -> None:
     plan = _fixture_plan(tmp_path / "mutated-report-artifact")
     execution = _execute(plan, FakeStageAdapter())
-    decision = Path(plan.output_dir) / execution.manifest.artifacts[
-        "promotion_decision"
-    ].path
+    decision = (
+        Path(plan.output_dir) / execution.manifest.artifacts["promotion_decision"].path
+    )
     decision.write_text('{"decision":"promote"}', encoding="utf-8")
 
     with pytest.raises(ValueError, match="hash mismatch"):
@@ -595,8 +628,7 @@ def test_non_certifying_smoke_can_never_promote(tmp_path: Path) -> None:
     assert execution.manifest.status == "rejected"
     assert execution.manifest.metadata["certification_mode"] == "non_certifying_smoke"
     decision_path = (
-        Path(plan.output_dir)
-        / execution.manifest.artifacts["promotion_decision"].path
+        Path(plan.output_dir) / execution.manifest.artifacts["promotion_decision"].path
     )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["decision"] == "reject"
@@ -631,6 +663,22 @@ def test_run_engine_rejects_mutated_receipt_artifact_on_resume(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="artifact hash mismatch"):
         _execute(plan, FailingStageAdapter())
+
+
+def test_run_engine_rejects_artifact_mutated_by_later_stage(tmp_path: Path) -> None:
+    plan = _fixture_plan(tmp_path / "mutated-during-run")
+
+    class MutatingAdapter(FakeStageAdapter):
+        def execute_stage(self, stage, current_plan, prior):
+            output = super().execute_stage(stage, current_plan, prior)
+            if stage == "finalize":
+                (
+                    Path(current_plan.output_dir) / "artifacts" / "prepare.json"
+                ).write_text('{"stage":"tampered"}', encoding="utf-8")
+            return output
+
+    with pytest.raises(ValueError, match="artifact hash mismatch"):
+        _execute(plan, MutatingAdapter())
 
 
 def test_run_engine_rejects_legacy_receipt_with_actionable_new_run_id(
@@ -766,7 +814,63 @@ def test_run_engine_propagates_distributed_stage_failure_without_deadlock(
     assert bundle.validate()["status"] == "ok"
 
 
-def test_run_engine_bounds_wait_when_distributed_peer_disappears(tmp_path: Path) -> None:
+def test_run_engine_propagates_writer_receipt_failure_without_deadlock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = _fixture_plan(tmp_path / "distributed-receipt-failure").model_dump(
+        mode="json"
+    )
+    raw["distributed_timeout_seconds"] = 2.0
+    plan = RunPlan.model_validate(raw)
+    barrier = Barrier(2)
+    errors: dict[int, str] = {}
+    lock = Lock()
+    original_write = engine_module._write_model_atomic
+
+    def fail_prepare_receipt(path: Path, model: object) -> None:
+        if path.name == "prepare.json":
+            raise OSError("receipt disk full")
+        original_write(path, model)
+
+    monkeypatch.setattr(engine_module, "_write_model_atomic", fail_prepare_receipt)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        main_future = pool.submit(
+            _execute,
+            plan,
+            FakeStageAdapter(),
+            coordinator=ThreadCoordinator(
+                is_main_process=True,
+                rank=0,
+                barrier=barrier,
+                errors=errors,
+                lock=lock,
+            ),
+        )
+        worker_future = pool.submit(
+            _execute,
+            plan,
+            WorkerStageAdapter(),
+            coordinator=ThreadCoordinator(
+                is_main_process=False,
+                rank=1,
+                barrier=barrier,
+                errors=errors,
+                lock=lock,
+            ),
+        )
+        with pytest.raises(OSError, match="receipt disk full"):
+            main_future.result(timeout=20)
+        with pytest.raises(
+            RuntimeError, match="receipt persistence.*receipt disk full"
+        ):
+            worker_future.result(timeout=20)
+
+
+def test_run_engine_bounds_wait_when_distributed_peer_disappears(
+    tmp_path: Path,
+) -> None:
     raw = _fixture_plan(tmp_path / "missing-peer").model_dump(mode="json")
     raw["distributed_timeout_seconds"] = 0.01
     plan = RunPlan.model_validate(raw)
@@ -986,9 +1090,7 @@ def test_run_engine_stages_provider_billing_before_campaign_promotion(
             estimated_cost_usd=0.5,
         )
     )
-    lease = campaign.claim_proposal(
-        proposal_id, worker_id="worker-1", ttl_seconds=60
-    )
+    lease = campaign.claim_proposal(proposal_id, worker_id="worker-1", ttl_seconds=60)
     assert lease is not None
     raw = _fixture_plan(tmp_path / "provider-billing").model_dump(mode="json")
     raw["certification_mode"] = "certifying"

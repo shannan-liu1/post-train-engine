@@ -80,6 +80,10 @@ class WrongHandleProvider(RecoverableProvider):
         )
 
 
+class ReplaySafeProvider(NonReplayableProvider):
+    recovery_policy = "replay_safe"
+
+
 def test_resume_reconciles_completed_provider_operation_without_resubmission(
     tmp_path: Path,
 ) -> None:
@@ -153,3 +157,27 @@ def test_ambiguous_non_replayable_operation_fails_without_resubmission(
         )
 
     assert provider.submission_count == 1
+
+
+def test_resume_rejects_changed_provider_recovery_policy(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    original = NonReplayableProvider()
+    request = JobRequest(
+        job_id="run-1:adapt",
+        job_type="candidate_adaptation",
+        provider_id=original.provider_id,
+        payload={"candidate_id": "candidate-1"},
+    )
+    with pytest.raises(KeyboardInterrupt):
+        execute_provider_operation(
+            provider=original,
+            store=CrashBeforeResultStore(run_dir),
+            request=request,
+        )
+
+    with pytest.raises(ValueError, match="recovery policy differs"):
+        execute_provider_operation(
+            provider=ReplaySafeProvider(),
+            store=ArtifactStore(run_dir, resume=True),
+            request=request,
+        )

@@ -14,6 +14,7 @@ import yaml
 from post_train_engine.cli.main import main
 from post_train_engine.artifact_store import ArtifactStore
 from post_train_engine.engine import CANONICAL_STAGE_ORDER
+from post_train_engine.evals.contract import hash_example_ids
 from post_train_engine.run_bundle import RunBundle
 from post_train_engine.runpod_grpo import (
     DistributedContext,
@@ -22,14 +23,15 @@ from post_train_engine.runpod_grpo import (
     _as_batch,
     _candidate_checkpoint_refs,
     _checkpoint_score,
+    _compile_runpod_plan,
     _filter_trl_config_kwargs,
+    _gather_eval_rows,
     _grpo_config_kwargs,
     _evaluate_hf_model,
     _gsm8k_reward_func,
     _load_and_split_dataset,
     _select_checkpoint,
     _shard_sequence,
-    _validate_hf_upload_config,
     _validate_launch_topology,
     _validate_grpo_runtime_shape,
     _write_dataset_artifacts,
@@ -39,6 +41,7 @@ from post_train_engine.runpod_grpo import (
 )
 from post_train_engine.runtime_evidence import RuntimePairEvidence
 from post_train_engine.tasks.gsm8k import GSM8KExample
+from post_train_engine.traces.schema import TraceRecord, stable_prompt_hash
 
 
 def test_evaluator_preserves_order_for_a_batch_invariant_model(
@@ -100,7 +103,9 @@ def test_evaluator_preserves_order_for_a_batch_invariant_model(
         def from_pretrained(*_args, **_kwargs):
             return FakeModel()
 
-    monkeypatch.setattr(runpod_module, "_load_tokenizer", lambda *_args, **_kwargs: FakeTokenizer())
+    monkeypatch.setattr(
+        runpod_module, "_load_tokenizer", lambda *_args, **_kwargs: FakeTokenizer()
+    )
     monkeypatch.setitem(
         sys.modules,
         "transformers",
@@ -118,8 +123,12 @@ def test_evaluator_preserves_order_for_a_batch_invariant_model(
         )
         for value in (2, 4, 6, 8)
     ]
-    scalar = cfg.model_copy(update={"eval": cfg.eval.model_copy(update={"batch_size": 1})})
-    batched = cfg.model_copy(update={"eval": cfg.eval.model_copy(update={"batch_size": 3})})
+    scalar = cfg.model_copy(
+        update={"eval": cfg.eval.model_copy(update={"batch_size": 1})}
+    )
+    batched = cfg.model_copy(
+        update={"eval": cfg.eval.model_copy(update={"batch_size": 3})}
+    )
 
     scalar_rows = _evaluate_hf_model(
         cfg=scalar,
@@ -228,7 +237,18 @@ def test_r4_config_rejects_absolute_source_and_grpo_output_collision(
     body["source_config"] = str(source_config.resolve())
     runtime_config.write_text(yaml.safe_dump(body), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="source_config must be relative"):
+    with pytest.raises(ValueError, match="source_config must be a sibling filename"):
+        main(["run", "--config", str(runtime_config), "--no-env"])
+
+
+def test_r4_config_rejects_parent_source_traversal(tmp_path: Path) -> None:
+    source_config = _write_config(tmp_path)
+    runtime_config = _write_runtime_config(tmp_path, source_config)
+    body = yaml.safe_load(runtime_config.read_text(encoding="utf-8"))
+    body["source_config"] = "../outside.yaml"
+    runtime_config.write_text(yaml.safe_dump(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_config must be a sibling filename"):
         main(["run", "--config", str(runtime_config), "--no-env"])
 
     source = load_runpod_grpo_config(source_config)
@@ -277,6 +297,32 @@ def test_runpod_grpo_builds_policy_lineage_training_view(tmp_path: Path) -> None
     assert view.metadata["selected_example_ids"] == [train[0].id]
 
 
+def test_runpod_plan_canonicalizes_promotion_order(tmp_path: Path) -> None:
+    cfg = load_runpod_grpo_config(_write_config(tmp_path))
+    train, selection, promotion = _load_and_split_dataset(cfg)
+    reversed_promotion = list(reversed(promotion))
+
+    plan = _compile_runpod_plan(
+        cfg,
+        dist=DistributedContext(world_size=2, rank=0, local_rank=0),
+        train_examples=train,
+        selection_examples=selection,
+        promotion_examples=reversed_promotion,
+    )
+
+    assert plan.promotion_example_ids == tuple(
+        sorted(row.id for row in reversed_promotion)
+    )
+    assert plan.evaluation_contract.example_ids_sha256 == hash_example_ids(
+        plan.promotion_example_ids
+    )
+    gathered = _gather_eval_rows(
+        [_eval_row("z", correct=True), _eval_row("a", correct=True)],
+        DistributedContext(),
+    )
+    assert [row.example_id for row in gathered] == ["a", "z"]
+
+
 def test_runpod_grpo_emits_non_training_outcome_without_parent_frontier(
     tmp_path: Path,
 ) -> None:
@@ -301,33 +347,21 @@ def test_runpod_grpo_emits_non_training_outcome_without_parent_frontier(
     assert outcome["outcome"] == "no_learnable_evidence"
 
 
-def test_runpod_lifecycle_fails_closed_on_ambiguous_remote_transaction(
+def test_runpod_config_rejects_adapter_side_effect_uploads(
     tmp_path: Path,
 ) -> None:
-    from post_train_engine.runpod_grpo import _finalize_lifecycle_if_configured
-
-    cfg = load_runpod_grpo_config(
-        _write_config(
-            tmp_path,
-            {
-                "hf_upload": {
-                    "enabled": True,
-                    "repo_id": "owner/repo",
-                    "token_env": "HF_TOKEN",
-                }
-            },
-        )
-    )
-    store = ArtifactStore(cfg.run.output_dir)
-    store.write_json("lifecycle/transaction.json", {"state": "started"})
-
-    with pytest.raises(ValueError, match="remote lifecycle transaction is ambiguous"):
-        _finalize_lifecycle_if_configured(
-            cfg=cfg,
-            store=store,
-            candidate={"candidate_id": "candidate", "model_id": "checkpoint"},
-            train_result={"metrics": {}},
-            decision={"decision": "reject"},
+    with pytest.raises(ValueError, match="hf_upload"):
+        load_runpod_grpo_config(
+            _write_config(
+                tmp_path,
+                {
+                    "hf_upload": {
+                        "enabled": True,
+                        "repo_id": "owner/repo",
+                        "token_env": "HF_TOKEN",
+                    }
+                },
+            )
         )
 
 
@@ -352,8 +386,7 @@ def test_runpod_config_derives_cuda_filter_from_image(
         {
             "execution": {
                 "container_image": (
-                    "runpod/pytorch:2.8.0-py3.11-cuda12.4.1-"
-                    "cudnn-devel-ubuntu22.04"
+                    "runpod/pytorch:2.8.0-py3.11-cuda12.4.1-cudnn-devel-ubuntu22.04"
                 )
             }
         },
@@ -408,9 +441,13 @@ def test_runpod_grpo_launch_topology_requires_accelerate_for_multi_gpu() -> None
     cfg = load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
 
     with pytest.raises(ValueError, match="requires accelerate launch"):
-        _validate_launch_topology(cfg, DistributedContext(world_size=1, rank=0, local_rank=0))
+        _validate_launch_topology(
+            cfg, DistributedContext(world_size=1, rank=0, local_rank=0)
+        )
 
-    _validate_launch_topology(cfg, DistributedContext(world_size=2, rank=0, local_rank=0))
+    _validate_launch_topology(
+        cfg, DistributedContext(world_size=2, rank=0, local_rank=0)
+    )
 
 
 def test_distributed_context_from_env_identifies_rank_zero(
@@ -432,7 +469,9 @@ def test_distributed_context_from_env_identifies_rank_zero(
 def test_eval_sharding_covers_examples_once_across_ranks() -> None:
     rows = list(range(17))
     shards = [
-        _shard_sequence(rows, DistributedContext(world_size=4, rank=rank, local_rank=rank))
+        _shard_sequence(
+            rows, DistributedContext(world_size=4, rank=rank, local_rank=rank)
+        )
         for rank in range(4)
     ]
 
@@ -496,7 +535,9 @@ def test_grpo_reward_function_captures_training_rollout_traces(tmp_path: Path) -
     trace_path = tmp_path / "traces" / "rank0.jsonl"
     reward = _gsm8k_reward_func(
         FakeTokenizer(),
-        config=load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml").training_reward_config(),
+        config=load_runpod_grpo_config(
+            "configs/gsm8k_runpod_smoke.yaml"
+        ).training_reward_config(),
         trace_path=trace_path,
         run_id="run-001",
         source_checkpoint="Qwen/Qwen2.5-0.5B-Instruct",
@@ -511,7 +552,9 @@ def test_grpo_reward_function_captures_training_rollout_traces(tmp_path: Path) -
     )
 
     assert len(rewards) == 2
-    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert [row["example_id"] for row in rows] == ["ex-1", "ex-1"]
     assert rows[0]["completion"] == "reasoning <answer>4</answer>"
     assert rows[0]["reward_components"]["task_reward"] == 1.0
@@ -521,7 +564,9 @@ def test_grpo_reward_function_captures_training_rollout_traces(tmp_path: Path) -
     assert rows[1]["verifier_result"]["correct"] is False
 
 
-def test_candidate_checkpoint_refs_include_sorted_checkpoints_and_final(tmp_path: Path) -> None:
+def test_candidate_checkpoint_refs_include_sorted_checkpoints_and_final(
+    tmp_path: Path,
+) -> None:
     train_dir = tmp_path / "train"
     for name in ("checkpoint-10", "checkpoint-2", "final"):
         path = train_dir / name
@@ -530,7 +575,11 @@ def test_candidate_checkpoint_refs_include_sorted_checkpoints_and_final(tmp_path
 
     refs = _candidate_checkpoint_refs(tmp_path)
 
-    assert [ref["checkpoint_id"] for ref in refs] == ["checkpoint-2", "checkpoint-10", "final"]
+    assert [ref["checkpoint_id"] for ref in refs] == [
+        "checkpoint-2",
+        "checkpoint-10",
+        "final",
+    ]
 
 
 def test_select_checkpoint_uses_metric_then_token_tie_breaker() -> None:
@@ -545,8 +594,16 @@ def test_select_checkpoint_uses_metric_then_token_tie_breaker() -> None:
 
     selection = _select_checkpoint(
         [
-            {"checkpoint_id": "checkpoint-1", "path": "train/checkpoint-1", "rows": rows_a},
-            {"checkpoint_id": "checkpoint-2", "path": "train/checkpoint-2", "rows": rows_b},
+            {
+                "checkpoint_id": "checkpoint-1",
+                "path": "train/checkpoint-1",
+                "rows": rows_a,
+            },
+            {
+                "checkpoint_id": "checkpoint-2",
+                "path": "train/checkpoint-2",
+                "rows": rows_b,
+            },
         ],
         metric="accuracy",
     )
@@ -560,23 +617,37 @@ def test_checkpoint_score_rejects_unknown_selection_metric() -> None:
         _checkpoint_score([_eval_row("a", correct=True)], "loss")
 
 
-def test_hf_upload_config_requires_token_only_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_hf_upload_config_cannot_be_enabled() -> None:
     cfg = load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
-    _validate_hf_upload_config(cfg)
-    enabled = cfg.model_copy(
-        update={
-            "hf_upload": cfg.hf_upload.model_copy(
-                update={"enabled": True, "repo_id": "user/post-train-gsm8k"}
-            )
-        }
-    )
+    raw = cfg.model_dump(mode="json")
+    raw["hf_upload"] = {
+        "enabled": True,
+        "repo_id": "user/post-train-gsm8k",
+    }
+    with pytest.raises(ValueError, match="hf_upload"):
+        RunPodGRPOConfig.model_validate(raw)
 
-    monkeypatch.delenv("PTE_REMOTE_HF_WRITE", raising=False)
-    with pytest.raises(ValueError, match="missing required HF token env"):
-        _validate_hf_upload_config(enabled)
 
-    monkeypatch.setenv("PTE_REMOTE_HF_WRITE", "hf_fake")
-    _validate_hf_upload_config(enabled)
+def test_runpod_grpo_trace_capture_cannot_be_disabled() -> None:
+    cfg = load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
+    raw = cfg.model_dump(mode="json")
+    raw["trace_capture"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="enabled"):
+        RunPodGRPOConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "trace_dir",
+    ["/tmp/traces", "../traces", r"rollouts\train", "C:/traces"],
+)
+def test_runpod_grpo_trace_capture_path_must_remain_in_run(trace_dir: str) -> None:
+    cfg = load_runpod_grpo_config("configs/gsm8k_runpod_smoke.yaml")
+    raw = cfg.model_dump(mode="json")
+    raw["trace_capture"]["train_trace_dir"] = trace_dir
+
+    with pytest.raises(ValueError, match="contained POSIX relative path"):
+        RunPodGRPOConfig.model_validate(raw)
 
 
 def test_runpod_hillclimb_fails_closed_without_cuda_but_writes_preflight_artifacts(
@@ -631,9 +702,7 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
         "_resolve_hub_revisions",
         lambda value: value.model_copy(
             update={
-                "model": value.model.model_copy(
-                    update={"resolved_revision": "a" * 40}
-                )
+                "model": value.model.model_copy(update={"resolved_revision": "a" * 40})
             }
         ),
     )
@@ -667,7 +736,7 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
 
     def fake_train_grpo(
         cfg: Any,
-        _view: Any,
+        view: Any,
         store: ArtifactStore | None,
         *,
         dist: DistributedContext,
@@ -676,6 +745,33 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
         checkpoint = Path(cfg.run.output_dir) / "train" / "final"
         checkpoint.mkdir(parents=True, exist_ok=True)
         (checkpoint / "model.safetensors").write_bytes(b"fixture")
+        selected_row = json.loads(
+            (store.run_dir / view.data_artifact.path)
+            .read_text(encoding="utf-8")
+            .splitlines()[0]
+        )
+        for rank in range(dist.world_size):
+            store.write_jsonl(
+                f"{cfg.trace_capture.train_trace_dir}/rank{rank}.jsonl",
+                [
+                    TraceRecord(
+                        trace_id=f"fixture-rank-{rank}",
+                        run_id=cfg.run.run_id,
+                        task_id="gsm8k",
+                        example_id=selected_row["example_id"],
+                        split_role="train",
+                        prompt_hash=stable_prompt_hash("fixture"),
+                        source_checkpoint=cfg.model.base_model_id,
+                        policy_version="fixture-step-0",
+                        policy_step=0,
+                        policy_step_evidence="exact",
+                        rollout_group_id=f"fixture-group-{rank}",
+                        generation_backend="fixture",
+                        sampling_config={"temperature": 1.0},
+                        verifier_id="gsm8k_numeric_v1",
+                    ).model_dump(mode="json")
+                ],
+            )
         return {
             "status": "trained",
             "metrics": {"train_loss": 0.0},
@@ -694,9 +790,7 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["metadata"]["stage_order"] == list(CANONICAL_STAGE_ORDER)
     assert {
-        name
-        for name in manifest["artifacts"]
-        if name.startswith("stage_receipt_")
+        name for name in manifest["artifacts"] if name.startswith("stage_receipt_")
     } == {f"stage_receipt_{stage}" for stage in CANONICAL_STAGE_ORDER}
     assert manifest["status"] == "rejected"
     assert manifest["metadata"]["certification_mode"] == "non_certifying_smoke"
@@ -708,6 +802,110 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
         "evaluate",
     }
     assert RunBundle.load(run_dir).validate()["status"] == "ok"
+    assert manifest["artifacts"]["policy_trace_rank0"]["path"] == (
+        "rollouts/train/rank0.jsonl"
+    )
+
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    policy_refs = {
+        name: ref
+        for name, ref in manifest["artifacts"].items()
+        if name.startswith("policy_trace_rank")
+    }
+    train_ref = manifest["artifacts"]["train_result"]
+    train_path = run_dir / train_ref["path"]
+    original_train = train_path.read_bytes()
+    train_body = json.loads(original_train)
+    train_body["distributed"]["world_size"] = 11
+    train_path.write_text(json.dumps(train_body), encoding="utf-8")
+    manifest["artifacts"]["train_result"]["sha256"] = (
+        "sha256:" + hashlib.sha256(train_path.read_bytes()).hexdigest()
+    )
+    rank_zero_path = run_dir / policy_refs["policy_trace_rank0"]["path"]
+    rank_zero_rows = [
+        json.loads(line)
+        for line in rank_zero_path.read_text(encoding="utf-8").splitlines()
+    ]
+    added_ranks = [rank for rank in range(1, 11) if f"policy_trace_rank{rank}" not in policy_refs]
+    for rank in added_ranks:
+        rank_path = run_dir / f"rollouts/train/rank{rank}.jsonl"
+        rank_rows = [
+            {**row, "trace_id": f"{row['trace_id']}:rank{rank}"}
+            for row in rank_zero_rows
+        ]
+        rank_path.write_text(
+            "\n".join(json.dumps(row) for row in rank_rows) + "\n",
+            encoding="utf-8",
+        )
+        manifest["artifacts"][f"policy_trace_rank{rank}"] = {
+            **policy_refs["policy_trace_rank0"],
+            "path": f"rollouts/train/rank{rank}.jsonl",
+            "sha256": "sha256:" + hashlib.sha256(rank_path.read_bytes()).hexdigest(),
+        }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    coverage_validation = RunBundle.load(run_dir).validate()
+    assert coverage_validation["status"] == "ok", coverage_validation["failures"][0][
+        "message"
+    ]
+    for rank in added_ranks:
+        del manifest["artifacts"][f"policy_trace_rank{rank}"]
+        (run_dir / f"rollouts/train/rank{rank}.jsonl").unlink()
+    train_path.write_bytes(original_train)
+    manifest["artifacts"]["train_result"]["sha256"] = (
+        "sha256:" + hashlib.sha256(original_train).hexdigest()
+    )
+
+    view_ref = manifest["artifacts"]["method_training_view"]
+    view_path = run_dir / view_ref["path"]
+    original_view = view_path.read_bytes()
+    view_body = json.loads(original_view)
+    view_body["source_trace_ids"].pop()
+    view_path.write_text(json.dumps(view_body), encoding="utf-8")
+    manifest["artifacts"]["method_training_view"]["sha256"] = (
+        "sha256:" + hashlib.sha256(view_path.read_bytes()).hexdigest()
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    false_envelope = RunBundle.load(run_dir).validate()
+    assert any(
+        failure["name"] == "training_view_leakage"
+        for failure in false_envelope["failures"]
+    )
+    view_path.write_bytes(original_view)
+    manifest["artifacts"]["method_training_view"]["sha256"] = (
+        "sha256:" + hashlib.sha256(original_view).hexdigest()
+    )
+
+    for name in policy_refs:
+        del manifest["artifacts"][name]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    missing_policy = RunBundle.load(run_dir).validate()
+    assert any(
+        failure["name"] == "policy_training_traces"
+        for failure in missing_policy["failures"]
+    )
+    manifest["artifacts"].update(policy_refs)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    policy_path = run_dir / policy_refs["policy_trace_rank0"]["path"]
+    policy_rows = [
+        json.loads(line)
+        for line in policy_path.read_text(encoding="utf-8").splitlines()
+    ]
+    policy_rows[0]["run_id"] = "different-run"
+    policy_path.write_text(
+        "\n".join(json.dumps(row) for row in policy_rows) + "\n",
+        encoding="utf-8",
+    )
+    manifest["artifacts"]["policy_trace_rank0"]["sha256"] = (
+        "sha256:" + hashlib.sha256(policy_path.read_bytes()).hexdigest()
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    wrong_policy = RunBundle.load(run_dir).validate()
+    assert any(
+        failure["name"] == "policy_training_traces"
+        for failure in wrong_policy["failures"]
+    )
 
     trace_path = run_dir / "evidence" / "input_traces.jsonl"
     trace_count = len(trace_path.read_text(encoding="utf-8").splitlines())
@@ -735,9 +933,7 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
     assert "cuda" in env
 
     view = json.loads(
-        (run_dir / "evidence" / "method_training_view.json").read_text(
-            encoding="utf-8"
-        )
+        (run_dir / "evidence" / "method_training_view.json").read_text(encoding="utf-8")
     )
     missing_trace_id = view["source_trace_ids"][0]
     retained = [
@@ -756,8 +952,7 @@ def test_runpod_compatibility_command_executes_canonical_engine_with_fakes(
     validation = RunBundle.load(run_dir).validate()
     assert validation["status"] == "failed"
     assert any(
-        failure["name"] == "grpo_reward_evidence"
-        for failure in validation["failures"]
+        failure["name"] == "grpo_reward_evidence" for failure in validation["failures"]
     )
 
 
@@ -849,11 +1044,10 @@ def _write_config(
             "gpu_type": "A40",
             "gpu_count": 1,
             "container_image": (
-                "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-"
-                "cudnn-devel-ubuntu22.04"
+                "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
             ),
-            "disk_gb": 100,
-            "volume_gb": 150,
+            "disk_gb": 40,
+            "volume_gb": 0,
         },
         "run": {
             "certification_mode": "non_certifying_smoke",

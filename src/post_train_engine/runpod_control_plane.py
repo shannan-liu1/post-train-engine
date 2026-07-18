@@ -6,8 +6,9 @@ import hashlib
 import json
 import math
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -73,6 +74,79 @@ class RunPodRESTTransport:
         return {} if not payload else json.loads(payload.decode("utf-8"))
 
 
+class RunPodProviderTransport(RunPodRESTTransport):
+    """Use provider-scheduled GraphQL creation and REST lifecycle operations."""
+
+    _GRAPHQL_URL = "https://api.runpod.io/graphql"
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> Any:
+        if method != "POST" or path != "/pods":
+            return super().request(method, path, body)
+        if body is None:
+            raise ValueError("RunPod Pod creation requires a request body")
+        terminate_after = body.get("terminateAfter")
+        if not isinstance(terminate_after, str) or not terminate_after:
+            raise ValueError("RunPod Pod creation requires provider termination")
+        gpu_types = body.get("gpuTypeIds")
+        if not isinstance(gpu_types, list) or len(gpu_types) != 1:
+            raise ValueError("RunPod GraphQL creation requires exactly one GPU type")
+        cuda_versions = body.get("allowedCudaVersions")
+        if not isinstance(cuda_versions, list) or len(cuda_versions) != 1:
+            raise ValueError("RunPod GraphQL creation requires one CUDA version")
+        provider_input = {
+            "cloudType": body.get("cloudType"),
+            "containerDiskInGb": body.get("containerDiskInGb"),
+            "gpuCount": body.get("gpuCount"),
+            "gpuTypeId": gpu_types[0],
+            "imageName": body.get("imageName"),
+            "minCudaVersion": cuda_versions[0],
+            "name": body.get("name"),
+            "ports": ",".join(body.get("ports", ())),
+            "startSsh": True,
+            "supportPublicIp": body.get("supportPublicIp"),
+            "terminateAfter": terminate_after,
+            "volumeInGb": body.get("volumeInGb"),
+        }
+        payload = json.dumps(
+            {
+                "query": (
+                    "mutation createPod($input: PodFindAndDeployOnDemandInput!) { "
+                    "podFindAndDeployOnDemand(input: $input) { "
+                    "id name costPerHr desiredStatus } }"
+                ),
+                "variables": {"input": provider_input},
+            }
+        ).encode("utf-8")
+        request = Request(
+            self._GRAPHQL_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        with urlopen(request, timeout=self._timeout_seconds) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        errors = raw.get("errors") if isinstance(raw, dict) else None
+        if isinstance(errors, list) and errors:
+            message = errors[0].get("message") if isinstance(errors[0], dict) else None
+            raise RuntimeError(
+                f"RunPod GraphQL create failed: {message or 'unknown error'}"
+            )
+        data = raw.get("data") if isinstance(raw, dict) else None
+        pod = data.get("podFindAndDeployOnDemand") if isinstance(data, dict) else None
+        if not isinstance(pod, dict):
+            raise ValueError("RunPod GraphQL create response omitted the Pod")
+        return pod
+
+
 class RunPodBudget(BaseModel):
     model_config = _FROZEN_FORBID
 
@@ -96,7 +170,9 @@ class RunPodBudget(BaseModel):
 
     def hard_deadline_seconds(self, pod_rate_usd_per_hour: float) -> int:
         if not math.isfinite(pod_rate_usd_per_hour) or pod_rate_usd_per_hour <= 0.0:
-            raise ValueError("RunPod create receipt requires a positive finite Pod rate")
+            raise ValueError(
+                "RunPod create receipt requires a positive finite Pod rate"
+            )
         cost_deadline_seconds = math.floor(
             (self.target_spend_usd - self.settled_spend_usd - self.reserve_usd)
             / pod_rate_usd_per_hour
@@ -135,13 +211,17 @@ class RunPodAllocationPolicy(BaseModel):
         if request.get("volumeInGb") != self.volume_gb:
             raise ValueError("RunPod request must use zero persistent volume")
         if request.get("interruptible") is not False:
-            raise ValueError("RunPod request must explicitly disable interruptible mode")
+            raise ValueError(
+                "RunPod request must explicitly disable interruptible mode"
+            )
         if request.get("ports") != ["22/tcp"]:
             raise ValueError("RunPod request must expose SSH only")
         if request.get("supportPublicIp") is not True:
             raise ValueError("RunPod request must request a public SSH address")
         if "env" in request:
-            raise ValueError("RunPod create request must not persist environment values")
+            raise ValueError(
+                "RunPod create request must not persist environment values"
+            )
         image = str(request.get("imageName") or "")
         cuda_version = cuda_version_from_image(image)
         if request.get("allowedCudaVersions") != [cuda_version]:
@@ -185,9 +265,18 @@ class AmbiguousPodCreationError(RuntimeError):
 class RunPodControlPlane:
     """Own one durable, bounded RunPod Pod creation operation."""
 
-    def __init__(self, transport: RunPodTransport, journal_path: str | Path) -> None:
+    def __init__(
+        self,
+        transport: RunPodTransport,
+        journal_path: str | Path,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self.transport = transport
         self.journal_path = Path(journal_path)
+        self.sleep = sleep
+        self.clock = clock
 
     def create_pod(
         self,
@@ -195,59 +284,131 @@ class RunPodControlPlane:
         *,
         budget: RunPodBudget,
         allocation_policy: RunPodAllocationPolicy | None = None,
+        arm_watchdog: Callable[[], dict[str, Any]] | None = None,
+        operation_sha256: str | None = None,
     ) -> PodCreateReceipt:
         (allocation_policy or RunPodAllocationPolicy()).validate_request(request)
+        if arm_watchdog is None:
+            raise ValueError("RunPod creation requires a watchdog callback")
         pod_name = str(request.get("name") or "")
         if not pod_name:
             raise ValueError("RunPod create request requires a deterministic name")
         request_sha256 = _sha256_json(request)
         budget_json = budget.model_dump(mode="json")
+        operation_sha256 = operation_sha256 or _sha256_json(
+            {"request": request, "budget": budget_json}
+        )
+        if not operation_sha256.startswith("sha256:") or len(operation_sha256) != 71:
+            raise ValueError("RunPod attempt identity must use sha256:<digest>")
         journal = self._read_journal()
         if journal is None:
-            self._write_journal(
-                {
-                    "state": "intent",
-                    "pod_name": pod_name,
-                    "request_sha256": request_sha256,
-                    "budget": budget_json,
-                    "request": request,
-                }
-            )
+            intent_at_unix = self.clock()
+            operation = {
+                "intent_at_unix": intent_at_unix,
+                "pod_name": pod_name,
+                "request_sha256": request_sha256,
+                "operation_sha256": operation_sha256,
+                "budget": budget_json,
+                "request": request,
+            }
+            self._write_journal({"state": "intent", **operation})
+            watchdog = arm_watchdog()
+            if watchdog.get("state") != "armed":
+                raise RuntimeError("RunPod watchdog did not enter armed state")
+            self._write_journal({"state": "create_started", **operation})
+            provider_request = {
+                **request,
+                "terminateAfter": _rfc3339_utc(
+                    intent_at_unix + budget.max_runtime_seconds
+                ),
+            }
             try:
-                raw = self.transport.request("POST", "/pods", request)
+                raw = self.transport.request("POST", "/pods", provider_request)
             except BaseException as exc:
                 self._write_journal(
                     {
                         "state": "ambiguous",
+                        "intent_at_unix": intent_at_unix,
                         "pod_name": pod_name,
                         "request_sha256": request_sha256,
+                        "operation_sha256": operation_sha256,
                         "budget": budget_json,
                         "request": request,
                     }
                 )
-                raise AmbiguousPodCreationError(
-                    "RunPod create response was ambiguous; reconcile by deterministic Pod name"
-                ) from exc
+                raw = self._reconcile_by_name_with_retries(pod_name)
+                if raw is None:
+                    raise AmbiguousPodCreationError(
+                        "RunPod create response was ambiguous; no same-name Pod "
+                        "appeared during bounded reconciliation"
+                    ) from exc
         else:
             if journal.get("request_sha256") != request_sha256:
-                raise ValueError("RunPod operation journal belongs to a different request")
-            if journal.get("budget") != budget_json:
-                raise ValueError("RunPod operation journal belongs to a different budget")
-            if journal.get("state") == "created":
-                return PodCreateReceipt.model_validate(journal["receipt"])
-            raw = self._reconcile_by_name(pod_name)
-            if raw is None:
-                raise AmbiguousPodCreationError(
-                    "RunPod creation remains ambiguous; no same-name Pod was found and replay is disabled"
+                raise ValueError(
+                    "RunPod operation journal belongs to a different request"
                 )
+            if journal.get("budget") != budget_json:
+                raise ValueError(
+                    "RunPod operation journal belongs to a different budget"
+                )
+            if journal.get("operation_sha256") != operation_sha256:
+                raise ValueError(
+                    "RunPod operation journal belongs to a different attempt identity"
+                )
+            state = journal.get("state")
+            if state not in {"intent", "create_started", "ambiguous", "created"}:
+                raise RuntimeError(
+                    f"RunPod create cannot resume terminal cleanup state {state!r}"
+                )
+            if state == "created":
+                watchdog = arm_watchdog()
+                if watchdog.get("state") != "armed":
+                    raise RuntimeError("RunPod watchdog did not enter armed state")
+                return PodCreateReceipt.model_validate(journal["receipt"])
+            intent_at_unix = _positive_timestamp(
+                journal.get("intent_at_unix"), label="RunPod create intent"
+            )
+            watchdog = arm_watchdog()
+            if watchdog.get("state") != "armed":
+                raise RuntimeError("RunPod watchdog did not enter armed state")
+            if state == "intent":
+                operation = {
+                    key: value for key, value in journal.items() if key != "state"
+                }
+                self._write_journal({"state": "create_started", **operation})
+                provider_request = {
+                    **request,
+                    "terminateAfter": _rfc3339_utc(
+                        intent_at_unix + budget.max_runtime_seconds
+                    ),
+                }
+                try:
+                    raw = self.transport.request("POST", "/pods", provider_request)
+                except BaseException as exc:
+                    self._write_journal({"state": "ambiguous", **operation})
+                    raw = self._reconcile_by_name_with_retries(pod_name)
+                    if raw is None:
+                        raise AmbiguousPodCreationError(
+                            "RunPod create response was ambiguous; no same-name Pod "
+                            "appeared during bounded reconciliation"
+                        ) from exc
+            else:
+                raw = self._reconcile_by_name_with_retries(pod_name)
+                if raw is None:
+                    raise AmbiguousPodCreationError(
+                        "RunPod creation remains ambiguous; no same-name Pod was found "
+                        "and replay is disabled"
+                    )
 
         pod_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
         if not pod_id:
             self._write_journal(
                 {
                     "state": "ambiguous",
+                    "intent_at_unix": intent_at_unix,
                     "pod_name": pod_name,
                     "request_sha256": request_sha256,
+                    "operation_sha256": operation_sha256,
                     "budget": budget_json,
                     "request": request,
                 }
@@ -266,15 +427,20 @@ class RunPodControlPlane:
             rate = _pod_rate(raw)
             hard_deadline = budget.hard_deadline_seconds(rate)
         except BaseException:
-            self.delete_pod(pod_id)
+            self.delete_pod_and_verify(pod_id)
             raise
+        if self.clock() >= intent_at_unix + hard_deadline:
+            self.delete_pod_and_verify(pod_id)
+            raise TimeoutError(
+                "RunPod create reconciliation exceeded its hard deadline"
+            )
         receipt = PodCreateReceipt(
             pod_id=pod_id,
             pod_name=pod_name,
             pod_rate_usd_per_hour=rate,
             hard_deadline_seconds=hard_deadline,
             request_sha256=request_sha256,
-            recorded_at_unix=time.time(),
+            recorded_at_unix=intent_at_unix,
         )
         try:
             self._write_journal(
@@ -282,13 +448,14 @@ class RunPodControlPlane:
                     "state": "created",
                     "pod_name": pod_name,
                     "request_sha256": request_sha256,
+                    "operation_sha256": operation_sha256,
                     "budget": budget_json,
                     "request": request,
                     "receipt": receipt.model_dump(mode="json"),
                 }
             )
         except BaseException:
-            self.delete_pod(pod_id)
+            self.delete_pod_and_verify(pod_id)
             raise
         return receipt
 
@@ -305,22 +472,101 @@ class RunPodControlPlane:
             return None
         return PodCreateReceipt.model_validate(journal.get("receipt"))
 
+    def operation_state(self) -> str | None:
+        journal = self._read_journal()
+        return None if journal is None else str(journal.get("state") or "")
+
     def delete_pod(self, pod_id: str) -> None:
         if not pod_id:
             raise ValueError("pod_id must be non-empty")
         self.transport.request("DELETE", f"/pods/{pod_id}")
-        self._record_deleted(pod_id, outcome="delete_accepted")
+        self._record_delete_requested(pod_id)
 
     def verify_pod_absent(self, pod_id: str) -> bool:
-        """Reconcile provider state and close the journal only after absence."""
+        """Close the journal only after two provider absence observations."""
 
         if not pod_id:
             raise ValueError("pod_id must be non-empty")
-        active_pods = _list_rows(self.transport.request("GET", "/pods"))
-        if any(str(row.get("id")) == pod_id for row in active_pods):
-            return False
+        for observation in range(2):
+            active_pods = _list_rows(self.transport.request("GET", "/pods"))
+            unexpected = [
+                str(row.get("id") or "<missing-id>")
+                for row in active_pods
+                if str(row.get("id")) != pod_id
+            ]
+            if unexpected:
+                raise RuntimeError(
+                    "RunPod teardown found unexpected active Pods: "
+                    + ", ".join(unexpected)
+                )
+            if any(str(row.get("id")) == pod_id for row in active_pods):
+                return False
+            if observation == 0:
+                self.sleep(0.25)
         self._record_deleted(pod_id, outcome="provider_absent")
         return True
+
+    def require_only_created_pod(
+        self,
+        receipt: PodCreateReceipt,
+        *,
+        attempts: int = 5,
+    ) -> None:
+        """Require eventual visibility of exactly the just-created Pod."""
+
+        if attempts <= 0:
+            raise ValueError("inventory attempts must be positive")
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                active_pods = self.list_pods()
+            except (OSError, TimeoutError) as exc:
+                last_error = exc
+                active_pods = []
+            matching = [
+                pod
+                for pod in active_pods
+                if str(pod.get("id")) == receipt.pod_id
+                and str(pod.get("name")) == receipt.pod_name
+            ]
+            if len(matching) == 1 and len(active_pods) == 1:
+                return
+            if active_pods:
+                raise RuntimeError(
+                    "created RunPod attempt does not match the active Pod inventory"
+                )
+            if attempt + 1 < attempts:
+                self.sleep(1.0)
+        error = RuntimeError("created RunPod Pod never appeared in active inventory")
+        if last_error is not None:
+            raise error from last_error
+        raise error
+
+    def delete_pod_and_verify(self, pod_id: str, *, attempts: int = 3) -> int:
+        """Delete a known Pod and require provider-confirmed absence."""
+
+        if attempts <= 0:
+            raise ValueError("delete attempts must be positive")
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                self.delete_pod(pod_id)
+            except BaseException as exc:
+                last_error = exc
+            try:
+                if self.verify_pod_absent(pod_id):
+                    return attempt + 1
+            except BaseException as exc:
+                last_error = exc
+            if attempt + 1 < attempts:
+                self.sleep(1.0)
+        self.record_delete_unverified(pod_id)
+        error = RuntimeError(
+            f"RunPod still reports Pod {pod_id!r} active after {attempts} delete attempts"
+        )
+        if last_error is not None:
+            raise error from last_error
+        raise error
 
     def get_pod(self, pod_id: str) -> dict[str, Any]:
         """Return one provider Pod only when its identity matches the request."""
@@ -378,6 +624,22 @@ class RunPodControlPlane:
                 }
             )
 
+    def _record_delete_requested(self, pod_id: str) -> None:
+        journal = self._read_journal()
+        receipt = None if journal is None else journal.get("receipt")
+        if isinstance(receipt, dict) and str(receipt.get("pod_id")) != pod_id:
+            return
+        if journal is not None:
+            self._write_journal(
+                {
+                    **journal,
+                    "state": "delete_requested",
+                    "delete_requested_pod_id": pod_id,
+                    "delete_requested_at_unix": self.clock(),
+                    "deletion_outcome": "provider_delete_accepted",
+                }
+            )
+
     def fetch_billing(
         self,
         pod_id: str,
@@ -420,10 +682,12 @@ class RunPodControlPlane:
             raise ValueError("final billing settlement requires end_time")
         observation = self._read_billing_observation(pod_id)
         if observation is None or amount != observation:
-            raise ValueError("final billing amount must match a durable prior observation")
+            raise ValueError(
+                "final billing amount must match a durable prior observation"
+            )
         active_pods = _list_rows(self.transport.request("GET", "/pods"))
-        if any(str(row.get("id")) == pod_id for row in active_pods):
-            raise ValueError("cannot finalize billing while the Pod is active")
+        if active_pods:
+            raise ValueError("cannot finalize billing while any RunPod Pod is active")
         self._record_deleted(pod_id, outcome="provider_absent_at_billing_settlement")
         return PodBillingReceipt(
             pod_id=pod_id,
@@ -442,6 +706,25 @@ class RunPodControlPlane:
             )
         return None if not matches else matches[0]
 
+    def _reconcile_by_name_with_retries(
+        self,
+        pod_name: str,
+        *,
+        attempts: int = 3,
+    ) -> dict[str, Any] | None:
+        for attempt in range(attempts):
+            try:
+                match = self._reconcile_by_name(pod_name)
+            except AmbiguousPodCreationError:
+                raise
+            except BaseException:
+                match = None
+            if match is not None:
+                return match
+            if attempt + 1 < attempts:
+                self.sleep(1.0)
+        return None
+
     def _read_journal(self) -> dict[str, Any] | None:
         if not self.journal_path.is_file():
             return None
@@ -453,7 +736,9 @@ class RunPodControlPlane:
     def _write_journal(self, body: dict[str, Any]) -> None:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.journal_path.with_name("." + self.journal_path.name + ".tmp")
-        temporary.write_text(json.dumps(body, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(body, indent=2, sort_keys=True), encoding="utf-8"
+        )
         temporary.replace(self.journal_path)
 
     @property
@@ -471,7 +756,9 @@ class RunPodControlPlane:
         body[pod_id] = {"amount_usd": amount_usd, "recorded_at_unix": time.time()}
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name("." + path.name + ".tmp")
-        temporary.write_text(json.dumps(body, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(body, indent=2, sort_keys=True), encoding="utf-8"
+        )
         temporary.replace(path)
 
     def _read_billing_observation(self, pod_id: str) -> float | None:
@@ -489,7 +776,9 @@ def _pod_rate(raw: dict[str, Any]) -> float:
     if value is None:
         value = raw.get("costPerHr")
     if type(value) is bool or not isinstance(value, int | float | str):
-        raise ValueError("RunPod create response did not include an authoritative Pod rate")
+        raise ValueError(
+            "RunPod create response did not include an authoritative Pod rate"
+        )
     try:
         rate = float(value)
     except ValueError as exc:
@@ -521,6 +810,24 @@ def _sha256_json(body: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _positive_timestamp(value: Any, *, label: str) -> float:
+    if (
+        type(value) not in {int, float}
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise ValueError(f"{label} requires a positive finite timestamp")
+    return float(value)
+
+
+def _rfc3339_utc(timestamp: float) -> str:
+    return (
+        datetime.fromtimestamp(timestamp, timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 __all__ = [
     "AmbiguousPodCreationError",
     "PodBillingReceipt",
@@ -528,6 +835,7 @@ __all__ = [
     "RunPodBudget",
     "RunPodAllocationPolicy",
     "RunPodControlPlane",
+    "RunPodProviderTransport",
     "RunPodRESTTransport",
     "RunPodTransport",
 ]

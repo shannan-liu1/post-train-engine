@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from pydantic import (
@@ -34,6 +34,8 @@ PrivilegedVisibility = Literal[
     "gold_answer",
     "verifier_feedback",
     "privileged_context",
+    "environment",
+    "critic",
     "unknown",
 ]
 
@@ -62,30 +64,51 @@ class TrainingDataRef(BaseModel):
     ) -> TrainingDataRef:
         data_path = Path(path)
         if not data_path.is_file():
-            raise ValueError(f"training data path must be an existing file: {data_path}")
-        digest = hashlib.sha256(data_path.read_bytes()).hexdigest()
-        stored_path = str(data_path)
-        if artifact_root is not None:
-            try:
-                stored_path = data_path.resolve().relative_to(
-                    Path(artifact_root).resolve()
-                ).as_posix()
-            except ValueError as exc:
-                raise ValueError(
-                    "training data path must remain inside artifact_root"
-                ) from exc
+            raise ValueError(
+                f"training data path must be an existing file: {data_path}"
+            )
+        if artifact_root is None:
+            raise ValueError("training data path must be relative to artifact_root")
+        try:
+            stored_path = (
+                data_path.resolve()
+                .relative_to(Path(artifact_root).resolve())
+                .as_posix()
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "training data path must remain inside artifact_root"
+            ) from exc
+        digest = hashlib.sha256()
+        with data_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
         return cls(
             path=stored_path,
             kind=kind,
-            sha256=f"sha256:{digest}",
+            sha256=f"sha256:{digest.hexdigest()}",
             required=required,
         )
+
+    @field_validator("path")
+    @classmethod
+    def _path_must_be_relative_and_contained(cls, value: str) -> str:
+        posix = PurePosixPath(value.replace("\\", "/"))
+        if (
+            PurePosixPath(value).is_absolute()
+            or PureWindowsPath(value).is_absolute()
+            or ".." in posix.parts
+        ):
+            raise ValueError("training data path must be relative to artifact_root")
+        return value
 
     @field_validator("sha256")
     @classmethod
     def _sha256_must_be_canonical(cls, value: str) -> str:
         if not _SHA256_RE.fullmatch(value):
-            raise ValueError("training data sha256 must use sha256:<64 lowercase hex chars>")
+            raise ValueError(
+                "training data sha256 must use sha256:<64 lowercase hex chars>"
+            )
         return value
 
 
@@ -133,9 +156,13 @@ class TrainingViewArtifact(BaseModel):
 
     @model_validator(mode="after")
     def _validate_training_view_contract(self) -> TrainingViewArtifact:
-        protected = {"selection", "promotion", "canary", "unseen"}.intersection(
-            self.source_split_roles
-        )
+        protected = {
+            "selection",
+            "diagnostic",
+            "promotion",
+            "canary",
+            "unseen",
+        }.intersection(self.source_split_roles)
         if protected:
             raise ValueError(
                 "training views cannot use protected evaluation split sources: "
@@ -145,26 +172,29 @@ class TrainingViewArtifact(BaseModel):
             raise ValueError("grpo_rollout views must be compatible with grpo")
         if self.view_type == "opsd" and self.privileged_visibility == "none":
             raise ValueError("opsd views must declare privileged visibility")
-        if self.view_type == "multi_teacher_opd" and "multi_teacher_opd" not in self.method_compatibility:
-            raise ValueError("multi_teacher_opd views must declare multi_teacher_opd compatibility")
+        if (
+            self.view_type == "multi_teacher_opd"
+            and "multi_teacher_opd" not in self.method_compatibility
+        ):
+            raise ValueError(
+                "multi_teacher_opd views must declare multi_teacher_opd compatibility"
+            )
         return self
 
     def to_json(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
 
     def resolve_data_path(self, artifact_root: str | Path) -> Path:
-        """Resolve new relative refs and legacy absolute refs through one reader."""
+        """Resolve one canonical relative reference through its artifact root."""
 
-        path = Path(self.data_artifact.path)
-        return path if path.is_absolute() else Path(artifact_root) / path
+        return Path(artifact_root) / self.data_artifact.path
 
     def require_data_integrity(self, artifact_root: str | Path) -> Path:
         """Resolve and hash-check the immutable data immediately before use."""
 
         root = Path(artifact_root).resolve()
-        stored = Path(self.data_artifact.path)
         path = self.resolve_data_path(root).resolve()
-        if not stored.is_absolute() and not path.is_relative_to(root):
+        if not path.is_relative_to(root):
             raise ValueError("training data path escapes artifact_root")
         if not path.is_file():
             if self.data_artifact.required:

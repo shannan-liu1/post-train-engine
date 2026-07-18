@@ -8,6 +8,10 @@ from typing import Any
 
 from post_train_engine.agentic.environments import run_exact_math_tool_episode
 from post_train_engine.engine import RunPlan, RunStage, StageOutput
+from post_train_engine.training_views import (
+    build_training_view_artifact,
+    write_training_view_artifact,
+)
 
 
 class ExactMathRunAdapter:
@@ -78,16 +82,32 @@ class ExactMathRunAdapter:
             )
             traces.append(trajectory.to_trace_record().model_dump(mode="json"))
         trace_path = _write_jsonl(root / "evidence" / "traces.jsonl", traces)
-        view_path = _write_json(
-            root / "evidence" / "sft_view.json",
-            {
-                "view_id": f"{plan.run_id}:exact-math-sft",
-                "method_compatibility": ["sft"],
-                "source_trace_ids": [trace["trace_id"] for trace in traces],
-                "source_split_roles": ["train"],
-                "privileged_visibility": "environment",
-            },
+        training_path = _write_jsonl(
+            root / "data" / "sft_examples.jsonl",
+            [
+                {
+                    "example_id": trace["example_id"],
+                    "prompt": trace["prompt"],
+                    "completion": trace["completion"],
+                    "source_trace_ids": [trace["trace_id"]],
+                    "source_split_roles": ["train"],
+                }
+                for trace in traces
+            ],
         )
+        view = build_training_view_artifact(
+            view_id=f"{plan.run_id}:exact-math-sft",
+            run_id=plan.run_id,
+            task_id=plan.task_name,
+            view_type="sft",
+            method_compatibility=("sft",),
+            data_path=training_path,
+            artifact_root=root,
+            data_kind="sft_examples",
+            privileged_visibility="environment",
+        )
+        view_path = root / "evidence" / "sft_view.json"
+        write_training_view_artifact(view, view_path)
         return {"traces": str(trace_path), "sft_view": str(view_path)}
 
     def _train(

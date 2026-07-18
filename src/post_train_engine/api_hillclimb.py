@@ -43,10 +43,17 @@ from post_train_engine.evidence_safety import (
     certify_content_separation,
 )
 from post_train_engine.providers.base import RemoteProvider
-from post_train_engine.providers.fake import FakeInferenceProvider, FakePromptAdapterProvider
+from post_train_engine.providers.fake import (
+    FakeInferenceProvider,
+    FakePromptAdapterProvider,
+)
 from post_train_engine.providers.openai_compatible import OpenAICompatibleProvider
 from post_train_engine.provider_operations import execute_provider_operation
-from post_train_engine.traces import TraceRecord, build_rollout_group, stable_prompt_hash
+from post_train_engine.traces import (
+    TraceRecord,
+    build_rollout_group,
+    stable_prompt_hash,
+)
 from post_train_engine.training_views import (
     TrainingViewArtifact,
     build_training_view_artifact,
@@ -339,7 +346,9 @@ class _APIHillClimbAdapter:
         self.store.copy_file(self.config_path, "config.raw.yaml")
         self.store.write_json("config.resolved.json", self.resolved.redacted_json())
         self.store.write_json("env.redacted.json", self.resolved.env_redacted)
-        self.store.write_json("candidates/baseline.json", self.resolved.baseline.to_json())
+        self.store.write_json(
+            "candidates/baseline.json", self.resolved.baseline.to_json()
+        )
         return _api_stage_output(
             self.store,
             artifacts={
@@ -559,11 +568,11 @@ class _APIHillClimbAdapter:
             _read_json(prior["train"].artifacts["candidate"])
         )
         baseline_eval = load_eval_artifact(prior["evaluate"].artifacts["baseline_eval"])
-        candidate_eval = load_eval_artifact(prior["evaluate"].artifacts["candidate_eval"])
-        decision = _read_json(prior["promote"].artifacts["promotion_decision"])
-        next_experiment = _read_json(
-            prior["promote"].artifacts["next_experiment"]
+        candidate_eval = load_eval_artifact(
+            prior["evaluate"].artifacts["candidate_eval"]
         )
+        decision = _read_json(prior["promote"].artifacts["promotion_decision"])
+        next_experiment = _read_json(prior["promote"].artifacts["next_experiment"])
         report = _final_report(
             cfg=self.resolved.config,
             resolved=self.resolved,
@@ -660,9 +669,7 @@ def _write_api_training_evidence(
     frontier_ids = {
         example_id
         for example_id, group_rows in grouped.items()
-        if 0.0
-        < sum(float(row.correct) for row in group_rows) / len(group_rows)
-        < 1.0
+        if 0.0 < sum(float(row.correct) for row in group_rows) / len(group_rows) < 1.0
     }
     common_artifacts = {
         "traces": "traces/baseline_train.jsonl",
@@ -709,7 +716,6 @@ def _write_api_training_evidence(
         data_path=store.run_dir / data_relative,
         artifact_root=store.run_dir,
         data_kind="prompt_adaptation_rows",
-        rows=selected_rows,
         privileged_visibility="gold_answer",
         metadata={
             "selection_policy": "parent_success_rate_frontier",
@@ -738,8 +744,7 @@ def _api_stage_output(
 ) -> StageOutput:
     return StageOutput(
         artifacts={
-            name: str(store.run_dir / relative)
-            for name, relative in artifacts.items()
+            name: str(store.run_dir / relative) for name, relative in artifacts.items()
         },
         values=dict(values or {}),
         cost_usd=0.0 if cost_missing_reason is None else None,
@@ -764,6 +769,8 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
             raise ValueError(f"expected JSONL objects: {path}")
         rows.append(row)
     return rows
+
+
 def _api_promotion_artifact(
     result: EvalResult,
     *,
@@ -804,7 +811,11 @@ def _build_provider(provider: ResolvedProvider) -> RemoteProvider:
     if spec.type == "fake_prompt_adapter":
         return FakePromptAdapterProvider(provider_id=spec.provider_id)
     if is_chat_completions_provider_type(spec.type):
-        if provider.base_url is None or provider.api_key is None or provider.model is None:
+        if (
+            provider.base_url is None
+            or provider.api_key is None
+            or provider.model is None
+        ):
             raise ValueError(f"provider {spec.provider_id} is not fully resolved")
         return OpenAICompatibleProvider(
             provider_id=spec.provider_id,
@@ -866,7 +877,10 @@ def _load_and_split_dataset(
                 gold_solution=example.gold_solution,
                 gold_answer=example.gold_answer,
                 source=example.source,
-                metadata={**dict(example.metadata), "dataset_revision": dataset_revision},
+                metadata={
+                    **dict(example.metadata),
+                    "dataset_revision": dataset_revision,
+                },
             )
             for example in examples
         ]
@@ -875,7 +889,9 @@ def _load_and_split_dataset(
 
     required = cfg.dataset.train_size + cfg.dataset.eval_size
     if required > len(examples):
-        raise ValueError(f"requested {required} examples but dataset has {len(examples)}")
+        raise ValueError(
+            f"requested {required} examples but dataset has {len(examples)}"
+        )
     shuffled = list(examples)
     random.Random(cfg.dataset.split_seed).shuffle(shuffled)
     train = shuffled[: cfg.dataset.train_size]
@@ -904,11 +920,17 @@ def _write_dataset_artifacts(
     )
     store.write_jsonl(
         "datasets/train.jsonl",
-        [_example_json(example, cfg.dataset.prompt_style, "train") for example in train_examples],
+        [
+            _example_json(example, cfg.dataset.prompt_style, "train")
+            for example in train_examples
+        ],
     )
     store.write_jsonl(
         "datasets/eval.jsonl",
-        [_example_json(example, cfg.dataset.prompt_style, "eval") for example in eval_examples],
+        [
+            _example_json(example, cfg.dataset.prompt_style, "eval")
+            for example in eval_examples
+        ],
     )
 
 
@@ -971,7 +993,7 @@ def _evaluate_candidate(
             examples=examples,
             prompt_style=cfg.dataset.prompt_style,
             samples_per_example=cfg.eval.samples_per_example,
-            split_role="eval",
+            split_role="promotion",
             generation=cfg.eval.model_dump(mode="json"),
         ),
     )
@@ -1013,7 +1035,9 @@ def _grade_generations(
         example = examples_by_id[example_id]
         completion_value = generation.get("completion")
         if not isinstance(completion_value, str):
-            raise ValueError(f"provider generation row {index} missing completion string")
+            raise ValueError(
+                f"provider generation row {index} missing completion string"
+            )
         completion = completion_value
         sample_index = _nonnegative_int(
             generation.get("sample_index", 0),
@@ -1053,7 +1077,9 @@ def _grade_generations(
             )
         )
     if not rows:
-        raise ValueError(f"provider returned no generations for candidate {candidate.candidate_id}")
+        raise ValueError(
+            f"provider returned no generations for candidate {candidate.candidate_id}"
+        )
     return rows
 
 
@@ -1076,7 +1102,9 @@ def _eval_result(
     if not first_samples:
         raise ValueError("eval requires sample_index=0 rows")
     seen_ids = [row.example_id for row in first_samples]
-    duplicate_ids = sorted({example_id for example_id in seen_ids if seen_ids.count(example_id) > 1})
+    duplicate_ids = sorted(
+        {example_id for example_id in seen_ids if seen_ids.count(example_id) > 1}
+    )
     if duplicate_ids:
         raise ValueError(f"eval has duplicate sample_index=0 rows: {duplicate_ids}")
     missing = sorted(expected_example_ids.difference(seen_ids))
@@ -1088,7 +1116,9 @@ def _eval_result(
         )
     accuracy = sum(row.correct for row in first_samples) / len(first_samples)
     parse_rate = sum(row.parse_ok for row in first_samples) / len(first_samples)
-    mean_tokens = sum(float(row.completion_tokens) for row in first_samples) / len(first_samples)
+    mean_tokens = sum(float(row.completion_tokens) for row in first_samples) / len(
+        first_samples
+    )
     return EvalResult(
         candidate_id=candidate_id,
         metrics={
@@ -1254,7 +1284,9 @@ def _markdown_report(report: dict[str, Any]) -> str:
     )
 
 
-def _example_json(example: GSM8KExample, prompt_style: str, split_role: str) -> dict[str, Any]:
+def _example_json(
+    example: GSM8KExample, prompt_style: str, split_role: str
+) -> dict[str, Any]:
     return {
         "example_id": example.id,
         "source": example.source,

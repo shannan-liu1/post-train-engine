@@ -22,6 +22,7 @@ class EvaluationRoles(BaseModel):
     def _roles_must_be_valid(self) -> EvaluationRoles:
         named = {
             "selection": self.selection_example_ids,
+            "diagnostic": self.diagnostic_example_ids,
             "promotion": self.promotion_example_ids,
             "canary": self.canary_example_ids,
             "unseen": self.unseen_example_ids,
@@ -45,6 +46,7 @@ class EvaluationRoles(BaseModel):
         return frozenset(
             (
                 *self.selection_example_ids,
+                *self.diagnostic_example_ids,
                 *self.promotion_example_ids,
                 *self.canary_example_ids,
                 *self.unseen_example_ids,

@@ -23,7 +23,7 @@ class EvalContract(BaseModel):
     schema_version: Literal["eval_contract_v1"] = "eval_contract_v1"
     suite_id: str = Field(..., min_length=1)
     suite_version: str = Field(..., min_length=1)
-    role: Literal["promotion"] = "promotion"
+    role: Literal["promotion", "canary"] = "promotion"
     example_ids_sha256: str
     example_content_sha256: str
     prompt_contract_sha256: str
@@ -57,6 +57,7 @@ class EvalContract(BaseModel):
         verifier_contract: Mapping[str, Any],
         generation_contract: Mapping[str, Any],
         primary_metric: str,
+        role: Literal["promotion", "canary"] = "promotion",
     ) -> EvalContract:
         normalized_ids = tuple(str(value) for value in example_ids)
         if not normalized_ids or any(not value for value in normalized_ids):
@@ -71,6 +72,7 @@ class EvalContract(BaseModel):
         return cls(
             suite_id=suite_id,
             suite_version=suite_version,
+            role=role,
             example_ids_sha256=hash_example_ids(normalized_ids),
             example_content_sha256=_stable_hash(normalized_content),
             prompt_contract_sha256=_stable_hash(prompt_contract),

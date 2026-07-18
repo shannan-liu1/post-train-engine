@@ -12,7 +12,10 @@ from typing import Any, Literal
 
 import yaml
 
-from post_train_engine.evals.statistics import PairedAccuracyStats, paired_accuracy_stats
+from post_train_engine.evals.statistics import (
+    PairedAccuracyStats,
+    paired_accuracy_stats,
+)
 from post_train_engine.evals.harness import EvalReport, EvalSample
 
 Severity = Literal["none", "low", "medium", "high", "critical"]
@@ -457,8 +460,14 @@ def decide_promotion(
         stats=stats,
         severity_summary=severity_summary,
         canary_decision=None if canary is None else canary.to_dict(),
-        baseline_metrics=dict(baseline_eval.metrics),
-        candidate_metrics=dict(candidate_eval.metrics),
+        baseline_metrics={
+            **dict(baseline_eval.metrics),
+            primary_metric: sum(old) / len(old),
+        },
+        candidate_metrics={
+            **dict(candidate_eval.metrics),
+            primary_metric: sum(new) / len(new),
+        },
     )
 
 
@@ -474,10 +483,7 @@ def eval_report_to_artifact(report: EvalReport) -> EvalArtifact:
         artifact_id=report.candidate_id,
         primary_metric=report.primary_metric,
         examples=tuple(_result_from_sample(sample) for sample in details),
-        metrics={
-            name: result.value
-            for name, result in report.metrics.items()
-        },
+        metrics={name: result.value for name, result in report.metrics.items()},
         slices=_slice_metrics(report),
         metadata={
             **dict(report.metadata),
@@ -510,9 +516,7 @@ def load_promotion_gate_config(path: str | Path) -> PromotionGateConfig:
     values = dict(raw)
     if "required_slice_gates" in values:
         values["required_slice_gates"] = tuple(
-            gate
-            if isinstance(gate, SliceGateConfig)
-            else SliceGateConfig(**dict(gate))
+            gate if isinstance(gate, SliceGateConfig) else SliceGateConfig(**dict(gate))
             for gate in values["required_slice_gates"]
         )
     return PromotionGateConfig(**values)
@@ -525,9 +529,8 @@ def canary_decision_from_artifact(artifact: EvalArtifact) -> CanaryDecision:
         if example.correct and example.parse_ok and example.severity == "none":
             continue
         failed_examples.append(example.example_id)
-        failure_types[example.example_id] = (
-            example.failure_type
-            or ("parse" if not example.parse_ok else "incorrect")
+        failure_types[example.example_id] = example.failure_type or (
+            "parse" if not example.parse_ok else "incorrect"
         )
     return CanaryDecision(
         decision="fail" if failed_examples else "pass",
@@ -565,7 +568,9 @@ def _completion_tokens(sample: EvalSample) -> int | float:
         value = sample.grade.metadata.get(key)
         if value is not None:
             return value
-    raise ValueError(f"eval sample {sample.example_id} is missing completion token count")
+    raise ValueError(
+        f"eval sample {sample.example_id} is missing completion token count"
+    )
 
 
 def _bucket_from_sample(sample: EvalSample) -> str | None:
@@ -692,11 +697,22 @@ def _paired_rows(
         raise ValueError("eval artifacts have no paired example ids")
     missing = set(baseline_by_id) ^ set(candidate_by_id)
     if missing:
-        raise ValueError(f"eval artifacts are not paired; first missing id: {sorted(missing)[0]}")
-    return tuple(
-        (baseline_by_id[example_id], candidate_by_id[example_id])
-        for example_id in ids
+        raise ValueError(
+            f"eval artifacts are not paired; first missing id: {sorted(missing)[0]}"
+        )
+    paired = tuple(
+        (baseline_by_id[example_id], candidate_by_id[example_id]) for example_id in ids
     )
+    for baseline_row, candidate_row in paired:
+        if (
+            baseline_row.bucket != candidate_row.bucket
+            or baseline_row.protected != candidate_row.protected
+        ):
+            raise ValueError(
+                "paired eval suite metadata differs for example "
+                f"{baseline_row.example_id!r}"
+            )
+    return paired
 
 
 def _apply_slice_gate(
@@ -710,7 +726,9 @@ def _apply_slice_gate(
 ) -> None:
     gate_name = f"slice:{slice_gate.slice_name}:{slice_gate.metric}"
     baseline_metric = _slice_metric(baseline, slice_gate.slice_name, slice_gate.metric)
-    candidate_metric = _slice_metric(candidate, slice_gate.slice_name, slice_gate.metric)
+    candidate_metric = _slice_metric(
+        candidate, slice_gate.slice_name, slice_gate.metric
+    )
     if baseline_metric is None or candidate_metric is None:
         _gate(
             gate_name,
@@ -741,8 +759,7 @@ def _apply_slice_gate(
             else:
                 checks.append(stats.bootstrap_ci_low >= slice_gate.min_ci_low)
                 reason_bits.append(
-                    "ci_low "
-                    f"{stats.bootstrap_ci_low:.6f} < {slice_gate.min_ci_low:.6f}"
+                    f"ci_low {stats.bootstrap_ci_low:.6f} < {slice_gate.min_ci_low:.6f}"
                 )
     passed = all(checks)
     _gate(
@@ -762,7 +779,7 @@ def _slice_paired_stats(
     rows = [
         (baseline_row.correct, candidate_row.correct)
         for baseline_row, candidate_row in _paired_rows(baseline, candidate)
-        if baseline_row.bucket == slice_name or candidate_row.bucket == slice_name
+        if baseline_row.bucket == slice_name
     ]
     if not rows:
         return None
@@ -798,15 +815,14 @@ def _regression_severity(
         or (baseline.parse_ok and not candidate.parse_ok)
         or explicit != "none"
     )
-    if (
-        damaged
-        and (
-            candidate.protected
-            or candidate.failure_type in {"canary", "schema", "safety", "tool"}
-        )
+    if damaged and (
+        candidate.protected
+        or candidate.failure_type in {"canary", "schema", "safety", "tool"}
     ):
         inferred = "critical"
-    elif baseline.correct and not candidate.correct and candidate.bucket == "easy_stable":
+    elif (
+        baseline.correct and not candidate.correct and candidate.bucket == "easy_stable"
+    ):
         inferred = "high"
     elif baseline.parse_ok and not candidate.parse_ok:
         inferred = "medium"
@@ -826,7 +842,9 @@ def _coerce_canary_decision(
         return canary_decision
     return CanaryDecision(
         decision=str(canary_decision["decision"]),
-        failed_examples=tuple(str(item) for item in canary_decision.get("failed_examples", ())),
+        failed_examples=tuple(
+            str(item) for item in canary_decision.get("failed_examples", ())
+        ),
         failure_types={
             str(key): str(value)
             for key, value in dict(canary_decision.get("failure_types", {})).items()
@@ -847,12 +865,12 @@ def _parse_rate(examples: Sequence[EvalExampleResult]) -> float:
 
 
 def _slice_metric(artifact: EvalArtifact, slice_name: str, metric: str) -> float | None:
+    rows = [example for example in artifact.examples if example.bucket == slice_name]
+    if metric in _PAIRED_CORRECTNESS_PRIMARY_METRICS:
+        return None if not rows else _accuracy(rows)
     if slice_name in artifact.slices and metric in artifact.slices[slice_name]:
         return artifact.slices[slice_name][metric]
-    rows = [example for example in artifact.examples if example.bucket == slice_name]
-    if not rows:
-        return None
-    return _accuracy(rows)
+    return None
 
 
 def _token_ratio(

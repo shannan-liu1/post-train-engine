@@ -22,8 +22,12 @@ from post_train_engine.traces.schema import SplitRole, TraceRecord
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 
 TeacherKind = Literal["external", "self_privileged", "peer_conditioned", "committee"]
-SupervisionKind = Literal["token_distribution", "sequence_score", "critique", "reference_completion"]
-TeacherVisibility = Literal["none", "gold_answer", "verifier_feedback", "privileged_context", "environment"]
+SupervisionKind = Literal[
+    "token_distribution", "sequence_score", "critique", "reference_completion"
+]
+TeacherVisibility = Literal[
+    "none", "gold_answer", "verifier_feedback", "privileged_context", "environment"
+]
 
 
 class DistillationOODGuard(BaseModel):
@@ -40,7 +44,11 @@ class DistillationOODGuard(BaseModel):
     @field_validator("measured_teacher_advantage", "min_teacher_advantage")
     @classmethod
     def _advantage_must_be_finite(cls, value: float) -> float:
-        if type(value) is bool or not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            type(value) is bool
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise ValueError("teacher advantage must be finite")
         return float(value)
 
@@ -70,12 +78,18 @@ class DistillationTeacher(BaseModel):
     @field_validator("weight")
     @classmethod
     def _weight_finite(cls, value: float) -> float:
-        if type(value) is bool or not isinstance(value, int | float) or not math.isfinite(float(value)):
+        if (
+            type(value) is bool
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+        ):
             raise ValueError("weight must be finite")
         return float(value)
 
     @staticmethod
-    def validate_unique(teachers: Sequence[DistillationTeacher]) -> tuple[DistillationTeacher, ...]:
+    def validate_unique(
+        teachers: Sequence[DistillationTeacher],
+    ) -> tuple[DistillationTeacher, ...]:
         if not teachers:
             raise ValueError("at least one teacher is required")
         ids = [teacher.teacher_id for teacher in teachers]
@@ -103,7 +117,11 @@ class TeacherSignal(BaseModel):
     def _finite_optional(cls, value: float | None, info: object) -> float | None:
         if value is None:
             return None
-        if type(value) is bool or not isinstance(value, int | float) or not math.isfinite(float(value)):
+        if (
+            type(value) is bool
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+        ):
             raise ValueError(f"{getattr(info, 'field_name', 'value')} must be finite")
         return float(value)
 
@@ -138,14 +156,18 @@ class OnPolicyDistillationRow(BaseModel):
             signal.teacher_kind == "self_privileged" and signal.visibility == "none"
             for signal in self.teacher_signals
         ):
-            raise ValueError("self_privileged teacher signals must declare privileged visibility")
+            raise ValueError(
+                "self_privileged teacher signals must declare privileged visibility"
+            )
         return self
 
     def to_json(self) -> dict[str, Any]:
         body = self.model_dump(mode="json")
         body["source_trace_ids"] = [self.target_trace_id]
         body["source_split_roles"] = [self.split_role]
-        body["teacher_weight_sum"] = sum(signal.weight for signal in self.teacher_signals)
+        body["teacher_weight_sum"] = sum(
+            signal.weight for signal in self.teacher_signals
+        )
         return body
 
 
@@ -177,12 +199,19 @@ def build_mopd_peer_context(
             failures.append(trace)
     if not target_seen:
         raise ValueError(f"target trace not found in rollout group: {target_trace_id}")
-    successes = sorted(successes, key=lambda trace: (-trace.reward_components["reward"], trace.trace_id))
-    failures = sorted(failures, key=lambda trace: (trace.reward_components["reward"], trace.trace_id))
+    successes = sorted(
+        successes,
+        key=lambda trace: (-trace.reward_components["reward"], trace.trace_id),
+    )
+    failures = sorted(
+        failures, key=lambda trace: (trace.reward_components["reward"], trace.trace_id)
+    )
     return {
         "strategy": "contrastive_success_failure",
         "success_threshold": success_threshold,
-        "success_trace_ids": tuple(trace.trace_id for trace in successes[:max_successes]),
+        "success_trace_ids": tuple(
+            trace.trace_id for trace in successes[:max_successes]
+        ),
         "failure_trace_ids": tuple(trace.trace_id for trace in failures[:max_failures]),
     }
 
@@ -205,7 +234,9 @@ def build_multi_teacher_view(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in serialized_rows),
         encoding="utf-8",
     )
-    teacher_ids = sorted({signal.teacher_id for row in rows for signal in row.teacher_signals})
+    teacher_ids = sorted(
+        {signal.teacher_id for row in rows for signal in row.teacher_signals}
+    )
     visibility = _view_visibility(rows)
     return build_training_view_artifact(
         view_id=view_id,
@@ -216,7 +247,6 @@ def build_multi_teacher_view(
         data_path=path,
         artifact_root=path.parent,
         data_kind="multi_teacher_opd_jsonl",
-        rows=serialized_rows,
         privileged_visibility=visibility,
         metadata={
             "teacher_ids": teacher_ids,
@@ -228,7 +258,9 @@ def build_multi_teacher_view(
     )
 
 
-def _view_visibility(rows: Sequence[OnPolicyDistillationRow]) -> Literal[
+def _view_visibility(
+    rows: Sequence[OnPolicyDistillationRow],
+) -> Literal[
     "none",
     "gold_answer",
     "verifier_feedback",
@@ -252,7 +284,12 @@ def _view_visibility(rows: Sequence[OnPolicyDistillationRow]) -> Literal[
                 strongest_rank = rank
     if strongest == "environment":
         return "privileged_context"
-    return cast(Literal["none", "gold_answer", "verifier_feedback", "privileged_context", "unknown"], strongest)
+    return cast(
+        Literal[
+            "none", "gold_answer", "verifier_feedback", "privileged_context", "unknown"
+        ],
+        strongest,
+    )
 
 
 def multi_teacher_kl_loss(
@@ -275,7 +312,9 @@ def multi_teacher_kl_loss(
     if teacher_logits.ndim != 4:
         raise ValueError("teacher_logits must have shape [teachers, batch, seq, vocab]")
     if teacher_logits.shape[1:] != student_logits.shape:
-        raise ValueError("teacher logits batch/seq/vocab dimensions must match student logits")
+        raise ValueError(
+            "teacher logits batch/seq/vocab dimensions must match student logits"
+        )
     if teacher_weights.shape != (teacher_logits.shape[0],):
         raise ValueError("teacher_weights must have shape [teachers]")
     if rollout_token_mask.shape != student_logits.shape[:2]:
@@ -294,7 +333,11 @@ def multi_teacher_kl_loss(
     mixed_teacher_probs = mixed_teacher_probs.clamp_min(1e-12)
     mixed_teacher_log_probs = mixed_teacher_probs.log()
     student_log_probs = F.log_softmax(selected_student, dim=-1)
-    return (mixed_teacher_probs * (mixed_teacher_log_probs - student_log_probs)).sum(dim=-1).mean()
+    return (
+        (mixed_teacher_probs * (mixed_teacher_log_probs - student_log_probs))
+        .sum(dim=-1)
+        .mean()
+    )
 
 
 __all__ = [

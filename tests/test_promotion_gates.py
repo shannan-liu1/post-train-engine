@@ -291,7 +291,9 @@ def test_promotion_fails_closed_on_unsupported_primary_metric_contracts() -> Non
         decide_promotion(baseline, candidate, PromotionGateConfig())
 
 
-def test_promotion_rejects_required_slice_regression_even_when_global_delta_passes() -> None:
+def test_promotion_rejects_required_slice_regression_even_when_global_delta_passes() -> (
+    None
+):
     baseline_rows: list[EvalExampleResult] = []
     candidate_rows: list[EvalExampleResult] = []
     for idx in range(10):
@@ -399,6 +401,13 @@ def test_promotion_rejects_critical_or_high_severity_regressions() -> None:
     assert decision.severity_summary["high"] == 1
     assert decision.decision == "reject"
 
+    protected_baseline = replace(
+        baseline,
+        examples=(
+            replace(baseline.examples[0], protected=True),
+            *baseline.examples[1:],
+        ),
+    )
     protected_candidate = EvalArtifact(
         artifact_id="new-protected",
         primary_metric=baseline.primary_metric,
@@ -415,7 +424,7 @@ def test_promotion_rejects_critical_or_high_severity_regressions() -> None:
         ),
     )
     protected_decision = decide_promotion(
-        baseline,
+        protected_baseline,
         protected_candidate,
         PromotionGateConfig(
             min_primary_delta=0.0,
@@ -428,6 +437,62 @@ def test_promotion_rejects_critical_or_high_severity_regressions() -> None:
     assert protected_decision.gates["critical_severity"] == "fail"
     assert protected_decision.severity_summary["critical"] == 1
     assert protected_decision.decision == "reject"
+
+
+def test_promotion_rejects_candidate_controlled_suite_metadata() -> None:
+    baseline = _artifact("old", [True] * 10 + [False] * 90)
+    candidate_rows = list(
+        _artifact("new", [False] + [True] * 20 + [False] * 79).examples
+    )
+    candidate_rows[0] = EvalExampleResult(
+        example_id=candidate_rows[0].example_id,
+        correct=False,
+        tokens=candidate_rows[0].tokens,
+        bucket="frontier",
+        protected=False,
+    )
+
+    with pytest.raises(ValueError, match="suite metadata differs"):
+        decide_promotion(
+            baseline,
+            EvalArtifact(
+                artifact_id="new",
+                primary_metric=baseline.primary_metric,
+                evaluation_contract_hash=_EVAL_CONTRACT_HASH,
+                examples=tuple(candidate_rows),
+            ),
+            PromotionGateConfig(),
+        )
+
+
+def test_promotion_recomputes_correctness_slice_metrics_from_paired_rows() -> None:
+    baseline = replace(
+        _artifact("old", [True] * 10 + [False] * 90),
+        slices={"easy_stable": {"greedy_exact_accuracy@1": 0.0}},
+    )
+    candidate = replace(
+        _artifact("new", [False] + [True] * 20 + [False] * 79),
+        slices={"easy_stable": {"greedy_exact_accuracy@1": 1.0}},
+    )
+
+    decision = decide_promotion(
+        baseline,
+        candidate,
+        PromotionGateConfig(
+            min_primary_delta=0.0,
+            min_primary_ci_low=-1.0,
+            max_mcnemar_p=1.0,
+            required_slice_gates=(
+                SliceGateConfig(
+                    slice_name="easy_stable",
+                    metric="greedy_exact_accuracy@1",
+                    max_regression=0.0,
+                ),
+            ),
+        ),
+    )
+
+    assert decision.gates["slice:easy_stable:greedy_exact_accuracy@1"] == "fail"
 
 
 def test_promotion_rejects_failing_canary_decision() -> None:

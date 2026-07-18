@@ -82,6 +82,19 @@ def test_task_registry_and_eval_source_use_normalized_examples() -> None:
     }
 
 
+@pytest.mark.parametrize("difficulty", [0, 6])
+def test_normalized_example_rejects_out_of_range_difficulty(
+    difficulty: int,
+) -> None:
+    with pytest.raises(ValueError, match="difficulty"):
+        Example(
+            id="example",
+            source="toy",
+            prompt="2 + 2?",
+            difficulty=difficulty,
+        )
+
+
 def test_checkpoint_registry_and_replay_buffer_persist_jsonl(tmp_path) -> None:
     checkpoints = CheckpointRegistry(tmp_path / "checkpoints.jsonl")
     checkpoints.append(
@@ -107,7 +120,9 @@ def test_checkpoint_registry_and_replay_buffer_persist_jsonl(tmp_path) -> None:
     )
 
     assert checkpoints.best_promoted().candidate_id == "candidate-1"
-    assert [row["candidate_id"] for row in read_jsonl(tmp_path / "checkpoints.jsonl")] == [
+    assert [
+        row["candidate_id"] for row in read_jsonl(tmp_path / "checkpoints.jsonl")
+    ] == [
         "candidate-1",
         "candidate-2",
     ]

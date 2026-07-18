@@ -112,7 +112,9 @@ def execute_run_config(
         return runner(raw, Path(config_path))
     if "schema_version" in raw:
         if schema_version != "runpod_grpo_hillclimb_v1":
-            raise ValueError(f"unsupported run config schema_version {schema_version!r}")
+            raise ValueError(
+                f"unsupported run config schema_version {schema_version!r}"
+            )
         if api_shape:
             raise ValueError(
                 "conflicting run config discriminators: RunPod schema cannot be "
@@ -157,6 +159,7 @@ def run_local_gsm8k_smoke(
     require_nonfailed_manifest(execution.manifest, plan.output_dir)
     return execution.manifest
 
+
 def _write_training_views(
     out_dir: Path,
     *,
@@ -179,7 +182,6 @@ def _write_training_views(
             data_path=curriculum_dir / "grpo_frontier.jsonl",
             artifact_root=out_dir.parent,
             data_kind="grpo_frontier",
-            rows=curriculum.grpo_frontier,
             privileged_visibility="none",
             metadata={"bucket_policy": "frontier"},
         ),
@@ -195,7 +197,6 @@ def _write_training_views(
             data_path=curriculum_dir / "easy_regression.jsonl",
             artifact_root=out_dir.parent,
             data_kind="easy_regression",
-            rows=curriculum.easy_regression,
             privileged_visibility="none",
             metadata={"bucket_policy": "easy_regression_rehearsal"},
         ),
@@ -211,7 +212,6 @@ def _write_training_views(
             data_path=curriculum_dir / "opsd_hard.jsonl",
             artifact_root=out_dir.parent,
             data_kind="opsd_hard",
-            rows=curriculum.opsd_hard,
             privileged_visibility="gold_answer",
             metadata={"bucket_policy": "hard_or_unsolved_parseable"},
         ),
@@ -281,7 +281,9 @@ class _SmokeConfig:
             prompt_style=str(raw.get("prompt_style") or "thinking_tags"),
             rollouts=rollouts,
             early_rollouts=early_rollouts,
-            max_new_tokens=_positive_int(raw.get("max_new_tokens", 64), "max_new_tokens"),
+            max_new_tokens=_positive_int(
+                raw.get("max_new_tokens", 64), "max_new_tokens"
+            ),
         )
 
 
@@ -562,7 +564,9 @@ class _LocalGSM8KSmokeAdapter:
                 "method": "grpo_vanilla",
                 "model": self.cfg.model_id,
                 "optimizer": {"framework": DEFAULT_OPTIMIZER_FRAMEWORK},
-                "data": str(Path(plan.output_dir) / "curriculum" / "grpo_frontier.jsonl"),
+                "data": str(
+                    Path(plan.output_dir) / "curriculum" / "grpo_frontier.jsonl"
+                ),
                 "status": "validated_not_trained",
             },
         )
@@ -653,7 +657,10 @@ class _LocalGSM8KSmokeAdapter:
                     "candidate_eval": prior["evaluate"].artifacts["candidate_eval"],
                     "promotion_eval_artifact": candidate.to_dict(),
                 },
-                evaluation_metadata={"split": "dev_promotion", "split_hash": split_hash},
+                evaluation_metadata={
+                    "split": "dev_promotion",
+                    "split_hash": split_hash,
+                },
                 train_artifacts={
                     "grpo_frontier": prior["evidence"].artifacts["grpo_frontier"],
                 },
@@ -847,7 +854,9 @@ def _trace_records_from_probe_rows(
             policy_step=0,
             policy_step_evidence="static",
             rollout_group_id=f"{row['example_id']}:rollouts",
-            generation_backend=str(dict(row["generation_config"]).get("backend", "unknown")),
+            generation_backend=str(
+                dict(row["generation_config"]).get("backend", "unknown")
+            ),
             sampling_config=dict(row["generation_config"]),
             verifier_id="gsm8k_numeric_v1",
             reward_components={"gsm8k_reward": float(row["reward"])},

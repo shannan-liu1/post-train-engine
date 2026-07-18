@@ -30,7 +30,9 @@ class _GpuRunnerBase:
 
     def train(self, request: MethodTrainingRequest) -> RunResult:
         if not isinstance(request, MethodTrainingRequest):
-            raise TypeError("method runners require a MethodTrainingRequest with TrainingView")
+            raise TypeError(
+                "method runners require a MethodTrainingRequest with TrainingView"
+            )
         config = request.config
         self._validate_config(config)
         request.training_view.require_data_integrity(
@@ -92,7 +94,9 @@ class _GpuRunnerBase:
             remove_unused_columns=False,
         )
 
-    def _load_model_and_tokenizer(self, config: ExperimentConfig, torch: Any) -> tuple[Any, Any]:
+    def _load_model_and_tokenizer(
+        self, config: ExperimentConfig, torch: Any
+    ) -> tuple[Any, Any]:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         dtype = {
@@ -152,10 +156,14 @@ class _GpuRunnerBase:
             },
         )
 
-    def _optimizer_tuple(self, model: Any, config: ExperimentConfig, torch: Any) -> tuple[Any, None]:
+    def _optimizer_tuple(
+        self, model: Any, config: ExperimentConfig, torch: Any
+    ) -> tuple[Any, None]:
         return build_optimizer(model, config.optimizer, config.training, torch), None
 
-    def _train_after_validation(self, config: ExperimentConfig, torch: Any) -> RunResult:
+    def _train_after_validation(
+        self, config: ExperimentConfig, torch: Any
+    ) -> RunResult:
         raise NotImplementedError
 
 
@@ -163,7 +171,9 @@ class _GpuRunnerBase:
 class SFTGpuRunner(_GpuRunnerBase):
     name: str = field(init=False, default="sft")
 
-    def _train_after_validation(self, config: ExperimentConfig, torch: Any) -> RunResult:
+    def _train_after_validation(
+        self, config: ExperimentConfig, torch: Any
+    ) -> RunResult:
         from trl import SFTTrainer
 
         model, tokenizer = self._load_model_and_tokenizer(config, torch)
@@ -187,7 +197,9 @@ class SFTGpuRunner(_GpuRunnerBase):
 class DPOGpuRunner(_GpuRunnerBase):
     name: str = field(init=False, default="dpo")
 
-    def _train_after_validation(self, config: ExperimentConfig, torch: Any) -> RunResult:
+    def _train_after_validation(
+        self, config: ExperimentConfig, torch: Any
+    ) -> RunResult:
         from trl import DPOTrainer
 
         model, tokenizer = self._load_model_and_tokenizer(config, torch)
@@ -222,7 +234,9 @@ class GRPOGpuRunner(_GpuRunnerBase):
                 + ", ".join(unsupported)
             )
 
-    def _train_after_validation(self, config: ExperimentConfig, torch: Any) -> RunResult:
+    def _train_after_validation(
+        self, config: ExperimentConfig, torch: Any
+    ) -> RunResult:
         from trl import GRPOTrainer
 
         model, tokenizer = self._load_model_and_tokenizer(config, torch)
@@ -268,8 +282,12 @@ def _numeric_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
     return out
 
 
-def _build_trainer(trainer_cls: type[Any], tokenizer: Any, kwargs: dict[str, Any]) -> Any:
+def _build_trainer(
+    trainer_cls: type[Any], tokenizer: Any, kwargs: dict[str, Any]
+) -> Any:
     try:
         return trainer_cls(processing_class=tokenizer, **kwargs)
-    except TypeError:
+    except TypeError as exc:
+        if "unexpected keyword argument 'processing_class'" not in str(exc):
+            raise
         return trainer_cls(tokenizer=tokenizer, **kwargs)

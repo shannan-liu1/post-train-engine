@@ -13,7 +13,11 @@ from typing import Any, Callable, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from post_train_engine.artifacts import require_valid_run_bundle
-from post_train_engine.campaign import CampaignStore, ProposalOutcome, recommend_from_run
+from post_train_engine.campaign import (
+    CampaignStore,
+    ProposalOutcome,
+    recommend_from_run,
+)
 from post_train_engine.evaluation_roles import EvaluationRoles
 from post_train_engine.evidence_safety import (
     ContentSeparationCertificate,
@@ -22,6 +26,7 @@ from post_train_engine.evidence_safety import (
 from post_train_engine.evals.contract import EvalContract, hash_example_ids
 from post_train_engine.evals.promotion import (
     PromotionGateConfig,
+    canary_decision_from_artifact,
     decide_promotion,
     load_eval_artifact,
     write_promotion_decision,
@@ -30,6 +35,7 @@ from post_train_engine.run_bundle import (
     ResolvedInput,
     RunBundle,
     RunManifest,
+    SourceIdentity,
     capture_source_identity,
     make_artifact_ref,
     write_manifest_atomic,
@@ -92,9 +98,16 @@ class CampaignBinding(BaseModel):
                 "campaign promotion suite requires id, version, and max exposures"
             )
         if self.settlement_mode == "provider_billing" and not self.provider_resource_id:
-            raise ValueError("provider billing settlement requires provider_resource_id")
-        if self.settlement_mode == "stage_measured" and self.provider_resource_id is not None:
-            raise ValueError("stage-measured settlement cannot name provider_resource_id")
+            raise ValueError(
+                "provider billing settlement requires provider_resource_id"
+            )
+        if (
+            self.settlement_mode == "stage_measured"
+            and self.provider_resource_id is not None
+        ):
+            raise ValueError(
+                "stage-measured settlement cannot name provider_resource_id"
+            )
         return self
 
 
@@ -111,6 +124,7 @@ class RunPlan(BaseModel):
     model_id: str = Field(..., min_length=1)
     output_dir: str = Field(..., min_length=1)
     source_root: str | None = None
+    source_identity: SourceIdentity | None = None
     inputs: dict[str, ResolvedInput]
     training_example_ids: tuple[str, ...] = ()
     selection_example_ids: tuple[str, ...] = ()
@@ -119,6 +133,7 @@ class RunPlan(BaseModel):
     canary_example_ids: tuple[str, ...] = ()
     unseen_example_ids: tuple[str, ...] = ()
     evaluation_contract: EvalContract
+    canary_evaluation_contract: EvalContract | None = None
     content_separation: ContentSeparationCertificate
     verifier_separation: VerifierSeparation
     max_cost_usd: float | None = Field(default=None, ge=0.0)
@@ -139,11 +154,32 @@ class RunPlan(BaseModel):
         roles.require_training_eligible(self.training_example_ids)
         if not self.promotion_example_ids:
             raise ValueError("RunPlan requires promotion example IDs")
+        if self.evaluation_contract.role != "promotion":
+            raise ValueError(
+                "RunPlan promotion evaluation contract requires promotion role"
+            )
         if self.evaluation_contract.example_ids_sha256 != hash_example_ids(
             self.promotion_example_ids
         ):
             raise ValueError(
                 "RunPlan promotion example IDs do not match the evaluation contract example IDs"
+            )
+        if bool(self.canary_example_ids) != bool(self.canary_evaluation_contract):
+            raise ValueError(
+                "RunPlan canary IDs and canary evaluation contract must be declared together"
+            )
+        if (
+            self.canary_evaluation_contract is not None
+            and self.canary_evaluation_contract.role != "canary"
+        ):
+            raise ValueError("RunPlan canary evaluation contract requires canary role")
+        if (
+            self.canary_evaluation_contract is not None
+            and self.canary_evaluation_contract.example_ids_sha256
+            != hash_example_ids(self.canary_example_ids)
+        ):
+            raise ValueError(
+                "RunPlan canary example IDs do not match the canary evaluation contract"
             )
         expected_protected_count = len(roles.protected_example_ids)
         if (
@@ -155,7 +191,9 @@ class RunPlan(BaseModel):
             )
         missing = {"model", "dataset"}.difference(self.inputs)
         if missing:
-            raise ValueError("RunPlan missing core inputs: " + ", ".join(sorted(missing)))
+            raise ValueError(
+                "RunPlan missing core inputs: " + ", ".join(sorted(missing))
+            )
         if self.certification_mode == "certifying" and self.campaign is None:
             raise ValueError("certifying RunPlan requires a campaign binding")
         non_exact = sorted(
@@ -168,7 +206,10 @@ class RunPlan(BaseModel):
                 "certifying RunPlan requires exact input identities: "
                 + ", ".join(non_exact)
             )
-        if self.certification_mode == "non_certifying_smoke" and self.campaign is not None:
+        if (
+            self.certification_mode == "non_certifying_smoke"
+            and self.campaign is not None
+        ):
             raise ValueError("non-certifying smoke RunPlan cannot bind a campaign")
         if (
             self.campaign is not None
@@ -335,8 +376,29 @@ class RunEngine:
         is_writer = coordinator is None or coordinator.is_main_process
         if is_writer:
             run_dir.mkdir(parents=True, exist_ok=True)
+            if plan.source_identity is None:
+                plan = plan.model_copy(
+                    update={
+                        "source_identity": capture_source_identity(
+                            plan.source_root or Path.cwd()
+                        )
+                    }
+                )
+            frozen_plan_path = run_dir / "state" / "run_plan.json"
+            if frozen_plan_path.is_file():
+                frozen_plan = RunPlan.model_validate_json(
+                    frozen_plan_path.read_text(encoding="utf-8")
+                )
+                if frozen_plan.plan_hash != plan.plan_hash:
+                    raise ValueError("frozen RunPlan does not match resolved plan")
+            else:
+                _write_model_atomic(frozen_plan_path, plan)
         if coordinator is not None:
             coordinator.wait(plan.distributed_timeout_seconds)
+            if not is_writer:
+                plan = RunPlan.model_validate_json(
+                    (run_dir / "state" / "run_plan.json").read_text(encoding="utf-8")
+                )
         if manifest_path.is_file():
             bundle = RunBundle.load(run_dir)
             require_valid_run_bundle(run_dir)
@@ -441,9 +503,7 @@ class RunEngine:
                         output = resolution_output if is_writer else None
                     elif stage == "promote":
                         output = (
-                            self._promote(run_dir, plan, prior)
-                            if is_writer
-                            else None
+                            self._promote(run_dir, plan, prior) if is_writer else None
                         )
                     else:
                         output = adapter.execute_stage(stage, plan, dict(prior))
@@ -475,27 +535,48 @@ class RunEngine:
                 if local_error is not None:
                     raise local_error
                 raise failure
+            persistence_error: Exception | None = None
             if execute_stage and is_writer:
-                if output is None:
-                    raise ValueError(f"writer produced no output for stage {stage}")
-                receipt = StageReceipt(
-                    stage=stage,
-                    plan_hash=plan.plan_hash,
-                    duration_seconds=(
-                        resolution_duration_seconds
-                        if stage == "resolve"
-                        else time.perf_counter() - started
-                    ),
-                    output=output,
-                    artifact_sha256=_hash_stage_artifacts(run_dir, output),
+                try:
+                    if output is None:
+                        raise ValueError(f"writer produced no output for stage {stage}")
+                    receipt = StageReceipt(
+                        stage=stage,
+                        plan_hash=plan.plan_hash,
+                        duration_seconds=(
+                            resolution_duration_seconds
+                            if stage == "resolve"
+                            else time.perf_counter() - started
+                        ),
+                        output=output,
+                        artifact_sha256=_hash_stage_artifacts(run_dir, output),
+                    )
+                    _write_model_atomic(receipt_path, receipt)
+                except Exception as exc:
+                    persistence_error = exc
+            persistence_errors = (
+                ()
+                if coordinator is None
+                else coordinator.collect_errors(
+                    None
+                    if persistence_error is None
+                    else f"{type(persistence_error).__name__}: {persistence_error}",
+                    plan.distributed_timeout_seconds,
                 )
-                _write_model_atomic(receipt_path, receipt)
-            if coordinator is not None:
-                coordinator.wait(plan.distributed_timeout_seconds)
-                if not is_writer:
-                    receipt = self._read_receipt(receipt_path, plan, stage)
+            )
+            if persistence_error is not None:
+                raise persistence_error
+            if persistence_errors:
+                raise RuntimeError(
+                    f"distributed stage {stage} receipt persistence failed: "
+                    + "; ".join(persistence_errors)
+                )
+            if coordinator is not None and not is_writer:
+                receipt = self._read_receipt(receipt_path, plan, stage)
             if receipt is None:
-                raise ValueError(f"missing stage receipt after execution: {receipt_path}")
+                raise ValueError(
+                    f"missing stage receipt after execution: {receipt_path}"
+                )
             if receipt.output.cost_usd is not None:
                 spent += receipt.output.cost_usd
             if plan.max_cost_usd is not None and receipt.output.cost_usd is None:
@@ -583,11 +664,31 @@ class RunEngine:
         if binding is None or binding.settlement_mode != "provider_billing":
             raise ValueError("RunPlan is not bound to provider billing settlement")
         parsed_receipt = PodBillingReceipt.model_validate(receipt)
-        if parsed_receipt.settlement_state != "settled" or parsed_receipt.amount_usd is None:
+        if (
+            parsed_receipt.settlement_state != "settled"
+            or parsed_receipt.amount_usd is None
+        ):
             raise ValueError("provider billing receipt is not settled")
         if parsed_receipt.pod_id != binding.provider_resource_id:
             raise ValueError("provider billing receipt belongs to a different resource")
         run_dir = Path(plan.output_dir).resolve()
+        frozen_plan_path = run_dir / "state" / "run_plan.json"
+        if not frozen_plan_path.is_file():
+            raise ValueError("provider settlement requires the frozen RunPlan")
+        frozen_plan = RunPlan.model_validate_json(
+            frozen_plan_path.read_text(encoding="utf-8")
+        )
+        comparable_frozen = frozen_plan.model_copy(
+            update={"source_identity": plan.source_identity}
+        )
+        if comparable_frozen.plan_hash != plan.plan_hash:
+            raise ValueError("settlement RunPlan does not match the frozen RunPlan")
+        plan = frozen_plan
+        binding = plan.campaign
+        if binding is None or binding.settlement_mode != "provider_billing":
+            raise ValueError(
+                "frozen RunPlan is not bound to provider billing settlement"
+            )
         bundle = RunBundle.load(run_dir)
         require_valid_run_bundle(run_dir)
         if bundle.manifest.metadata.get("plan_hash") != plan.plan_hash:
@@ -597,7 +698,9 @@ class RunEngine:
             path.read_text(encoding="utf-8")
         )
         if receipt_from_disk != parsed_receipt:
-            raise ValueError("provider billing receipt file differs from supplied receipt")
+            raise ValueError(
+                "provider billing receipt file differs from supplied receipt"
+            )
         receipt_ref = make_artifact_ref(
             run_dir,
             path,
@@ -605,7 +708,9 @@ class RunEngine:
         )
         if bundle.manifest.status in {"promoted", "rejected"}:
             if bundle.manifest.metadata.get("campaign_settlement") != "settled":
-                raise ValueError("terminal provider-billed manifest lacks settlement evidence")
+                raise ValueError(
+                    "terminal provider-billed manifest lacks settlement evidence"
+                )
             if (
                 bundle.manifest.metadata.get("provider_resource_id")
                 != parsed_receipt.pod_id
@@ -627,9 +732,7 @@ class RunEngine:
         decision_ref = bundle.manifest.artifacts.get("promotion_decision")
         if decision_ref is None:
             raise ValueError("pending settlement bundle lacks promotion decision")
-        decision = json.loads(
-            (run_dir / decision_ref.path).read_text(encoding="utf-8")
-        )
+        decision = json.loads((run_dir / decision_ref.path).read_text(encoding="utf-8"))
         terminal_status = (
             "promoted" if decision.get("decision") == "promote" else "rejected"
         )
@@ -682,6 +785,16 @@ class RunEngine:
         prior: dict[str, StageOutput],
         spent: float,
     ) -> RunExecution:
+        for receipt in receipts:
+            persisted = self._read_receipt(
+                run_dir / "state" / f"{receipt.stage}.json",
+                plan,
+                receipt.stage,
+            )
+            if persisted != receipt:
+                raise ValueError(
+                    f"stage receipt changed before finalization: {receipt.stage}"
+                )
         promotion = prior["promote"]
         decision = promotion.values.get("decision")
         if decision not in {"promote", "reject"}:
@@ -697,7 +810,13 @@ class RunEngine:
                     kind=name,
                     visibility=(
                         "sealed"
-                        if name in {"baseline_eval", "candidate_eval", "canary_eval", "unseen_eval"}
+                        if name
+                        in {
+                            "baseline_eval",
+                            "candidate_eval",
+                            "canary_eval",
+                            "unseen_eval",
+                        }
                         else "standard"
                     ),
                 )
@@ -726,7 +845,8 @@ class RunEngine:
                 if settlement_pending
                 else ("promoted" if decision == "promote" else "rejected")
             ),
-            source=capture_source_identity(plan.source_root or Path.cwd()),
+            source=plan.source_identity
+            or capture_source_identity(plan.source_root or Path.cwd()),
             inputs=plan.inputs,
             artifacts=artifacts,
             metadata={
@@ -809,7 +929,8 @@ class RunEngine:
             task_name=plan.task_name,
             model_id=plan.model_id,
             status="failed",
-            source=capture_source_identity(plan.source_root or Path.cwd()),
+            source=plan.source_identity
+            or capture_source_identity(plan.source_root or Path.cwd()),
             inputs=plan.inputs,
             artifacts=artifacts,
             metadata={
@@ -865,7 +986,9 @@ class RunEngine:
         else:
             decision_ref = manifest.artifacts.get("promotion_decision")
             if decision_ref is None:
-                raise ValueError("campaign finalization requires promotion_decision evidence")
+                raise ValueError(
+                    "campaign finalization requires promotion_decision evidence"
+                )
             decision_path = Path(plan.output_dir).resolve() / decision_ref.path
             decision = json.loads(decision_path.read_text(encoding="utf-8"))
             if not isinstance(decision, dict):
@@ -985,10 +1108,33 @@ class RunEngine:
             raise ValueError(
                 "promotion artifact rows do not match the evaluation contract"
             )
+        canary_decision = None
+        if plan.canary_example_ids:
+            try:
+                canary_path = evaluation.artifacts["canary_eval"]
+            except KeyError as exc:
+                raise ValueError(
+                    "evaluate stage must emit canary_eval when the RunPlan declares canaries"
+                ) from exc
+            canary_eval = load_eval_artifact(canary_path)
+            canary_contract = plan.canary_evaluation_contract
+            if canary_contract is None:
+                raise ValueError("RunPlan omitted the canary evaluation contract")
+            if (
+                canary_eval.evaluation_contract_hash != canary_contract.contract_hash
+                or canary_eval.primary_metric != canary_contract.primary_metric
+                or hash_example_ids(
+                    tuple(row.example_id for row in canary_eval.examples)
+                )
+                != canary_contract.example_ids_sha256
+            ):
+                raise ValueError("canary_eval rows do not match the RunPlan canary IDs")
+            canary_decision = canary_decision_from_artifact(canary_eval)
         decision = decide_promotion(
             baseline_eval,
             candidate_eval,
             PromotionGateConfig(**plan.promotion_gate),
+            canary_decision=canary_decision,
         )
         if plan.certification_mode == "non_certifying_smoke":
             decision = replace(
@@ -1011,9 +1157,7 @@ class RunEngine:
                 else evidence.values.get("next_experiment_signal")
             ),
             training_eligible=(
-                None
-                if evidence is None
-                else evidence.values.get("training_eligible")
+                None if evidence is None else evidence.values.get("training_eligible")
             ),
         )
         recommendation_path = run_dir / "next_experiment.json"
@@ -1104,11 +1248,7 @@ def _write_json_atomic(path: Path, body: dict[str, Any]) -> None:
 def _cost_certification_metadata(
     receipts: list[StageReceipt],
 ) -> dict[str, Any]:
-    missing = [
-        receipt.stage
-        for receipt in receipts
-        if receipt.output.cost_usd is None
-    ]
+    missing = [receipt.stage for receipt in receipts if receipt.output.cost_usd is None]
     return {
         "cost_certifying": not missing,
         "missing_cost_stages": missing,

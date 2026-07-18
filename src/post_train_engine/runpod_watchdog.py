@@ -21,8 +21,8 @@ from post_train_engine.runpod_control_plane import (
 
 RUNPOD_API_KEY_ENV = "PTE_REMOTE_RUNPOD_ALL"
 _DELETE_VERIFY_ATTEMPTS = 3
-_DELETE_VERIFY_DELAY_SECONDS = 2.0
 _MINIMUM_DETACHED_LEAD_SECONDS = 5.0
+_AMBIGUOUS_RECONCILIATION_INTERVAL_SECONDS = 10.0
 _CHILD_ENV_ALLOWLIST = frozenset(
     {
         "APPDATA",
@@ -55,6 +55,7 @@ def launch_local_deletion_watchdog(
     api_key: str,
     spawn: Callable[..., SpawnedProcess] = subprocess.Popen,
     clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
     transport_factory: Callable[[str], RunPodTransport] = RunPodRESTTransport,
 ) -> dict[str, Any]:
     """Launch the provider-authoritative watchdog without serializing its key."""
@@ -64,11 +65,14 @@ def launch_local_deletion_watchdog(
     journal = Path(journal_path).resolve()
     receipt = Path(receipt_path).resolve()
     log = Path(log_path).resolve()
-    operation = _load_created_operation(journal)
-    pod_id, deadline_seconds, delete_at_unix = _watchdog_target(operation)
+    operation = _load_guarded_operation(journal)
+    target = _watchdog_target(operation)
     receipt.parent.mkdir(parents=True, exist_ok=True)
     log.parent.mkdir(parents=True, exist_ok=True)
-    if delete_at_unix - clock() <= _MINIMUM_DETACHED_LEAD_SECONDS:
+    if (
+        "pod_id" in target
+        and target["delete_at_unix"] - clock() <= _MINIMUM_DETACHED_LEAD_SECONDS
+    ):
         return run_local_deletion_watchdog(
             journal_path=journal,
             receipt_path=receipt,
@@ -81,9 +85,7 @@ def launch_local_deletion_watchdog(
         receipt,
         {
             "state": "launching",
-            "pod_id": pod_id,
-            "hard_deadline_seconds": deadline_seconds,
-            "delete_at_unix": delete_at_unix,
+            **target,
             "recorded_at_unix": time.time(),
         },
     )
@@ -112,14 +114,24 @@ def launch_local_deletion_watchdog(
         spawn_kwargs["start_new_session"] = True
     with log.open("ab") as log_stream:
         process = spawn(command, stdout=log_stream, **spawn_kwargs)
-    if process.poll() is not None:
-        raise RuntimeError("RunPod deletion watchdog exited during launch")
+    ready = False
+    for _attempt in range(20):
+        if process.poll() is not None:
+            raise RuntimeError("RunPod deletion watchdog exited during launch")
+        try:
+            child_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            child_receipt = {}
+        if isinstance(child_receipt, dict) and child_receipt.get("state") == "ready":
+            ready = True
+            break
+        sleep(0.1)
+    if not ready:
+        raise RuntimeError("RunPod deletion watchdog did not confirm readiness")
     result = {
         "state": "armed",
-        "pod_id": pod_id,
+        **target,
         "pid": process.pid,
-        "hard_deadline_seconds": deadline_seconds,
-        "delete_at_unix": delete_at_unix,
         "recorded_at_unix": time.time(),
         "log_path": str(log),
     }
@@ -136,83 +148,176 @@ def run_local_deletion_watchdog(
     clock: Callable[[], float] = time.time,
     transport_factory: Callable[[str], RunPodTransport] = RunPodRESTTransport,
 ) -> dict[str, Any]:
-    """Wait for the journal deadline, delete its literal Pod, and persist evidence."""
+    """Supervise one intent until its Pod is absent or provider TTL takes over."""
 
     if not api_key:
         raise ValueError("RunPod API key must be non-empty")
     journal = Path(journal_path).resolve()
     receipt = Path(receipt_path).resolve()
-    operation = _load_created_operation(journal)
-    pod_id, _deadline_seconds, delete_at_unix = _watchdog_target(operation)
-    sleep(max(0.0, delete_at_unix - clock()))
-    control = RunPodControlPlane(transport_factory(api_key), journal)
-    last_error: Exception | None = None
-    for attempt in range(_DELETE_VERIFY_ATTEMPTS):
-        delete_error: Exception | None = None
-        try:
-            control.delete_pod(pod_id)
-        except Exception as exc:
-            delete_error = exc
-            last_error = exc
-        try:
-            absent = control.verify_pod_absent(pod_id)
-        except Exception as exc:
-            absent = False
-            last_error = exc
-        if absent:
+    operation = _load_guarded_operation(journal)
+    target = _watchdog_target(operation)
+    _write_json_atomic(
+        receipt,
+        {"state": "ready", **target, "recorded_at_unix": time.time()},
+    )
+    while True:
+        operation = _load_guarded_operation(journal)
+        if operation.get("state") == "deleted":
             result = {
-                "state": "absent" if delete_error is not None else "deleted",
-                "pod_id": pod_id,
-                "delete_attempts": attempt + 1,
+                "state": "absent",
+                "pod_id": operation.get("deleted_pod_id"),
                 "recorded_at_unix": time.time(),
             }
             _write_json_atomic(receipt, result)
             return result
-        if attempt + 1 < _DELETE_VERIFY_ATTEMPTS:
-            sleep(_DELETE_VERIFY_DELAY_SECONDS)
+        target = _watchdog_target(operation)
+        delay = target["delete_at_unix"] - clock()
+        if delay > 0.0:
+            sleep(delay)
+            refreshed = _load_guarded_operation(journal)
+            if refreshed.get("state") == "deleted":
+                continue
+            refreshed_target = _watchdog_target(refreshed)
+            if refreshed_target["delete_at_unix"] > target["delete_at_unix"]:
+                continue
+            target = refreshed_target
+        break
 
-    journal_error: Exception | None = None
+    control = RunPodControlPlane(
+        transport_factory(api_key),
+        journal,
+        sleep=sleep,
+        clock=clock,
+    )
+    pod_id = target.get("pod_id")
+    while not isinstance(pod_id, str) or not pod_id:
+        operation = _load_guarded_operation(journal)
+        if operation.get("state") == "deleted":
+            result = {
+                "state": "absent",
+                "pod_id": operation.get("deleted_pod_id"),
+                "recorded_at_unix": time.time(),
+            }
+            _write_json_atomic(receipt, result)
+            return result
+        refreshed_target = _watchdog_target(operation)
+        pod_id = refreshed_target.get("pod_id")
+        if isinstance(pod_id, str) and pod_id:
+            break
+        pod_name = str(target.get("pod_name") or "")
+        inventory_error: BaseException | None = None
+        try:
+            pods = control.list_pods()
+        except (OSError, TimeoutError) as exc:
+            inventory_error = exc
+            pods = []
+        matches = [row for row in pods if str(row.get("name")) == pod_name]
+        if len(matches) > 1:
+            raise RuntimeError(f"multiple RunPod Pods share watchdog name {pod_name!r}")
+        if matches:
+            pod_id = str(matches[0].get("id") or "")
+            if not pod_id:
+                raise RuntimeError("RunPod watchdog reconciliation found no Pod id")
+            break
+        provider_ttl_unix = _provider_ttl_unix(operation)
+        now = clock()
+        if inventory_error is not None:
+            if now >= provider_ttl_unix:
+                result = {
+                    "state": "failed",
+                    "pod_name": pod_name,
+                    "error_type": type(inventory_error).__name__,
+                    "error": "provider inventory remained unavailable through provider TTL",
+                    "recorded_at_unix": time.time(),
+                }
+                _write_json_atomic(receipt, result)
+                raise RuntimeError(result["error"]) from inventory_error
+            sleep(
+                min(
+                    _AMBIGUOUS_RECONCILIATION_INTERVAL_SECONDS,
+                    provider_ttl_unix - now,
+                )
+            )
+            continue
+        if now >= provider_ttl_unix:
+            result = {
+                "state": "absent",
+                "pod_name": pod_name,
+                "recorded_at_unix": time.time(),
+            }
+            _write_json_atomic(receipt, result)
+            return result
+        sleep(
+            min(
+                _AMBIGUOUS_RECONCILIATION_INTERVAL_SECONDS,
+                provider_ttl_unix - now,
+            )
+        )
     try:
-        control.record_delete_unverified(pod_id)
+        delete_attempts = control.delete_pod_and_verify(
+            pod_id, attempts=_DELETE_VERIFY_ATTEMPTS
+        )
     except Exception as exc:
-        journal_error = exc
+        result = {
+            "state": "failed",
+            "pod_id": pod_id,
+            "delete_attempts": _DELETE_VERIFY_ATTEMPTS,
+            "error_type": type(exc).__name__,
+            **(
+                {"journal_error_type": type(exc).__name__}
+                if isinstance(exc, (json.JSONDecodeError, OSError))
+                else {}
+            ),
+            "error": "provider still reports the Pod active after deletion retries",
+            "recorded_at_unix": time.time(),
+        }
+        _write_json_atomic(receipt, result)
+        raise RuntimeError(result["error"]) from exc
     result = {
-        "state": "failed",
+        "state": "deleted",
         "pod_id": pod_id,
-        "delete_attempts": _DELETE_VERIFY_ATTEMPTS,
-        "error_type": (
-            type(last_error).__name__
-            if last_error is not None
-            else "PodStillActiveError"
-        ),
-        "error": "provider still reports the Pod active after deletion retries",
-        **(
-            {"journal_error_type": type(journal_error).__name__}
-            if journal_error is not None
-            else {}
-        ),
+        "delete_attempts": delete_attempts,
         "recorded_at_unix": time.time(),
     }
     _write_json_atomic(receipt, result)
-    raise RuntimeError(result["error"]) from (journal_error or last_error)
+    return result
 
 
-def _load_created_operation(path: Path) -> dict[str, Any]:
+def _load_guarded_operation(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("state") != "created":
-        raise ValueError("watchdog requires a created RunPod operation journal")
+    allowed = {
+        "intent",
+        "create_started",
+        "ambiguous",
+        "created",
+        "delete_requested",
+        "delete_unverified",
+        "deleted",
+    }
+    if not isinstance(raw, dict) or raw.get("state") not in allowed:
+        raise ValueError("watchdog requires a guarded RunPod operation journal")
     return raw
 
 
-def _watchdog_target(operation: Mapping[str, Any]) -> tuple[str, int, float]:
+def _watchdog_target(operation: Mapping[str, Any]) -> dict[str, Any]:
     receipt = operation.get("receipt")
-    if not isinstance(receipt, dict):
-        raise ValueError("RunPod operation journal is missing its create receipt")
-    pod_id = str(receipt.get("pod_id") or "")
-    deadline = receipt.get("hard_deadline_seconds")
-    recorded_at = receipt.get("recorded_at_unix")
-    if not pod_id:
-        raise ValueError("RunPod create receipt is missing the Pod id")
+    if isinstance(receipt, dict):
+        pod_id = str(receipt.get("pod_id") or "")
+        deadline = receipt.get("hard_deadline_seconds")
+        recorded_at = receipt.get("recorded_at_unix")
+        if not pod_id:
+            raise ValueError("RunPod create receipt is missing the Pod id")
+        identity = {"pod_id": pod_id}
+    else:
+        pod_name = str(operation.get("pod_name") or "")
+        budget = operation.get("budget")
+        deadline = (
+            budget.get("minimum_runtime_seconds") if isinstance(budget, dict) else None
+        )
+        recorded_at = operation.get("intent_at_unix")
+        if not pod_name:
+            raise ValueError("RunPod create intent is missing the Pod name")
+        identity = {"pod_name": pod_name}
     if type(deadline) is not int or deadline <= 0:
         raise ValueError("RunPod create receipt requires a positive hard deadline")
     if (
@@ -221,12 +326,31 @@ def _watchdog_target(operation: Mapping[str, Any]) -> tuple[str, int, float]:
         or recorded_at <= 0.0
     ):
         raise ValueError("RunPod create receipt requires a valid recorded time")
-    return pod_id, deadline, float(recorded_at) + deadline
+    return {
+        **identity,
+        "hard_deadline_seconds": deadline,
+        "delete_at_unix": float(recorded_at) + deadline,
+    }
 
 
-def _watchdog_environment(
-    source: Mapping[str, str], *, api_key: str
-) -> dict[str, str]:
+def _provider_ttl_unix(operation: Mapping[str, Any]) -> float:
+    budget = operation.get("budget")
+    max_runtime = (
+        budget.get("max_runtime_seconds") if isinstance(budget, dict) else None
+    )
+    intent_at = operation.get("intent_at_unix")
+    if type(max_runtime) is not int or max_runtime <= 0:
+        raise ValueError("RunPod create intent requires a positive provider TTL")
+    if (
+        type(intent_at) not in {int, float}
+        or not math.isfinite(intent_at)
+        or intent_at <= 0.0
+    ):
+        raise ValueError("RunPod create intent requires a valid intent time")
+    return float(intent_at) + max_runtime
+
+
+def _watchdog_environment(source: Mapping[str, str], *, api_key: str) -> dict[str, str]:
     environment = {
         name: value
         for name, value in source.items()
@@ -250,11 +374,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args(argv)
     api_key = os.environ.get(RUNPOD_API_KEY_ENV, "")
-    run_local_deletion_watchdog(
-        journal_path=args.journal,
-        receipt_path=args.receipt,
-        api_key=api_key,
-    )
+    try:
+        run_local_deletion_watchdog(
+            journal_path=args.journal,
+            receipt_path=args.receipt,
+            api_key=api_key,
+        )
+    except BaseException as exc:
+        try:
+            current = json.loads(args.receipt.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current = {}
+        if not isinstance(current, dict) or current.get("state") != "failed":
+            _write_json_atomic(
+                args.receipt,
+                {
+                    "state": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "recorded_at_unix": time.time(),
+                },
+            )
+        raise
 
 
 if __name__ == "__main__":

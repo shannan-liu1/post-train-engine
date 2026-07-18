@@ -4,8 +4,8 @@ The trainer consumes normalized ``Example`` records so it does not need
 loader-specific record shapes. Task-specific metadata lives in optional fields.
 
 Validation is enforced by Pydantic at construction time. If a loader tries to
-build an ``Example`` with bad data - empty string in a required field, unknown
-source, out-of-range difficulty - Pydantic raises ``ValidationError`` and the
+build an ``Example`` with bad data, such as an empty required field or an
+out-of-range difficulty, Pydantic raises ``ValidationError`` and the
 bad record never enters the pipeline. The loader is responsible for catching
 and reporting; the schema is responsible for refusing.
 """
@@ -16,22 +16,22 @@ from typing import Any
 
 from collections.abc import Sequence
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-# Tiny type alias for the ``source`` field. Used in the model below and
-# re-exportable for callers that want to refer to the allowed values without
-# restating the literal.
+# Dataset identifiers remain extensible, so the source contract is a non-empty string.
 Source = str
 
 
 class Example(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     id: str = Field(..., min_length=1)
     source: Source = Field(..., min_length=1)
     prompt: str = Field(..., min_length=1)
     response: str | None = None
     final_answer: str | None = None
     category: str | None = None
-    difficulty: int | None = None
+    difficulty: int | None = Field(default=None, ge=1, le=5)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

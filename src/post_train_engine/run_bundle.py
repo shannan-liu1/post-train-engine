@@ -10,7 +10,16 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
+
+from post_train_engine.traces.schema import TraceRecord
 
 CANONICAL_RUN_SCHEMA_VERSION = "post_train_run_v1"
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
@@ -96,7 +105,9 @@ class ResolvedInput(BaseModel):
     @classmethod
     def _fingerprint_must_be_sha256(cls, value: str | None) -> str | None:
         if value is not None and not _SHA256_RE.fullmatch(value):
-            raise ValueError("input fingerprint must use sha256:<64 lowercase hex chars>")
+            raise ValueError(
+                "input fingerprint must use sha256:<64 lowercase hex chars>"
+            )
         return value
 
     @model_validator(mode="after")
@@ -109,10 +120,9 @@ class ResolvedInput(BaseModel):
                     "exact input identity requires resolved_revision or fingerprint"
                 )
         elif not self.non_certifying_reason:
-            raise ValueError(
-                "non-exact input identity requires non_certifying_reason"
-            )
+            raise ValueError("non-exact input identity requires non_certifying_reason")
         return self
+
 
 class RunManifest(BaseModel):
     """Canonical provenance envelope for every Run execution mode."""
@@ -167,7 +177,9 @@ class RunBundle:
         try:
             raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
-            raise FileNotFoundError(f"manifest does not exist: {manifest_path}") from exc
+            raise FileNotFoundError(
+                f"manifest does not exist: {manifest_path}"
+            ) from exc
         if not isinstance(raw, dict):
             raise ValueError(f"manifest JSON root must be an object: {manifest_path}")
         return cls(root, RunManifest.model_validate(raw))
@@ -245,13 +257,13 @@ class RunBundle:
                 }
             )
         physical_failures = any(
-            status["required"] and status["status"] != "ok"
-            for status in statuses
+            status["required"] and status["status"] != "ok" for status in statuses
         )
         if not physical_failures:
             statuses.append(self._promotion_consistency_status())
             statuses.append(self._training_view_leakage_status())
             statuses.append(self._grpo_reward_evidence_status())
+            statuses.append(self._policy_training_trace_status())
         failures = [
             status
             for status in statuses
@@ -263,8 +275,7 @@ class RunBundle:
             "status": "ok" if not failures else "failed",
             "required_count": sum(status["required"] for status in statuses),
             "ok_count": sum(
-                status["required"] and status["status"] == "ok"
-                for status in statuses
+                status["required"] and status["status"] == "ok" for status in statuses
             ),
             "failure_count": len(failures),
             "failures": failures,
@@ -286,7 +297,9 @@ class RunBundle:
         if self.manifest.status not in {"promoted", "rejected"}:
             return
 
-        expected_decision = "promote" if self.manifest.status == "promoted" else "reject"
+        expected_decision = (
+            "promote" if self.manifest.status == "promoted" else "reject"
+        )
         decision = self._read_artifact_object("promotion_decision")
         if decision.get("decision") != expected_decision:
             raise ValueError(
@@ -324,6 +337,12 @@ class RunBundle:
 
     def _training_view_leakage_status(self) -> dict[str, Any]:
         try:
+            trace_artifact = (
+                "input_traces"
+                if "input_traces" in self.manifest.artifacts
+                else "traces"
+            )
+            traces_by_id: dict[str, dict[str, Any]] | None = None
             for name, ref in self.manifest.artifacts.items():
                 if not (name.endswith("_view") or ref.kind.endswith("_view")):
                     continue
@@ -331,13 +350,21 @@ class RunBundle:
                 trace_ids = view.get("source_trace_ids")
                 roles = view.get("source_split_roles")
                 methods = view.get("method_compatibility")
+                if view.get("run_id") != self.manifest.run_id:
+                    raise ValueError(f"{name} belongs to a different Run")
+                if view.get("task_id") != self.manifest.task_name:
+                    raise ValueError(f"{name} belongs to a different task")
                 if not isinstance(trace_ids, list) or not trace_ids:
                     raise ValueError(f"{name} missing source_trace_ids")
                 if not isinstance(roles, list) or not roles:
                     raise ValueError(f"{name} missing source_split_roles")
-                protected = {"selection", "promotion", "canary", "unseen"} & set(
-                    roles
-                )
+                protected = {
+                    "selection",
+                    "diagnostic",
+                    "promotion",
+                    "canary",
+                    "unseen",
+                } & set(roles)
                 if protected:
                     raise ValueError(
                         f"{name} uses protected split sources: "
@@ -345,6 +372,30 @@ class RunBundle:
                     )
                 if not isinstance(methods, list) or not methods:
                     raise ValueError(f"{name} missing method_compatibility")
+                if traces_by_id is None:
+                    traces_by_id = self._traces_by_id(trace_artifact)
+                missing = sorted(set(trace_ids).difference(traces_by_id))
+                if missing:
+                    raise ValueError(f"{name} references missing trace: {missing[0]}")
+                observed_roles = {
+                    str(traces_by_id[trace_id].get("split_role"))
+                    for trace_id in trace_ids
+                }
+                if observed_roles != set(roles):
+                    raise ValueError(
+                        f"{name} split roles do not match referenced trace evidence"
+                    )
+                row_trace_ids, row_roles = self._validate_training_view_rows(
+                    name, view, traces_by_id
+                )
+                if row_trace_ids != set(trace_ids):
+                    raise ValueError(
+                        f"{name} row trace IDs do not match its lineage envelope"
+                    )
+                if row_roles != set(roles):
+                    raise ValueError(
+                        f"{name} row roles do not match its lineage envelope"
+                    )
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
             return _semantic_status(
                 "training_view_leakage",
@@ -369,8 +420,7 @@ class RunBundle:
                 if "input_traces" in self.manifest.artifacts
                 else "traces"
             )
-            traces = self._read_jsonl_artifact(trace_artifact)
-            traces_by_id = {str(trace.get("trace_id")): trace for trace in traces}
+            traces_by_id = self._traces_by_id(trace_artifact)
             for view_name, view in grpo_views:
                 source_trace_ids = set(view.get("source_trace_ids", ()))
                 missing = sorted(source_trace_ids.difference(traces_by_id))
@@ -391,9 +441,10 @@ class RunBundle:
                         value = trace.get(field)
                         if value is None or value == "":
                             raise ValueError(f"trace {trace_id} missing {field}")
-                    if not isinstance(trace["sampling_config"], dict) or not trace[
-                        "sampling_config"
-                    ]:
+                    if (
+                        not isinstance(trace["sampling_config"], dict)
+                        or not trace["sampling_config"]
+                    ):
                         raise ValueError(f"trace {trace_id} missing sampling_config")
             groups = self._read_jsonl_artifact("rollout_groups")
             if not groups:
@@ -417,8 +468,163 @@ class RunBundle:
             )
         return _semantic_status("grpo_reward_evidence", status="ok")
 
+    def _policy_training_trace_status(self) -> dict[str, Any]:
+        names = sorted(
+            name
+            for name in self.manifest.artifacts
+            if name.startswith("policy_trace_rank")
+        )
+        try:
+            is_runpod_grpo = self.manifest.metadata.get("execution_mode") == "runpod_grpo"
+            if not names:
+                if is_runpod_grpo:
+                    train_result = self._read_artifact_object("train_result")
+                    if train_result.get("status") == "trained":
+                        raise ValueError(
+                            "trained RunPod GRPO run omitted policy training traces"
+                        )
+                return _semantic_status("policy_training_traces", status="ok")
+            train_result = self._read_artifact_object("train_result")
+            distributed = train_result.get("distributed")
+            world_size = (
+                distributed.get("world_size") if isinstance(distributed, dict) else None
+            )
+            expected = (
+                [f"policy_trace_rank{rank}" for rank in range(world_size)]
+                if (type(world_size) is int and world_size > 0)
+                else []
+            )
+            if set(names) != set(expected):
+                raise ValueError(
+                    "policy training traces do not cover every distributed rank"
+                )
+            training_view = self._read_artifact_object("method_training_view")
+            data_ref = training_view.get("data_artifact")
+            if not isinstance(data_ref, dict) or not isinstance(
+                data_ref.get("path"), str
+            ):
+                raise ValueError("policy training traces require a TrainingView data path")
+            data_path = (self.root / PurePosixPath(data_ref["path"])).resolve()
+            try:
+                data_path.relative_to(self.root)
+            except ValueError as exc:
+                raise ValueError("TrainingView data path escapes the Run") from exc
+            if not data_path.is_file() or _sha256(data_path) != data_ref.get("sha256"):
+                raise ValueError("TrainingView data bytes do not match policy trace evidence")
+            eligible_example_ids = {
+                str(row.get("example_id"))
+                for row in self._read_jsonl_path(data_path, label="TrainingView data")
+                if row.get("example_id") is not None
+            }
+            if not eligible_example_ids:
+                raise ValueError("TrainingView data contains no eligible example IDs")
+            trace_ids: set[str] = set()
+            for name in names:
+                rows = self._read_jsonl_artifact(name)
+                if not rows:
+                    raise ValueError(f"{name} contains no policy-changing traces")
+                for row in rows:
+                    trace = TraceRecord.model_validate(row)
+                    if trace.split_role != "train":
+                        raise ValueError(f"{name} contains a non-training trace")
+                    if trace.run_id != self.manifest.run_id:
+                        raise ValueError(f"{name} belongs to a different Run")
+                    if trace.task_id != self.manifest.task_name:
+                        raise ValueError(f"{name} belongs to a different task")
+                    if trace.example_id not in eligible_example_ids:
+                        raise ValueError(
+                            f"{name} trace example was not eligible in the TrainingView"
+                        )
+                    if trace.trace_id in trace_ids:
+                        raise ValueError(
+                            f"duplicate policy training trace id: {trace.trace_id}"
+                        )
+                    trace_ids.add(trace.trace_id)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            return _semantic_status(
+                "policy_training_traces",
+                status="semantic_failed",
+                message=str(exc),
+            )
+        return _semantic_status("policy_training_traces", status="ok")
+
+    def _traces_by_id(self, artifact_name: str) -> dict[str, dict[str, Any]]:
+        traces: dict[str, dict[str, Any]] = {}
+        for trace in self._read_jsonl_artifact(artifact_name):
+            trace_id = trace.get("trace_id")
+            if not isinstance(trace_id, str) or not trace_id:
+                raise ValueError(
+                    f"artifact {artifact_name!r} contains an invalid trace id"
+                )
+            if trace_id in traces:
+                raise ValueError(f"duplicate trace id in {artifact_name!r}: {trace_id}")
+            traces[trace_id] = trace
+        return traces
+
+    def _validate_training_view_rows(
+        self,
+        view_name: str,
+        view: dict[str, Any],
+        traces_by_id: dict[str, dict[str, Any]],
+    ) -> tuple[set[str], set[str]]:
+        data_ref = view.get("data_artifact")
+        if not isinstance(data_ref, dict):
+            raise ValueError(f"{view_name} missing data_artifact")
+        raw_path = data_ref.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(f"{view_name} data_artifact has no path")
+        path = (self.root / PurePosixPath(raw_path)).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError(f"{view_name} data_artifact escapes the Run") from exc
+        if not path.is_file() or _sha256(path) != data_ref.get("sha256"):
+            raise ValueError(f"{view_name} data_artifact bytes do not match")
+        row_trace_ids: set[str] = set()
+        row_roles: set[str] = set()
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"{view_name} training row {line_number} must be an object"
+                )
+            trace_ids = row.get("source_trace_ids")
+            roles = row.get("source_split_roles")
+            if not isinstance(trace_ids, list) or not trace_ids:
+                raise ValueError(
+                    f"{view_name} training row {line_number} missing source_trace_ids"
+                )
+            if not isinstance(roles, list) or not roles:
+                raise ValueError(
+                    f"{view_name} training row {line_number} missing source_split_roles"
+                )
+            missing = sorted(set(trace_ids).difference(traces_by_id))
+            if missing:
+                raise ValueError(
+                    f"{view_name} training row {line_number} references missing trace"
+                )
+            observed = {
+                str(traces_by_id[trace_id].get("split_role"))
+                for trace_id in trace_ids
+            }
+            if observed != set(roles):
+                raise ValueError(
+                    f"{view_name} training row {line_number} roles do not match traces"
+                )
+            row_trace_ids.update(trace_ids)
+            row_roles.update(roles)
+        return row_trace_ids, row_roles
+
     def _read_jsonl_artifact(self, name: str) -> list[dict[str, Any]]:
         path = self.verified_artifact_path(name, allow_sealed=True)
+        return self._read_jsonl_path(path, label=f"artifact {name!r}")
+
+    @staticmethod
+    def _read_jsonl_path(path: Path, *, label: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(),
@@ -428,9 +634,7 @@ class RunBundle:
                 continue
             value = json.loads(line)
             if not isinstance(value, dict):
-                raise ValueError(
-                    f"artifact {name!r} line {line_number} must be an object"
-                )
+                raise ValueError(f"{label} line {line_number} must be an object")
             rows.append(value)
         return rows
 

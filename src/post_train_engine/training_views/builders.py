@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,13 +26,13 @@ def build_training_view_artifact(
     data_path: str | Path,
     artifact_root: str | Path,
     data_kind: str,
-    rows: Iterable[Mapping[str, Any]],
     privileged_visibility: PrivilegedVisibility,
     metadata: Mapping[str, Any] | None = None,
 ) -> TrainingViewArtifact:
     """Build a typed view manifest from row-level trace provenance."""
 
-    row_list = tuple(rows)
+    data_path = Path(data_path)
+    trace_ids, split_roles = _read_jsonl_provenance(data_path)
     return TrainingViewArtifact(
         view_id=view_id,
         run_id=run_id,
@@ -43,37 +44,57 @@ def build_training_view_artifact(
             kind=data_kind,
             artifact_root=artifact_root,
         ),
-        source_trace_ids=_collect_source_trace_ids(row_list),
-        source_split_roles=_collect_source_split_roles(row_list),
+        source_trace_ids=trace_ids,
+        source_split_roles=split_roles,
         privileged_visibility=privileged_visibility,
         metadata=dict(metadata or {}),
     )
 
 
-def _collect_source_trace_ids(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+def _read_jsonl_provenance(
+    path: Path,
+) -> tuple[tuple[str, ...], tuple[SplitRole, ...]]:
     trace_ids: set[str] = set()
-    for row in rows:
-        raw_ids = row.get("source_trace_ids", ())
-        if isinstance(raw_ids, str):
-            raw_ids = (raw_ids,)
-        for trace_id in raw_ids:
-            if not isinstance(trace_id, str) or not trace_id:
-                raise ValueError("source_trace_ids entries must be non-empty strings")
-            trace_ids.add(trace_id)
-    return tuple(sorted(trace_ids))
-
-
-def _collect_source_split_roles(rows: Iterable[Mapping[str, Any]]) -> tuple[SplitRole, ...]:
     roles: set[str] = set()
-    for row in rows:
-        raw_roles = row.get("source_split_roles", ())
-        if isinstance(raw_roles, str):
-            raw_roles = (raw_roles,)
-        for role in raw_roles:
-            if not isinstance(role, str) or not role:
-                raise ValueError("source_split_roles entries must be non-empty strings")
-            roles.add(role)
-    return cast(tuple[SplitRole, ...], tuple(sorted(roles)))
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"training data row {line_number} must be a JSON object"
+                )
+            _collect_row_provenance(row, trace_ids, roles)
+    return (
+        tuple(sorted(trace_ids)),
+        cast(tuple[SplitRole, ...], tuple(sorted(roles))),
+    )
+
+
+def _collect_row_provenance(
+    row: Mapping[str, Any],
+    trace_ids: set[str],
+    roles: set[str],
+) -> None:
+    raw_ids = row.get("source_trace_ids", ())
+    if not isinstance(raw_ids, list | tuple):
+        raise ValueError("source_trace_ids must be a list of strings")
+    if not raw_ids:
+        raise ValueError("every training row requires source_trace_ids")
+    for trace_id in raw_ids:
+        if not isinstance(trace_id, str) or not trace_id:
+            raise ValueError("source_trace_ids entries must be non-empty strings")
+        trace_ids.add(trace_id)
+    raw_roles = row.get("source_split_roles", ())
+    if not isinstance(raw_roles, list | tuple):
+        raise ValueError("source_split_roles must be a list of strings")
+    if not raw_roles:
+        raise ValueError("every training row requires source_split_roles")
+    for role in raw_roles:
+        if not isinstance(role, str) or not role:
+            raise ValueError("source_split_roles entries must be non-empty strings")
+        roles.add(role)
 
 
 __all__ = ["build_training_view_artifact"]

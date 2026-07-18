@@ -68,6 +68,32 @@ def test_artifacts_validate_fails_closed_on_malformed_required_flag(
     assert "required" in status["failures"][0]["message"]
 
 
+def test_artifacts_validate_rejects_unknown_manifest_schema(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "unknown-schema"
+    run_dir.mkdir()
+    (run_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "unknown_run_v9",
+                "run_id": "unknown",
+                "candidate_id": "unknown",
+                "status": "planned",
+                "artifacts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest"):
+        main(["artifacts", "validate", "--run", str(run_dir)])
+
+    status = json.loads((run_dir / "artifact_status.json").read_text("utf-8"))
+    assert status["status"] == "failed"
+    assert status["failures"][0]["name"] == "manifest"
+
+
 def test_artifacts_validate_fails_closed_on_promotion_consistency_conflict(
     tmp_path: Path,
 ) -> None:
@@ -95,15 +121,17 @@ def test_artifacts_validate_fails_closed_on_promotion_consistency_conflict(
     assert status["failures"][0]["name"] == "promotion_consistency"
 
 
-def test_artifacts_validate_fails_closed_when_training_view_uses_promotion_split(
+@pytest.mark.parametrize("protected_role", ["promotion", "diagnostic"])
+def test_artifacts_validate_fails_closed_when_training_view_uses_protected_split(
     tmp_path: Path,
+    protected_role: str,
 ) -> None:
     run_dir = _write_and_run_smoke_config(tmp_path)
     manifest_path = run_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     view_path = run_dir / manifest["artifacts"]["grpo_rollout_view"]["path"]
     view = json.loads(view_path.read_text(encoding="utf-8"))
-    view["source_split_roles"] = ["promotion"]
+    view["source_split_roles"] = [protected_role]
     view_path.write_text(
         json.dumps(view, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -120,6 +148,38 @@ def test_artifacts_validate_fails_closed_when_training_view_uses_promotion_split
     status = json.loads((run_dir / "artifact_status.json").read_text(encoding="utf-8"))
     assert status["status"] == "failed"
     assert status["failures"][0]["name"] == "training_view_leakage"
+
+
+def test_artifacts_validate_rejects_training_view_role_claim_mismatch(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_and_run_smoke_config(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    view_path = run_dir / manifest["artifacts"]["grpo_rollout_view"]["path"]
+    view = json.loads(view_path.read_text(encoding="utf-8"))
+    view["source_split_roles"] = ["replay"]
+    view_path.write_text(json.dumps(view, sort_keys=True), encoding="utf-8")
+    manifest["artifacts"]["grpo_rollout_view"]["sha256"] = _sha256(view_path)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="training_view_leakage:semantic_failed"):
+        main(["artifacts", "validate", "--run", str(run_dir)])
+
+
+def test_artifacts_validate_rejects_duplicate_trace_ids(tmp_path: Path) -> None:
+    run_dir = _write_and_run_smoke_config(tmp_path)
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    traces_path = run_dir / manifest["artifacts"]["traces"]["path"]
+    first = traces_path.read_text(encoding="utf-8").splitlines()[0]
+    with traces_path.open("a", encoding="utf-8") as stream:
+        stream.write(first + "\n")
+    manifest["artifacts"]["traces"]["sha256"] = _sha256(traces_path)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="training_view_leakage:semantic_failed"):
+        main(["artifacts", "validate", "--run", str(run_dir)])
 
 
 def _write_and_run_smoke_config(tmp_path: Path) -> Path:

@@ -9,16 +9,7 @@ from typing import Any
 
 import yaml
 
-from post_train_engine.artifacts import require_valid_run_bundle
 from post_train_engine.flywheel import ResourceTopology
-
-_SECRET_KEY_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "ACCESS_KEY")
-_KNOWN_SECRET_ENV_NAMES = {
-    "PTE_REMOTE_RUNPOD_ALL",
-    "PTE_REMOTE_WANDB_API",
-    "PTE_REMOTE_HF_WRITE",
-    "PTE_REMOTE_HYPERBOLIC_GPU",
-}
 
 
 def cuda_version_from_image(image: str) -> str:
@@ -85,7 +76,9 @@ def _major_minor(value: str) -> str:
 
 
 def _normalize_gpu_type(value: str) -> str:
-    normalized = "".join(character for character in value.lower() if character.isalnum())
+    normalized = "".join(
+        character for character in value.lower() if character.isalnum()
+    )
     for prefix in ("nvidiageforce", "nvidiatesla", "nvidia", "geforce", "tesla"):
         if normalized.startswith(prefix):
             return normalized.removeprefix(prefix)
@@ -94,8 +87,8 @@ def _normalize_gpu_type(value: str) -> str:
 
 def write_runpod_plan(
     *,
-    image: str | None,
-    gpu_type: str | None,
+    image: str | None = None,
+    gpu_type: str | None = None,
     command: str,
     dry_run: bool,
     run_dir: str | Path | None = None,
@@ -114,55 +107,38 @@ def write_runpod_plan(
 
     if not dry_run:
         raise RuntimeError("RunPod execution is not implemented; use --dry-run")
-    if run_dir is None and config_path is None:
-        raise ValueError("runpod plan requires --run or --config")
+    if config_path is None:
+        raise ValueError("runpod plan requires --config")
+    supplied = sorted(
+        name
+        for name, is_supplied in {
+            "run_dir": run_dir is not None,
+            "image": image is not None,
+            "gpu_type": gpu_type is not None,
+            "repo_root": Path(repo_root) != Path("."),
+            "setup_commands": bool(setup_commands),
+            "env": bool(env),
+            "secret_env": bool(secret_env),
+            "gpu_count": gpu_count is not None,
+            "container_disk_gb": container_disk_gb is not None,
+            "volume_gb": volume_gb is not None,
+        }.items()
+        if is_supplied
+    )
+    if supplied:
+        raise ValueError(
+            "canonical RunPod plan rejects overrides: " + ", ".join(supplied)
+        )
     if not command:
         raise ValueError("command is required")
     runpod_execution = _runpod_execution_from_config(config_path)
-    if runpod_execution is not None:
-        image = _resolve_config_value(
-            "image",
-            image,
-            str(runpod_execution["container_image"]),
-        )
-        configured_gpu_type = str(runpod_execution["gpu_type"])
-        if gpu_type is not None and _normalize_gpu_type(gpu_type) != _normalize_gpu_type(
-            configured_gpu_type
-        ):
-            raise ValueError(
-                "gpu_type does not match RunPod config: "
-                f"{gpu_type!r} != {configured_gpu_type!r}"
-            )
-        gpu_type = configured_gpu_type
-        gpu_count = _resolve_config_value(
-            "gpu_count",
-            gpu_count,
-            int(runpod_execution["gpu_count"]),
-        )
-        container_disk_gb = _resolve_config_value(
-            "container_disk_gb",
-            container_disk_gb,
-            int(runpod_execution["disk_gb"]),
-        )
-        volume_gb = _resolve_config_value(
-            "volume_gb",
-            volume_gb,
-            int(runpod_execution["volume_gb"]),
-        )
-    else:
-        gpu_count = 1 if gpu_count is None else gpu_count
-        container_disk_gb = 80 if container_disk_gb is None else container_disk_gb
-        volume_gb = 0 if volume_gb is None else volume_gb
-    if not image:
-        raise ValueError("image is required when config is not a RunPod config")
-    if not gpu_type:
-        raise ValueError("gpu_type is required when config is not a RunPod config")
-    assert gpu_count is not None
-    assert container_disk_gb is not None
-    assert volume_gb is not None
-    _positive_int(gpu_count, "gpu_count")
-    _positive_int(container_disk_gb, "container_disk_gb")
-    _non_negative_int(volume_gb, "volume_gb")
+    if runpod_execution is None:
+        raise ValueError("runpod plan requires a RunPod GRPO config")
+    image = str(runpod_execution["container_image"])
+    gpu_type = str(runpod_execution["gpu_type"])
+    gpu_count = int(runpod_execution["gpu_count"])
+    container_disk_gb = int(runpod_execution["disk_gb"])
+    volume_gb = int(runpod_execution["volume_gb"])
     cuda_version = cuda_version_from_image(image)
 
     topology = ResourceTopology(
@@ -172,39 +148,22 @@ def write_runpod_plan(
         gpu_type=gpu_type,
         data_parallel_size=gpu_count,
     )
-    run_block = None
-    if run_dir is not None:
-        run_dir = Path(run_dir)
-        artifact_status = require_valid_run_bundle(run_dir)
-        run_block = {
-            "path": str(run_dir),
-            "artifact_status": artifact_status["status"],
-            "run_id": artifact_status["run_id"],
-            "candidate_id": artifact_status["candidate_id"],
-        }
-
-    config_block = None
-    if config_path is not None:
-        config_path = Path(config_path)
-        if not config_path.is_file():
-            raise ValueError(f"config path does not exist: {config_path}")
-        config_block = {
-            "path": str(config_path),
-            "sha256": _sha256(config_path),
-        }
-
+    config_path = Path(config_path).resolve()
+    if not config_path.is_file():
+        raise ValueError(f"config path does not exist: {config_path}")
+    try:
+        config_relative = config_path.relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError("RunPod config must remain inside the repository") from exc
+    config_block = {"path": config_relative, "sha256": _sha256(config_path)}
     if out_path is None:
-        if run_dir is None:
-            raise ValueError("--out is required when --run is not provided")
-        out_path = Path(run_dir) / "runpod_plan.json"
-    else:
-        out_path = Path(out_path)
+        raise ValueError("runpod plan requires --out")
+    out_path = Path(out_path)
 
     plan = {
         "provider": "runpod",
         "dry_run": True,
         "will_submit": False,
-        "run": run_block,
         "config": config_block,
         "environment": {
             "image": image,
@@ -213,15 +172,11 @@ def write_runpod_plan(
             "gpu_count": gpu_count,
             "container_disk_gb": container_disk_gb,
             "volume_gb": volume_gb,
-            "setup_commands": list(setup_commands),
-            "env": _parse_env(env),
-            "secret_env": _parse_secret_env(secret_env),
         },
         "job": {
             "command": command,
-            "repo_root": str(Path(repo_root)),
             "remote_workdir": remote_workdir,
-            "sync_artifacts": run_dir is not None,
+            "sync_artifacts": False,
         },
         "resource_topology": topology.model_dump(mode="json"),
     }
@@ -275,7 +230,10 @@ def _runpod_execution_from_config(
     if not path.is_file():
         raise ValueError(f"config path does not exist: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("schema_version") != "runpod_grpo_hillclimb_v1":
+    if (
+        not isinstance(raw, dict)
+        or raw.get("schema_version") != "runpod_grpo_hillclimb_v1"
+    ):
         return None
     execution = raw.get("execution")
     if not isinstance(execution, dict):
@@ -291,60 +249,6 @@ def _runpod_execution_from_config(
     if missing:
         raise ValueError(f"RunPod config execution is missing fields: {missing}")
     return execution
-
-
-def _resolve_config_value(name: str, supplied: Any, configured: Any) -> Any:
-    if supplied is not None and supplied != configured:
-        raise ValueError(
-            f"{name} does not match RunPod config: {supplied!r} != {configured!r}"
-        )
-    return configured
-
-
-def _parse_env(entries: tuple[str, ...]) -> dict[str, str]:
-    parsed: dict[str, str] = {}
-    for entry in entries:
-        if "=" not in entry:
-            raise ValueError("--env entries must be KEY=VALUE")
-        key, value = entry.split("=", 1)
-        if not key:
-            raise ValueError("--env key must be non-empty")
-        if _looks_secret_key(key):
-            raise ValueError("secret-like env key must use --secret-env")
-        if key in parsed:
-            raise ValueError("--env keys must be unique")
-        parsed[key] = value
-    return parsed
-
-
-def _parse_secret_env(entries: tuple[str, ...]) -> list[str]:
-    names: list[str] = []
-    for entry in entries:
-        if "=" in entry:
-            raise ValueError("--secret-env records names only, not values")
-        if not entry:
-            raise ValueError("--secret-env name must be non-empty")
-        names.append(entry)
-    if len(set(names)) != len(names):
-        raise ValueError("--secret-env names must be unique")
-    return names
-
-
-def _looks_secret_key(key: str) -> bool:
-    upper = key.upper()
-    return upper in _KNOWN_SECRET_ENV_NAMES or any(
-        marker in upper for marker in _SECRET_KEY_MARKERS
-    )
-
-
-def _positive_int(value: int, name: str) -> None:
-    if type(value) is bool or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-
-
-def _non_negative_int(value: int, name: str) -> None:
-    if type(value) is bool or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
 
 
 def _sha256(path: Path) -> str:

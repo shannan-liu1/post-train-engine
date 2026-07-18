@@ -35,6 +35,8 @@ def execute_provider_operation(
     if operation is not None:
         if operation.get("request_sha256") != request_sha256:
             raise ValueError("provider operation request differs from durable intent")
+        if operation.get("recovery_policy") != provider.recovery_policy:
+            raise ValueError("provider recovery policy differs from durable intent")
         completed = operation.get("result")
         if isinstance(completed, dict):
             return JobResult.model_validate(completed)

@@ -21,7 +21,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import metadata
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 import yaml
@@ -34,7 +34,6 @@ from pydantic import (
 )
 
 from post_train_engine.artifact_store import ArtifactStore
-from post_train_engine.config import HuggingFaceLifecycleConfig, ModelLifecycleConfig
 from post_train_engine.engine import (
     CampaignBinding,
     RunEngine,
@@ -59,11 +58,6 @@ from post_train_engine.hub_identity import (
     resolve_huggingface_revision,
 )
 from post_train_engine.jsonl import read_jsonl, write_jsonl
-from post_train_engine.lifecycle import (
-    CheckpointLifecycleInput,
-    CheckpointLifecycleManager,
-    HuggingFaceCheckpointUploader,
-)
 from post_train_engine.rewards.gsm8k import GSM8KRewardConfig, compute_gsm8k_reward
 from post_train_engine.runpod import cuda_version_from_image, validate_cuda_runtime
 from post_train_engine.runtime_evidence import (
@@ -108,8 +102,8 @@ class ManualRunPodExecution(BaseModel):
     gpu_type: str = Field(..., min_length=1)
     gpu_count: int = Field(default=1, gt=0)
     container_image: str = Field(..., min_length=1)
-    disk_gb: int = Field(default=100, ge=40)
-    volume_gb: int = Field(default=150, ge=0)
+    disk_gb: int = Field(default=40, ge=40)
+    volume_gb: int = Field(default=0, ge=0)
     accelerator_hour_usd: float | None = Field(default=None, ge=0.0)
 
     @model_validator(mode="after")
@@ -139,7 +133,10 @@ class RunSpec(BaseModel):
     def _certification_has_authority(self) -> RunSpec:
         if self.certification_mode == "certifying" and self.campaign is None:
             raise ValueError("certifying run requires campaign binding")
-        if self.certification_mode == "non_certifying_smoke" and self.campaign is not None:
+        if (
+            self.certification_mode == "non_certifying_smoke"
+            and self.campaign is not None
+        ):
             raise ValueError("non-certifying smoke cannot bind a campaign")
         return self
 
@@ -238,7 +235,11 @@ class PromotionSpec(BaseModel):
     )
     @classmethod
     def _finite(cls, value: float) -> float:
-        if type(value) is bool or not isinstance(value, int | float) or not math.isfinite(value):
+        if (
+            type(value) is bool
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
             raise ValueError("promotion numeric fields must be finite")
         return float(value)
 
@@ -246,8 +247,23 @@ class PromotionSpec(BaseModel):
 class TraceCaptureSpec(BaseModel):
     model_config = _FROZEN_FORBID
 
-    enabled: bool = True
+    enabled: Literal[True] = True
     train_trace_dir: str = "rollouts/train"
+
+    @field_validator("train_trace_dir")
+    @classmethod
+    def _trace_dir_must_be_portable_and_contained(cls, value: str) -> str:
+        posix = PurePosixPath(value)
+        if (
+            not value
+            or "\\" in value
+            or posix.is_absolute()
+            or PureWindowsPath(value).is_absolute()
+            or ".." in posix.parts
+            or posix.as_posix() != value
+        ):
+            raise ValueError("train_trace_dir must be a contained POSIX relative path")
+        return value
 
 
 class CheckpointSelectionSpec(BaseModel):
@@ -256,30 +272,6 @@ class CheckpointSelectionSpec(BaseModel):
     enabled: bool = True
     metric: Literal["accuracy", "parse_success_rate"] = "accuracy"
     include_final: bool = True
-
-
-class HFUploadSpec(BaseModel):
-    model_config = _FROZEN_FORBID
-
-    enabled: bool = False
-    repo_id: str | None = Field(default=None, min_length=1)
-    repo_type: Literal["model", "dataset", "space"] = "model"
-    private: bool = True
-    token_env: str = "PTE_REMOTE_HF_WRITE"
-    path_template: str = "tasks/{task}/checkpoints/{date}/{candidate_id}"
-    upload_evidence: bool = True
-    upload_promoted_checkpoints: bool = True
-    upload_rejected_checkpoints: bool = False
-
-    @model_validator(mode="after")
-    def _enabled_requires_repo(self) -> HFUploadSpec:
-        if self.enabled and not self.repo_id:
-            raise ValueError("hf_upload.repo_id is required when hf_upload.enabled=true")
-        required_fields = ("{task}", "{date}", "{candidate_id}")
-        missing = [field for field in required_fields if field not in self.path_template]
-        if missing:
-            raise ValueError(f"hf_upload.path_template must include {', '.join(missing)}")
-        return self
 
 
 class RunPodGRPOConfig(BaseModel):
@@ -294,8 +286,9 @@ class RunPodGRPOConfig(BaseModel):
     eval: EvalSpec = Field(default_factory=EvalSpec)
     promotion: PromotionSpec = Field(default_factory=PromotionSpec)
     trace_capture: TraceCaptureSpec = Field(default_factory=TraceCaptureSpec)
-    checkpoint_selection: CheckpointSelectionSpec = Field(default_factory=CheckpointSelectionSpec)
-    hf_upload: HFUploadSpec = Field(default_factory=HFUploadSpec)
+    checkpoint_selection: CheckpointSelectionSpec = Field(
+        default_factory=CheckpointSelectionSpec
+    )
 
     def training_reward_config(self) -> GSM8KRewardConfig:
         return self.training.reward_config()
@@ -314,8 +307,13 @@ class RunPodRuntimeCertificationConfig(BaseModel):
     @field_validator("source_config")
     @classmethod
     def _source_config_is_relative(cls, value: str) -> str:
-        if Path(value).is_absolute():
-            raise ValueError("source_config must be relative to the R4 config")
+        if (
+            Path(value).is_absolute()
+            or Path(value).name != value
+            or "/" in value
+            or "\\" in value
+        ):
+            raise ValueError("source_config must be a sibling filename")
         return value
 
 
@@ -379,7 +377,10 @@ class DistributedContext:
 
 def is_runpod_grpo_config(path: str | Path) -> bool:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    return isinstance(raw, dict) and raw.get("schema_version") == "runpod_grpo_hillclimb_v1"
+    return (
+        isinstance(raw, dict)
+        and raw.get("schema_version") == "runpod_grpo_hillclimb_v1"
+    )
 
 
 def load_runpod_grpo_config(path: str | Path) -> RunPodGRPOConfig:
@@ -415,9 +416,7 @@ def _resolve_hub_revisions(cfg: RunPodGRPOConfig) -> RunPodGRPOConfig:
     )
     return cfg.model_copy(
         update={
-            "model": cfg.model.model_copy(
-                update={"resolved_revision": model_revision}
-            ),
+            "model": cfg.model.model_copy(update={"resolved_revision": model_revision}),
             "dataset": cfg.dataset.model_copy(
                 update={"resolved_revision": dataset_revision}
             ),
@@ -446,8 +445,6 @@ def _resolve_runpod_inputs(
     _validate_launch_topology(cfg, dist)
     if training_required:
         _validate_grpo_runtime_shape(cfg.training, world_size=dist.world_size)
-    if training_required and dist.is_main_process:
-        _validate_hf_upload_config(cfg)
     run_dir = Path(cfg.run.output_dir)
     store: ArtifactStore | None = None
     resumable = False
@@ -467,16 +464,20 @@ def _resolve_runpod_inputs(
             store.write_json("environment.json", runtime_environment(dist))
     runtime_attestation = _require_cuda(cfg)
     resolution_path = run_dir / "resolution" / "config.resolved.json"
-    if resolution_path.is_file():
-        cfg = RunPodGRPOConfig.model_validate(_read_json_object(resolution_path))
-    else:
+    if not resolution_path.is_file() and dist.is_main_process:
         cfg = _resolve_hub_revisions(cfg)
-    if store is not None and not resolution_path.is_file():
-        store.write_json(
-            "resolution/config.resolved.json",
-            cfg.model_dump(mode="json"),
-        )
+        if store is None:
+            raise RuntimeError("main process omitted the Run artifact store")
+        store.write_json("resolution/config.resolved.json", cfg.model_dump(mode="json"))
+    if not dist.is_main_process:
+        deadline = time.monotonic() + cfg.run.distributed_timeout_seconds
+        while not resolution_path.is_file() and time.monotonic() < deadline:
+            time.sleep(0.1)
+    if not resolution_path.is_file():
+        raise RuntimeError("resolved RunPod configuration was not persisted")
+    cfg = RunPodGRPOConfig.model_validate(_read_json_object(resolution_path))
     train, selection, promotion = _load_and_split_dataset(cfg)
+    promotion = sorted(promotion, key=lambda row: row.id)
     roles = EvaluationRoles(
         selection_example_ids=tuple(row.id for row in selection),
         promotion_example_ids=tuple(row.id for row in promotion),
@@ -490,14 +491,14 @@ def _resolve_runpod_inputs(
         selection_examples=tuple(selection),
         promotion_examples=tuple(promotion),
     )
+
+
 def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
     requested_cfg = load_runpod_grpo_config(config_path)
     dist = DistributedContext.from_env()
     state = _distributed_state(dist)
     coordinator = (
-        _AccelerateRunCoordinator(dist, state)
-        if dist.is_distributed
-        else None
+        _AccelerateRunCoordinator(dist, state) if dist.is_distributed else None
     )
     resolution: RunResolution | None = None
 
@@ -531,9 +532,7 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
             if inputs.store is None
             else _runpod_output(
                 inputs.store,
-                artifacts={
-                    "resolved_run_config": "resolution/config.resolved.json"
-                },
+                artifacts={"resolved_run_config": "resolution/config.resolved.json"},
                 values={
                     "dataset_resolution": plan.inputs["dataset"].resolution_state,
                     "model_resolution": plan.inputs["model"].resolution_state,
@@ -565,11 +564,14 @@ def run_runpod_grpo_hillclimb(config_path: str | Path) -> dict[str, Any]:
 
 def run_runpod_runtime_certification(config_path: str | Path) -> dict[str, Any]:
     runtime_cfg = load_runpod_runtime_config(config_path)
-    source_path = (Path(config_path).resolve().parent / runtime_cfg.source_config).resolve()
+    source_path = (
+        Path(config_path).resolve().parent / runtime_cfg.source_config
+    ).resolve()
     requested_cfg = load_runpod_grpo_config(source_path)
-    if Path(runtime_cfg.output_dir).resolve() == Path(
-        requested_cfg.run.output_dir
-    ).resolve():
+    if (
+        Path(runtime_cfg.output_dir).resolve()
+        == Path(requested_cfg.run.output_dir).resolve()
+    ):
         raise ValueError("R4 output_dir must be distinct from the GRPO output_dir")
     requested_cfg = requested_cfg.model_copy(
         update={
@@ -634,9 +636,7 @@ def run_runpod_runtime_certification(config_path: str | Path) -> dict[str, Any]:
             if inputs.store is None
             else _runpod_output(
                 inputs.store,
-                artifacts={
-                    "resolved_run_config": "resolution/config.resolved.json"
-                },
+                artifacts={"resolved_run_config": "resolution/config.resolved.json"},
                 values={
                     "runtime_attestation": inputs.runtime_attestation,
                     "training_allowed": False,
@@ -666,6 +666,7 @@ def run_runpod_runtime_certification(config_path: str | Path) -> dict[str, Any]:
             "R4 runtime certification failed; inspect the canonical Run bundle"
         )
     return report
+
 
 class _AccelerateRunCoordinator:
     def __init__(self, dist: DistributedContext, state: Any) -> None:
@@ -703,6 +704,7 @@ def _compile_runpod_plan(
     selection_examples: Sequence[GSM8KExample],
     promotion_examples: Sequence[GSM8KExample],
 ) -> RunPlan:
+    promotion_examples = tuple(sorted(promotion_examples, key=lambda row: row.id))
     model_exact = is_huggingface_commit(cfg.model.resolved_revision)
     dataset_revision = (
         "embedded-gsm8k-tiny-v1"
@@ -732,7 +734,9 @@ def _compile_runpod_plan(
                 "resolved_revision": cfg.model.resolved_revision,
                 "resolution_state": "exact" if model_exact else "provider_managed",
                 "non_certifying_reason": (
-                    None if model_exact else "model revision did not resolve to a commit"
+                    None
+                    if model_exact
+                    else "model revision did not resolve to a commit"
                 ),
             },
             "dataset": {
@@ -743,7 +747,9 @@ def _compile_runpod_plan(
                 "resolved_revision": dataset_revision,
                 "resolution_state": "exact" if dataset_exact else "provider_managed",
                 "non_certifying_reason": (
-                    None if dataset_exact else "dataset revision did not resolve to a commit"
+                    None
+                    if dataset_exact
+                    else "dataset revision did not resolve to a commit"
                 ),
             },
         },
@@ -801,11 +807,6 @@ def _compile_runpod_plan(
             "eval_sharding": "rank_modulo_example_order",
             "trace_capture": cfg.trace_capture.model_dump(mode="json"),
             "checkpoint_selection": cfg.checkpoint_selection.model_dump(mode="json"),
-            "hf_upload": {
-                **cfg.hf_upload.model_dump(mode="json"),
-                "token_env": cfg.hf_upload.token_env,
-                "token_present": bool(os.environ.get(cfg.hf_upload.token_env)),
-            },
         },
     )
 
@@ -987,9 +988,22 @@ class _RunPodGRPOAdapter:
         if self.store is None:
             return _runpod_worker_output()
         self.store.write_json("train/trainer_result.json", train_result)
+        trace_artifacts = (
+            {
+                f"policy_trace_rank{rank}": str(
+                    Path(self.cfg.trace_capture.train_trace_dir) / f"rank{rank}.jsonl"
+                )
+                for rank in range(self.dist.world_size)
+            }
+            if self.cfg.trace_capture.enabled
+            else {}
+        )
         return _runpod_output(
             self.store,
-            artifacts={"train_result": "train/trainer_result.json"},
+            artifacts={
+                "train_result": "train/trainer_result.json",
+                **trace_artifacts,
+            },
             values={"training_outcome": "trained"},
             phase_cost=_runpod_phase_cost(
                 self.cfg,
@@ -1034,10 +1048,14 @@ class _RunPodGRPOAdapter:
             "candidate_id": plan.candidate_id,
             "model_id": selected_path,
             "parent_id": "baseline",
-            "adapter_kind": "full_model_checkpoint" if trained else "no_training_outcome",
+            "adapter_kind": "full_model_checkpoint"
+            if trained
+            else "no_training_outcome",
             "training_method": "grpo",
             "checkpoint_selection": {
-                key: value for key, value in selection.items() if key != "selected_eval_rows"
+                key: value
+                for key, value in selection.items()
+                if key != "selected_eval_rows"
             },
         }
         self.store.write_json("candidates/candidate.json", candidate)
@@ -1143,27 +1161,14 @@ class _RunPodGRPOAdapter:
         )
         self.store.write_json("costs.json", cost_summary)
         self.store.write_json("metrics.json", _promotion_metrics(decision))
-        lifecycle = (
-            {
-                "enabled": False,
-                "promoted": False,
-                "reason": "no_training_outcome",
-                "local_artifacts": {},
-            }
-            if not bool(prior["select"].values["trained"])
-            else _finalize_lifecycle_if_configured(
-                cfg=self.cfg,
-                store=self.store,
-                candidate=candidate,
-                train_result=train_result,
-                decision=decision,
-            )
-        )
-        if lifecycle.get("enabled"):
-            lifecycle_artifact = {"lifecycle": "lifecycle/runpod_grpo_lifecycle.json"}
-        else:
-            self.store.write_json("lifecycle/runpod_grpo_lifecycle.json", lifecycle)
-            lifecycle_artifact = {"lifecycle": "lifecycle/runpod_grpo_lifecycle.json"}
+        lifecycle = {
+            "enabled": False,
+            "promoted": False,
+            "reason": "remote_mutations_require_settled_campaign_lifecycle",
+            "local_artifacts": {},
+        }
+        self.store.write_json("lifecycle/runpod_grpo_lifecycle.json", lifecycle)
+        lifecycle_artifact = {"lifecycle": "lifecycle/runpod_grpo_lifecycle.json"}
         baseline = {
             "candidate_id": "baseline",
             "model_id": self.cfg.model.base_model_id,
@@ -1212,8 +1217,7 @@ def _runpod_output(
         missing_reason = phase_cost.missing_reason
     return StageOutput(
         artifacts={
-            name: str(store.run_dir / relative)
-            for name, relative in artifacts.items()
+            name: str(store.run_dir / relative) for name, relative in artifacts.items()
         },
         values=output_values,
         cost_usd=0.0 if phase_cost is None else cost_usd,
@@ -1282,8 +1286,7 @@ def _require_cuda(cfg: RunPodGRPOConfig) -> dict[str, Any]:
         )
     except RuntimeError as exc:
         raise RuntimeError(
-            "RunPod GRPO hillclimb requires CUDA and the configured runtime: "
-            f"{exc}"
+            f"RunPod GRPO hillclimb requires CUDA and the configured runtime: {exc}"
         ) from exc
 
 
@@ -1301,7 +1304,9 @@ def _validate_launch_topology(cfg: RunPodGRPOConfig, dist: DistributedContext) -
             f"config execution.gpu_count={expected}, WORLD_SIZE={dist.world_size}."
         )
     if dist.rank >= dist.world_size:
-        raise ValueError(f"RANK must be < WORLD_SIZE; got rank={dist.rank}, world={dist.world_size}")
+        raise ValueError(
+            f"RANK must be < WORLD_SIZE; got rank={dist.rank}, world={dist.world_size}"
+        )
     if dist.local_rank >= dist.world_size:
         raise ValueError(
             f"LOCAL_RANK must be < WORLD_SIZE for single-node RunPod launch; "
@@ -1309,7 +1314,9 @@ def _validate_launch_topology(cfg: RunPodGRPOConfig, dist: DistributedContext) -
         )
 
 
-def _validate_grpo_runtime_shape(training: GRPOTrainingSpec, *, world_size: int | None = None) -> None:
+def _validate_grpo_runtime_shape(
+    training: GRPOTrainingSpec, *, world_size: int | None = None
+) -> None:
     resolved_world_size = _world_size_from_env() if world_size is None else world_size
     global_prompt_batch = training.per_device_train_batch_size * resolved_world_size
     if global_prompt_batch % training.num_generations != 0:
@@ -1391,12 +1398,12 @@ def _load_and_split_dataset(
 
         examples = embedded_gsm8k_examples()
     required = (
-        cfg.dataset.train_size
-        + cfg.dataset.selection_size
-        + cfg.dataset.eval_size
+        cfg.dataset.train_size + cfg.dataset.selection_size + cfg.dataset.eval_size
     )
     if required > len(examples):
-        raise ValueError(f"requested {required} examples but dataset has {len(examples)}")
+        raise ValueError(
+            f"requested {required} examples but dataset has {len(examples)}"
+        )
     shuffled = list(examples)
     random.Random(cfg.dataset.split_seed).shuffle(shuffled)
     train_end = cfg.dataset.train_size
@@ -1440,6 +1447,7 @@ def _write_dataset_artifacts(
         [_example_json(cfg, row, "promotion") for row in promotion_examples],
     )
 
+
 def _write_measured_training_view(
     store: ArtifactStore,
     cfg: RunPodGRPOConfig,
@@ -1450,7 +1458,9 @@ def _write_measured_training_view(
     grouped: dict[str, list[EvalRow]] = {}
     for row in probe_rows:
         if row.example_id not in examples_by_id:
-            raise ValueError(f"parent probe returned unknown train example: {row.example_id}")
+            raise ValueError(
+                f"parent probe returned unknown train example: {row.example_id}"
+            )
         grouped.setdefault(row.example_id, []).append(row)
     missing = sorted(set(examples_by_id).difference(grouped))
     if missing:
@@ -1508,7 +1518,10 @@ def _write_measured_training_view(
         build_rollout_group(
             group_id=f"{cfg.run.run_id}:parent-probe:{example_id}",
             traces=traces_by_example[example_id],
-            rewards=[float(row.correct) for row in sorted(rows, key=lambda item: item.sample_index)],
+            rewards=[
+                float(row.correct)
+                for row in sorted(rows, key=lambda item: item.sample_index)
+            ],
         )
         for example_id, rows in sorted(grouped.items())
     ]
@@ -1534,7 +1547,9 @@ def _write_measured_training_view(
     selected_rows = [
         {
             **_example_json(cfg, examples_by_id[example_id], "train"),
-            "source_trace_ids": [trace.trace_id for trace in traces_by_example[example_id]],
+            "source_trace_ids": [
+                trace.trace_id for trace in traces_by_example[example_id]
+            ],
             "source_split_roles": ["train"],
         }
         for example_id in sorted(frontier_ids)
@@ -1549,7 +1564,6 @@ def _write_measured_training_view(
         data_path=train_path,
         artifact_root=store.run_dir,
         data_kind="grpo_training_rows",
-        rows=selected_rows,
         privileged_visibility="gold_answer",
         metadata={
             "selection_policy": "parent_success_rate_frontier",
@@ -1568,14 +1582,12 @@ def _write_measured_training_view(
 def _shard_sequence(rows: Sequence[Any], dist: DistributedContext) -> list[Any]:
     if not dist.is_distributed:
         return list(rows)
-    return [
-        row
-        for idx, row in enumerate(rows)
-        if idx % dist.world_size == dist.rank
-    ]
+    return [row for idx, row in enumerate(rows) if idx % dist.world_size == dist.rank]
 
 
-def _example_json(cfg: RunPodGRPOConfig, example: GSM8KExample, split_role: str) -> dict[str, Any]:
+def _example_json(
+    cfg: RunPodGRPOConfig, example: GSM8KExample, split_role: str
+) -> dict[str, Any]:
     return {
         "example_id": example.id,
         "split_role": split_role,
@@ -1597,9 +1609,7 @@ def _train_grpo(
 ) -> dict[str, Any]:
     if "grpo" not in training_view.method_compatibility:
         raise ValueError("RunPod GRPO requires a GRPO-compatible TrainingView")
-    training_rows = read_jsonl(
-        training_view.require_data_integrity(cfg.run.output_dir)
-    )
+    training_rows = read_jsonl(training_view.require_data_integrity(cfg.run.output_dir))
     if not training_rows:
         raise ValueError("RunPod GRPO TrainingView contains no rows")
     try:
@@ -1664,19 +1674,26 @@ def _train_grpo(
         ),
         processing_class=tokenizer,
     )
-    _event(store, "training_started", {"max_steps": cfg.training.max_steps, "distributed": dist.to_json()})
+    _event(
+        store,
+        "training_started",
+        {"max_steps": cfg.training.max_steps, "distributed": dist.to_json()},
+    )
     result = trainer.train()
     final_dir = Path(cfg.run.output_dir) / "train" / "final"
     if _trainer_is_main_process(trainer):
         trainer.save_model(str(final_dir))
         tokenizer.save_pretrained(str(final_dir))
     metrics = _finite_metrics(getattr(result, "metrics", {}))
-    _event(store, "training_finished", {"metrics": metrics, "final_dir": str(final_dir)})
+    _event(
+        store, "training_finished", {"metrics": metrics, "final_dir": str(final_dir)}
+    )
     del trainer
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {
+        "status": "trained",
         "trainer": "TRL_GRPOTrainer",
         "method": "grpo",
         "base_model_id": cfg.model.base_model_id,
@@ -1748,7 +1765,9 @@ def _evaluate_and_select_checkpoints(
         )
         rows = _gather_eval_rows(local_rows, dist)
         if dist.is_main_process:
-            artifact_prefix = f"checkpoint_selection/{_safe_artifact_name(ref['checkpoint_id'])}"
+            artifact_prefix = (
+                f"checkpoint_selection/{_safe_artifact_name(ref['checkpoint_id'])}"
+            )
             assert store is not None
             _write_eval_outputs(store, artifact_prefix, rows)
             store.write_json(
@@ -1789,7 +1808,9 @@ def _select_checkpoint(
     metric: str,
 ) -> dict[str, Any]:
     if not evaluated:
-        raise ValueError("checkpoint selection requires at least one evaluated checkpoint")
+        raise ValueError(
+            "checkpoint selection requires at least one evaluated checkpoint"
+        )
     ranked = sorted(
         evaluated,
         key=lambda item: (
@@ -1847,7 +1868,9 @@ def _evaluate_hf_model(
         import torch
         from transformers import AutoModelForCausalLM
     except ImportError as exc:
-        raise RuntimeError("Transformers and torch are required for RunPod eval") from exc
+        raise RuntimeError(
+            "Transformers and torch are required for RunPod eval"
+        ) from exc
 
     tokenizer = _load_tokenizer(cfg, model_ref=model_ref)
     model = AutoModelForCausalLM.from_pretrained(
@@ -1941,15 +1964,21 @@ def _evaluate_hf_model(
     return rows
 
 
-def _gather_eval_rows(rows: Sequence[EvalRow], dist: DistributedContext) -> list[EvalRow]:
+def _gather_eval_rows(
+    rows: Sequence[EvalRow], dist: DistributedContext
+) -> list[EvalRow]:
     if not dist.is_distributed:
-        return list(rows)
+        return sorted(rows, key=lambda row: (row.example_id, row.sample_index))
     try:
         import torch.distributed as torch_dist
     except ImportError as exc:  # pragma: no cover - torch always present in this path
-        raise RuntimeError("torch.distributed is required for distributed eval merge") from exc
+        raise RuntimeError(
+            "torch.distributed is required for distributed eval merge"
+        ) from exc
     if not torch_dist.is_available() or not torch_dist.is_initialized():
-        raise RuntimeError("distributed eval merge requires an initialized process group")
+        raise RuntimeError(
+            "distributed eval merge requires an initialized process group"
+        )
     gathered: list[list[dict[str, Any]] | None] = [None for _ in range(dist.world_size)]
     torch_dist.all_gather_object(gathered, [row.to_json() for row in rows])
     if not dist.is_main_process:
@@ -1963,7 +1992,9 @@ def _gather_eval_rows(rows: Sequence[EvalRow], dist: DistributedContext) -> list
     return sorted(merged, key=lambda row: (row.example_id, row.sample_index))
 
 
-def _write_eval_outputs(store: ArtifactStore, artifact_prefix: str, rows: Sequence[EvalRow]) -> None:
+def _write_eval_outputs(
+    store: ArtifactStore, artifact_prefix: str, rows: Sequence[EvalRow]
+) -> None:
     store.write_jsonl(
         f"evals/{artifact_prefix}_raw_outputs.jsonl",
         [row.to_json() for row in rows],
@@ -2041,10 +2072,14 @@ def _grpo_config_kwargs(cfg: RunPodGRPOConfig) -> dict[str, Any]:
     }
 
 
-def _filter_trl_config_kwargs(kwargs: dict[str, Any], config_cls: type[Any]) -> dict[str, Any]:
+def _filter_trl_config_kwargs(
+    kwargs: dict[str, Any], config_cls: type[Any]
+) -> dict[str, Any]:
     signature = inspect.signature(config_cls.__init__)
     parameters = signature.parameters
-    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+    if any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    ):
         return kwargs
     accepted = set(parameters)
     unsupported = set(kwargs) - accepted
@@ -2117,9 +2152,7 @@ def _gsm8k_reward_func(
         else:
             policy_step = counter["batch"]
             step_evidence = "inferred_batch"
-            policy_version = (
-                f"{run_id}:rank{rank}:reward-batch:{counter['batch']:08d}"
-            )
+            policy_version = f"{run_id}:rank{rank}:reward-batch:{counter['batch']:08d}"
         rewards: list[float] = []
         for completion, gold, prompt_text, example in zip(
             completions,
@@ -2152,8 +2185,7 @@ def _gsm8k_reward_func(
                         policy_step=policy_step,
                         policy_step_evidence=step_evidence,
                         rollout_group_id=(
-                            f"{run_id}:rank{rank}:batch{counter['batch']:08d}:"
-                            f"{example}"
+                            f"{run_id}:rank{rank}:batch{counter['batch']:08d}:{example}"
                         ),
                         generation_backend="trl_grpo",
                         sampling_config=dict(
@@ -2165,7 +2197,9 @@ def _gsm8k_reward_func(
                         parsed_answer=result.parsed_answer,
                         parser_status={
                             "parse_ok": result.parse_ok,
-                            "mode": "strict" if config.use_strict_parse_for_reward else "lenient",
+                            "mode": "strict"
+                            if config.use_strict_parse_for_reward
+                            else "lenient",
                             "error": result.verifier_error,
                         },
                         verifier_result={
@@ -2222,7 +2256,9 @@ def _as_batch(values: Any, *, n: int, field_name: str) -> list[str]:
         if n % len(items) == 0:
             repeats = n // len(items)
             return [item for item in items for _ in range(repeats)]
-        raise ValueError(f"{field_name} length {len(values)} does not match completions length {n}")
+        raise ValueError(
+            f"{field_name} length {len(values)} does not match completions length {n}"
+        )
     return [str(values)] * n
 
 
@@ -2297,143 +2333,6 @@ def _promotion_metrics(decision: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_hf_upload_config(cfg: RunPodGRPOConfig) -> None:
-    hf = cfg.hf_upload
-    if not hf.enabled:
-        return
-    if not hf.repo_id:
-        raise ValueError("hf_upload.repo_id is required when hf_upload.enabled=true")
-    if not os.environ.get(hf.token_env):
-        raise ValueError(f"missing required HF token env: {hf.token_env}")
-
-
-def _finalize_lifecycle_if_configured(
-    *,
-    cfg: RunPodGRPOConfig,
-    store: ArtifactStore,
-    candidate: Mapping[str, Any],
-    train_result: Mapping[str, Any],
-    decision: Mapping[str, Any],
-) -> dict[str, Any]:
-    hf = cfg.hf_upload
-    promoted = decision["decision"] == "promote"
-    if not hf.enabled:
-        return {
-            "enabled": False,
-            "promoted": promoted,
-            "remote_ref": None,
-            "local_artifacts": {},
-        }
-    receipt_path = store.run_dir / "lifecycle" / "runpod_grpo_lifecycle.json"
-    if receipt_path.is_file():
-        existing = _read_json_object(receipt_path)
-        if existing.get("promoted") is not promoted:
-            raise ValueError("existing lifecycle receipt has a different promotion decision")
-        return existing
-    transaction_path = store.run_dir / "lifecycle" / "transaction.json"
-    if transaction_path.is_file():
-        transaction = _read_json_object(transaction_path)
-        if transaction.get("state") == "started":
-            raise ValueError(
-                "remote lifecycle transaction is ambiguous; reconcile the deterministic "
-                "Hugging Face path before retrying"
-            )
-    store.write_json(
-        "lifecycle/transaction.json",
-        {
-            "state": "started",
-            "candidate_id": candidate["candidate_id"],
-            "promoted": promoted,
-            "repo_id": hf.repo_id,
-            "path_template": hf.path_template,
-        },
-    )
-    uploader = HuggingFaceCheckpointUploader(token=os.environ[hf.token_env])
-    lifecycle = CheckpointLifecycleManager(
-        ModelLifecycleConfig(
-            artifact_dir=store.run_dir / "lifecycle",
-            discard_rejected_local=False,
-            keep_only_latest_promoted_local=False,
-            hf=HuggingFaceLifecycleConfig(
-                enabled=True,
-                repo_id=hf.repo_id,
-                repo_type=hf.repo_type,
-                private=hf.private,
-                path_template=hf.path_template,
-                upload_evidence=hf.upload_evidence,
-                upload_promoted_checkpoints=hf.upload_promoted_checkpoints,
-                upload_rejected_checkpoints=hf.upload_rejected_checkpoints,
-            ),
-        ),
-        uploader=uploader,
-    )
-    outcome = lifecycle.finalize(
-        CheckpointLifecycleInput(
-            candidate_id=str(candidate["candidate_id"]),
-            checkpoint_ref=str(candidate["model_id"]),
-            task_name="gsm8k",
-            parent_candidate_id="baseline",
-            parent_checkpoint_ref=cfg.model.base_model_id,
-            previous_incumbent_candidate_id="baseline",
-            previous_incumbent_checkpoint_ref=cfg.model.base_model_id,
-            previous_incumbent_remote_ref=None,
-            promoted=promoted,
-            score=float(decision["candidate_metrics"]["accuracy"]),
-            incumbent_score=float(decision["baseline_metrics"]["accuracy"]),
-            metrics={
-                name: float(value)
-                for name, value in decision["candidate_metrics"].items()
-                if isinstance(value, int | float) and math.isfinite(float(value))
-            },
-            evaluation_artifacts={
-                "candidate_eval": str(store.run_dir / "evals" / "candidate.json"),
-                "raw_outputs": str(store.run_dir / "evals" / "candidate_raw_outputs.jsonl"),
-                "checkpoint_selection": str(store.run_dir / "train" / "checkpoint_selection.json"),
-            },
-            evaluation_metadata={
-                "split": "eval",
-                "dataset": cfg.dataset.source,
-                "dataset_name": cfg.dataset.dataset_name,
-                "split_seed": cfg.dataset.split_seed,
-            },
-            train_artifacts={
-                "trainer_result": str(store.run_dir / "train" / "trainer_result.json"),
-                "trace_dir": str(store.run_dir / cfg.trace_capture.train_trace_dir),
-            },
-            train_metrics=dict(train_result.get("metrics", {})),
-            train_metadata={
-                "distributed": train_result.get("distributed", {}),
-                "trace_capture": train_result.get("trace_capture", {}),
-                "costs": {"source": "not_reported"},
-            },
-            promotion_gate=decision.get("gates", {}),
-            promotion_decision=decision,
-            rejection_reason=None if promoted else "; ".join(decision.get("rejection_reasons", [])),
-        )
-    )
-    body = {
-        "enabled": True,
-        "promoted": promoted,
-        "remote_ref": outcome.remote_ref,
-        "local_state": outcome.local_state,
-        "evidence_path": str(outcome.evidence_path),
-        "local_artifacts": outcome.local_artifacts,
-        "remote_artifacts": outcome.remote_artifacts,
-        "discarded_paths": list(outcome.discarded_paths),
-    }
-    store.write_json("lifecycle/runpod_grpo_lifecycle.json", body)
-    store.write_json(
-        "lifecycle/transaction.json",
-        {
-            "state": "completed",
-            "candidate_id": candidate["candidate_id"],
-            "promoted": promoted,
-            "receipt": "lifecycle/runpod_grpo_lifecycle.json",
-        },
-    )
-    return body
-
-
 def _finite_metrics(metrics: Mapping[str, Any]) -> dict[str, float]:
     out: dict[str, float] = {}
     for key, value in metrics.items():
@@ -2458,7 +2357,9 @@ def _runpod_phase_cost(
         resource_count=float(cfg.execution.gpu_count),
         unit_price_usd=price,
         missing_reason=(
-            None if price is not None else "execution.accelerator_hour_usd not configured"
+            None
+            if price is not None
+            else "execution.accelerator_hour_usd not configured"
         ),
     )
 
@@ -2717,9 +2618,7 @@ class _RunPodRuntimeCertificationAdapter:
                         dist=self.dist,
                     )
                 )
-            return [
-                row.to_json() for row in _gather_eval_rows(local_rows, self.dist)
-            ]
+            return [row.to_json() for row in _gather_eval_rows(local_rows, self.dist)]
 
         def evaluate_optimized() -> list[dict[str, Any]]:
             local_rows = _evaluate_hf_model(
@@ -2728,9 +2627,7 @@ class _RunPodRuntimeCertificationAdapter:
                 examples=local_examples,
                 dist=self.dist,
             )
-            return [
-                row.to_json() for row in _gather_eval_rows(local_rows, self.dist)
-            ]
+            return [row.to_json() for row in _gather_eval_rows(local_rows, self.dist)]
 
         def synchronize() -> None:
             _wait_for_everyone(self.distributed_state)
@@ -2833,9 +2730,7 @@ class _RunPodRuntimeCertificationAdapter:
         if self.store is None:
             return _runpod_worker_output()
         benchmark = _read_json_object(prior["evaluate"].artifacts["runtime_benchmark"])
-        promotion = _read_json_object(
-            prior["promote"].artifacts["promotion_decision"]
-        )
+        promotion = _read_json_object(prior["promote"].artifacts["promotion_decision"])
         report = {
             "run_id": plan.run_id,
             "runtime_certified": bool(benchmark["certifying"]),
@@ -2877,7 +2772,6 @@ __all__ = [
     "_grpo_config_kwargs",
     "_shard_sequence",
     "_select_checkpoint",
-    "_validate_hf_upload_config",
     "_validate_grpo_runtime_shape",
     "_validate_launch_topology",
     "is_runpod_grpo_config",

@@ -9,6 +9,7 @@ from post_train_engine.training.gpu_runners import (
     DPOGpuRunner,
     GRPOGpuRunner,
     SFTGpuRunner,
+    _build_trainer,
     _numeric_metrics,
     default_gpu_runners,
 )
@@ -16,7 +17,18 @@ from post_train_engine.training.runner import MethodTrainingRequest
 from post_train_engine.training_views import TrainingDataRef, TrainingViewArtifact
 
 
-def _config(method: str, tmp_path: Path, *, train_path: Path | None) -> ExperimentConfig:
+def test_trainer_compatibility_does_not_mask_internal_type_error() -> None:
+    class BrokenTrainer:
+        def __init__(self, *, processing_class, **_kwargs):
+            raise TypeError("trainer internal type failure")
+
+    with pytest.raises(TypeError, match="trainer internal type failure"):
+        _build_trainer(BrokenTrainer, object(), {})
+
+
+def _config(
+    method: str, tmp_path: Path, *, train_path: Path | None
+) -> ExperimentConfig:
     raw = {
         "model": {"base_model_id": "base"},
         "task": {"name": "toy"},
@@ -31,7 +43,9 @@ def _config(method: str, tmp_path: Path, *, train_path: Path | None) -> Experime
     return ExperimentConfig.model_validate(raw)
 
 
-def _request(config: ExperimentConfig, method: str, tmp_path: Path) -> MethodTrainingRequest:
+def _request(
+    config: ExperimentConfig, method: str, tmp_path: Path
+) -> MethodTrainingRequest:
     path = config.data.train_path or tmp_path / "unused.jsonl"
     return MethodTrainingRequest(
         config,
@@ -42,7 +56,7 @@ def _request(config: ExperimentConfig, method: str, tmp_path: Path) -> MethodTra
             view_type="grpo_rollout" if method == "grpo" else "sft",
             method_compatibility=(method,),
             data_artifact=TrainingDataRef(
-                path=str(path),
+                path=path.resolve().relative_to(tmp_path.resolve()).as_posix(),
                 kind="training_data",
                 sha256="sha256:" + "0" * 64,
             ),
@@ -50,6 +64,7 @@ def _request(config: ExperimentConfig, method: str, tmp_path: Path) -> MethodTra
             source_split_roles=("probe",),
             privileged_visibility="none",
         ),
+        artifact_root=tmp_path,
     )
 
 
@@ -79,7 +94,9 @@ def test_grpo_gpu_runner_requires_reward_functions(tmp_path: Path) -> None:
         runner.train(_request(config, "grpo", tmp_path))
 
 
-def test_grpo_gpu_runner_fails_closed_on_malformed_modified_knob(tmp_path: Path) -> None:
+def test_grpo_gpu_runner_fails_closed_on_malformed_modified_knob(
+    tmp_path: Path,
+) -> None:
     runner = GRPOGpuRunner(allow_cpu=True, reward_funcs=[lambda *_: 0.0])
     raw = _config("grpo", tmp_path, train_path=tmp_path / "train.jsonl").model_dump()
     raw["method"]["parameters"] = {"adaptive_entropy": True}
