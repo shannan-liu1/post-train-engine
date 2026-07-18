@@ -198,8 +198,8 @@ def test_graphql_http_rejection_preserves_bounded_provider_reason(
 def test_graphql_http_rejection_redacts_key_at_detail_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    api_key = "unique-secret-material-12345"
-    response_body = BytesIO(b"x" * 490 + api_key.encode("ascii"))
+    exact_secret = "x" * 32
+    response_body = BytesIO(b"y" * 490 + exact_secret.encode("ascii"))
     error = urllib.error.HTTPError(
         "https://api.runpod.io/graphql",
         403,
@@ -213,13 +213,13 @@ def test_graphql_http_rejection_redacts_key_at_detail_boundary(
     )
 
     with pytest.raises(RunPodCreateRejectedError) as exc_info:
-        RunPodProviderTransport(api_key).request(
+        RunPodProviderTransport(exact_secret).request(
             "POST",
             "/pods",
             {**_request(), "terminateAfter": "2026-07-18T00:00:00Z"},
         )
 
-    assert api_key[:10] not in str(exc_info.value)
+    assert exact_secret[:10] not in str(exc_info.value)
     assert len(str(exc_info.value)) <= 560
     assert response_body.closed
 
