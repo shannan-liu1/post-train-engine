@@ -54,7 +54,7 @@ RunPod catalog prices and stock can race with allocation. Multi-GPU stock also d
 - Do not infer the final topology price by multiplying or dividing catalog fields.
 - Delete the Pod immediately when its authoritative rate exceeds the attempt budget.
 - A create response without an assigned machine or usable SSH mapping is not a healthy allocation.
-- Fail immediately when RunPod reports a terminal Pod status. The CUDA allocation filter and digest-pinned image provide the pre-allocation image compatibility contract.
+- Fail immediately when RunPod reports a terminal Pod status. Let SSH readiness consume the existing aggregate bootstrap deadline; do not impose a shorter hidden readiness cap. The CUDA allocation filter and digest-pinned image provide the pre-allocation image compatibility contract.
 
 ## Create request
 
@@ -212,7 +212,7 @@ and holds one atomic execution lock. If a process dies and leaves that ignored l
 remove it only after provider inventory proves zero active Pods or the provider
 termination deadline has elapsed.
 
-Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
+Run the full locked test suite, Ruff, architecture constraints check, and diff check locally before allocation. Run source-identity tests before package builds and other repository-writing gates; concurrent mutation can correctly invalidate a replayed frozen plan. The paid preflight intentionally runs only remote-specific config, CUDA, and TRL compatibility gates. It stops after the first failure, uses one aggregate deadline, and always writes its JSON receipt. Do not repeat local tests or Ruff on paid compute.
 
 When dependencies change, run the export command recorded at the top of `requirements/runpod.txt`, then restore `# uv-lock-sha256: <sha256 of normalized uv.lock>` within its first three lines. Keep package hashes enabled. `runpod_preflight.py --constraints-only` rejects a stale, hashless, or missing binding.
 
@@ -271,6 +271,8 @@ pte runpod attempt settle --journal <operation.json> --pod-id <id> `
 | Watchdog used one absence check, could overwrite terminal evidence when launched after its deadline, and lost its failure receipt if the journal update failed | Eventual consistency, late launch, or journal corruption could leave a billable Pod with misleading or missing local evidence | Delete expired targets synchronously, retry provider deletion and absence verification three times, retain `delete_unverified` on exhaustion, and write the independent watchdog receipt even when journal repair fails. |
 | Watchdog inventory returned malformed JSON or an unexpected schema | A parsing error could terminate independent supervision before provider TTL | Treat ordinary inventory and decoding failures as temporary provider unavailability, retain supervision through provider TTL, and fail only after the bounded deadline. |
 | GraphQL create returned HTTP 403 Error 1010 while REST inventory and GraphQL identity queries succeeded | RunPod's Cloudflare policy blocked Python urllib's default browser signature before the mutation reached RunPod | Send the stable canonical application User-Agent, surface bounded definitive 4xx details with generic and exact-key redaction, preserve reconciliation for uncertain 4xx statuses, record `rejected` rather than `ambiguous`, and require two zero-Pod REST observations. |
+| A healthy nonterminal Pod did not expose SSH within 120 seconds even though bootstrap owned a 480-second aggregate deadline | A hidden readiness subdeadline tore down slow image starts before the reviewed bootstrap budget elapsed | Use the single aggregate bootstrap deadline for provider endpoint discovery, host-key pinning, authentication, and the bootstrap command; retain the downstream R4 reserve gate after bootstrap. |
+| A source-identity replay test failed only while `uv build` ran concurrently | The build transiently changed repository-visible state between the test's first and second resolution | Run source-identity tests and package-building gates sequentially; do not treat concurrent repository mutation as an application regression. |
 
 ## Primary references
 

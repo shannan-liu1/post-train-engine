@@ -321,7 +321,7 @@ class SSHRunPodRemoteExecutor:
             if raw.get("known_hosts_sha256") != actual_hash:
                 raise ValueError("pinned SSH known_hosts evidence changed")
             pinned = raw
-        readiness_deadline = min(deadline, self.monotonic() + 120.0)
+        readiness_deadline = deadline
         while self.monotonic() < readiness_deadline:
             try:
                 pod = self.control.get_pod(pod_id)
@@ -795,8 +795,13 @@ def _require_attempt_identity(spec: RunPodAttemptSpec) -> None:
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        raise ValueError("prepared RunPod attempt is missing identity evidence") from exc
-    if not isinstance(state, dict) or state.get("attempt_sha256") != spec.attempt_sha256:
+        raise ValueError(
+            "prepared RunPod attempt is missing identity evidence"
+        ) from exc
+    if (
+        not isinstance(state, dict)
+        or state.get("attempt_sha256") != spec.attempt_sha256
+    ):
         raise ValueError("prepared RunPod attempt changed after review")
 
 

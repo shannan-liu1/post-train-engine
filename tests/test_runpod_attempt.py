@@ -663,9 +663,7 @@ def test_ssh_remote_bootstrap_pins_host_and_verifies_exact_source(
     executor.download_evidence("pod-1", spec)
 
     assert [call[0] for call in calls[:2]] == ["ssh-keyscan", "ssh-keyscan"]
-    assert len(
-        [call for call in calls if call[0] == "ssh" and call[-1] == "true"]
-    ) == 2
+    assert len([call for call in calls if call[0] == "ssh" and call[-1] == "true"]) == 2
     remote_ssh_commands = [
         call for call in calls if call[0] == "ssh" and call[-1] != "true"
     ]
@@ -815,7 +813,7 @@ def test_ssh_bootstrap_uses_one_aggregate_deadline(tmp_path: Path) -> None:
         create_request={},
         budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
     )
-    times = iter((100.0, 100.0, 100.0, 101.0, 102.0, 130.0))
+    times = iter((100.0, 100.0, 101.0, 102.0, 130.0))
     calls: list[tuple[list[str], float]] = []
 
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -841,6 +839,66 @@ def test_ssh_bootstrap_uses_one_aggregate_deadline(tmp_path: Path) -> None:
     assert calls[-1][0][0] == "ssh"
     assert calls[-1][0][-1] != "true"
     assert bootstrap_timeout == 450.0
+
+
+def test_ssh_readiness_uses_full_bootstrap_deadline(tmp_path: Path) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    clock = Clock()
+
+    class Control:
+        @staticmethod
+        def get_pod(_pod_id: str) -> dict[str, Any]:
+            if clock.now < 130.0:
+                return {"id": "pod-1", "desiredStatus": "RUNNING"}
+            return {
+                "id": "pod-1",
+                "desiredStatus": "RUNNING",
+                "publicIp": "192.0.2.10",
+                "portMappings": {"22": 12345},
+            }
+
+    key_path = tmp_path / "id_ed25519"
+    key_path.write_text("fixture", encoding="utf-8")
+    spec = RunPodAttemptSpec(
+        attempt_dir=str(tmp_path),
+        plan_sha256="sha256:" + "a" * 64,
+        repo_url="https://github.com/shannan-liu1/post-train-engine.git",
+        commit_sha="a" * 40,
+        pod_name="pte-r4-aaaaaaaaaaaa",
+        create_request={},
+        budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+    )
+    calls: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        stdout = (
+            "[192.0.2.10]:12345 ssh-ed25519 AAAATEST\n"
+            if command[0] == "ssh-keyscan"
+            else ""
+        )
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    SSHRunPodRemoteExecutor(
+        control=Control(),
+        ssh_private_key=key_path,
+        command_runner=run,
+        sleep=clock.advance,
+        monotonic=clock,
+    ).bootstrap("pod-1", spec)
+
+    assert clock.now == 130.0
+    assert calls[-1][0] == "ssh"
+    assert calls[-1][-1] != "true"
 
 
 def test_r4_command_and_executor_reject_failed_canonical_run(tmp_path: Path) -> None:
