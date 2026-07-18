@@ -15,6 +15,7 @@ from post_train_engine.runpod_control_plane import (
     RunPodControlPlane,
     RunPodCreateRejectedError,
     RunPodProviderTransport,
+    RunPodRESTTransport,
 )
 from post_train_engine.runpod_watchdog import (
     launch_local_deletion_watchdog,
@@ -104,7 +105,7 @@ def test_provider_transport_uses_graphql_provider_termination_for_create(
     request = captured[0][0]
     payload = json.loads(request.data)
     assert request.full_url == "https://api.runpod.io/graphql"
-    assert request.get_header("User-agent") == "post-train-engine/0.0.1"
+    assert request.get_header("User-agent") == "post-train-engine"
     assert payload["variables"]["input"]["terminateAfter"] == body["terminateAfter"]
     assert payload["variables"]["input"]["gpuTypeId"] == "NVIDIA A40"
     assert result["id"] == "pod-1"
@@ -133,15 +134,47 @@ def test_runpod_transport_rejects_oversized_response(
         RunPodProviderTransport("secret").request("GET", "/pods")
 
 
+def test_rest_transport_uses_canonical_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[Any] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(_size: int) -> bytes:
+            return b"[]"
+
+    def open_request(request, *, timeout):
+        captured.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect", open_request
+    )
+
+    RunPodRESTTransport("secret").request("GET", "/pods")
+
+    assert captured[0][0].get_header("User-agent") == "post-train-engine"
+
+
 def test_graphql_http_rejection_preserves_bounded_provider_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    response_body = BytesIO(
+        b"Error 1010: browser signature banned; echoed credential secret-value"
+    )
     error = urllib.error.HTTPError(
         "https://api.runpod.io/graphql",
         403,
         "Forbidden",
         {},
-        BytesIO(b'Error 1010: browser signature banned; token=secret-value'),
+        response_body,
     )
     monkeypatch.setattr(
         "post_train_engine.runpod_control_plane.open_no_redirect",
@@ -159,6 +192,94 @@ def test_graphql_http_rejection_preserves_bounded_provider_reason(
         )
 
     assert "secret-value" not in str(exc_info.value)
+    assert response_body.closed
+
+
+def test_graphql_http_rejection_redacts_key_at_detail_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_key = "unique-secret-material-12345"
+    response_body = BytesIO(b"x" * 490 + api_key.encode("ascii"))
+    error = urllib.error.HTTPError(
+        "https://api.runpod.io/graphql",
+        403,
+        "Forbidden",
+        {},
+        response_body,
+    )
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(RunPodCreateRejectedError) as exc_info:
+        RunPodProviderTransport(api_key).request(
+            "POST",
+            "/pods",
+            {**_request(), "terminateAfter": "2026-07-18T00:00:00Z"},
+        )
+
+    assert api_key[:10] not in str(exc_info.value)
+    assert len(str(exc_info.value)) <= 560
+    assert response_body.closed
+
+
+def test_graphql_execution_error_redacts_exact_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read(_size: int) -> bytes:
+            return json.dumps(
+                {"errors": [{"message": "provider echoed secret-value"}]}
+            ).encode("utf-8")
+
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(RuntimeError, match="RunPod GraphQL create failed") as exc_info:
+        RunPodProviderTransport("secret-value").request(
+            "POST",
+            "/pods",
+            {**_request(), "terminateAfter": "2026-07-18T00:00:00Z"},
+        )
+
+    assert "secret-value" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("status", [408, 409, 425, 429, 499])
+def test_graphql_uncertain_http_status_remains_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    error = urllib.error.HTTPError(
+        "https://api.runpod.io/graphql",
+        status,
+        "uncertain",
+        {},
+        BytesIO(b"request outcome is uncertain"),
+    )
+    monkeypatch.setattr(
+        "post_train_engine.runpod_control_plane.open_no_redirect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        RunPodProviderTransport("secret").request(
+            "POST",
+            "/pods",
+            {**_request(), "terminateAfter": "2026-07-18T00:00:00Z"},
+        )
+
+    assert exc_info.value.code == status
 
 
 def test_create_persists_authoritative_rate_and_budget_deadline(tmp_path: Path) -> None:
@@ -374,6 +495,32 @@ def test_create_records_definitive_rejection_without_ambiguous_reconciliation(
         control.create_pod(
             _request(),
             budget=RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0),
+            arm_watchdog=_arm_watchdog,
+        )
+
+    assert [call[0] for call in transport.calls] == ["POST"]
+    assert json.loads(journal.read_text(encoding="utf-8"))["state"] == "rejected"
+
+
+def test_resumed_intent_records_definitive_rejection_without_reconciliation(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    transport = FakeTransport([RunPodCreateRejectedError("HTTP 403")])
+    control = RunPodControlPlane(transport, journal, sleep=lambda _seconds: None)
+    budget = RunPodBudget(target_spend_usd=1.5, settled_spend_usd=0.0)
+
+    with pytest.raises(RuntimeError, match="watchdog did not enter armed state"):
+        control.create_pod(
+            _request(),
+            budget=budget,
+            arm_watchdog=lambda: {"state": "failed"},
+        )
+
+    with pytest.raises(RunPodCreateRejectedError, match="HTTP 403"):
+        control.create_pod(
+            _request(),
+            budget=budget,
             arm_watchdog=_arm_watchdog,
         )
 
@@ -865,19 +1012,101 @@ def test_local_watchdog_closes_definitively_rejected_create(
         ),
         encoding="utf-8",
     )
-    transport = FakeTransport([[]])
+    transport = FakeTransport([[], []])
+    sleeps: list[float] = []
 
     result = run_local_deletion_watchdog(
         journal_path=journal,
         receipt_path=receipt_path,
         api_key="secret",
-        sleep=lambda _seconds: None,
+        sleep=sleeps.append,
         clock=lambda: 1060.0,
         transport_factory=lambda _key: transport,
     )
 
     assert result["state"] == "absent"
     assert result["pod_name"] == "pte-r4-deadbeef"
+    assert sleeps == [0.25]
+    assert [call[:2] for call in transport.calls] == [
+        ("GET", "/pods"),
+        ("GET", "/pods"),
+    ]
+
+
+def test_rejected_watchdog_recovers_from_malformed_inventory(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    receipt_path = tmp_path / "watchdog.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "rejected",
+                "pod_name": "pte-r4-deadbeef",
+                "intent_at_unix": 1000.0,
+                "budget": {
+                    "minimum_runtime_seconds": 60,
+                    "max_runtime_seconds": 1200,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = FakeTransport([{"unexpected": "shape"}, [], []])
+    now = [1060.0]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    result = run_local_deletion_watchdog(
+        journal_path=journal,
+        receipt_path=receipt_path,
+        api_key="secret",
+        sleep=advance,
+        clock=lambda: now[0],
+        transport_factory=lambda _key: transport,
+    )
+
+    assert result["state"] == "absent"
+    assert sleeps == [10.0, 0.25]
+    assert [call[:2] for call in transport.calls] == [
+        ("GET", "/pods"),
+        ("GET", "/pods"),
+        ("GET", "/pods"),
+    ]
+
+
+def test_rejected_watchdog_refuses_unexpected_active_pod(tmp_path: Path) -> None:
+    journal = tmp_path / "runpod_operation.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "state": "rejected",
+                "pod_name": "pte-r4-deadbeef",
+                "intent_at_unix": 1000.0,
+                "budget": {
+                    "minimum_runtime_seconds": 60,
+                    "max_runtime_seconds": 1200,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    unexpected = [{"id": "pod-other", "name": "other-work"}]
+    transport = FakeTransport([unexpected, unexpected])
+
+    with pytest.raises(RuntimeError, match="unexpected active Pods"):
+        run_local_deletion_watchdog(
+            journal_path=journal,
+            receipt_path=tmp_path / "watchdog.json",
+            api_key="secret",
+            sleep=lambda _seconds: None,
+            clock=lambda: 1060.0,
+            transport_factory=lambda _key: transport,
+        )
+
     assert [call[:2] for call in transport.calls] == [("GET", "/pods")]
 
 

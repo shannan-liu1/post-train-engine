@@ -174,7 +174,7 @@ Further cycles:
 - [ ] Runtime acceptance R1 through R6 has current evidence.
 - [ ] Extensibility acceptance E1 through E5 has current evidence.
 - [ ] Unknown-unknown register contains no unowned correctness risk.
-- [x] Full tests and Ruff pass after canonical runtime certification, repository deletion, and paid-attempt orchestration pass: 365 tests pass.
+- [x] Full tests and Ruff pass after canonical runtime certification, repository deletion, and paid-attempt orchestration pass: 391 tests pass.
 - [x] API and RunPod consequential resolution enter the typed RunEngine `resolve` phase before the immutable RunPlan and adapter stages.
 - [x] R4 runs through `pte run` as a non-training RunEngine adapter and records runtime evidence without model-promotion authority.
 - [x] Repository-wide deletion pass removed dead model/eval execution, inert configs, broad root exports, superseded planning text, and unused direct dependencies.

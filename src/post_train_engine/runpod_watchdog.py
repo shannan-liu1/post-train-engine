@@ -196,25 +196,29 @@ def run_local_deletion_watchdog(
         inventory_error: BaseException | None = None
         try:
             pods = control.list_pods()
-        except (OSError, TimeoutError) as exc:
+        except Exception as exc:
             inventory_error = exc
             pods = []
-        matches = [row for row in pods if str(row.get("name")) == pod_name]
-        if len(matches) > 1:
-            raise RuntimeError(f"multiple RunPod Pods share watchdog name {pod_name!r}")
-        if matches:
-            pod_id = str(matches[0].get("id") or "")
-            if not pod_id:
-                raise RuntimeError("RunPod watchdog reconciliation found no Pod id")
+        pod_id = _pod_id_from_name_inventory(pods, pod_name)
+        if pod_id is not None:
             break
         if operation.get("state") == "rejected" and inventory_error is None:
-            result = {
-                "state": "absent",
-                "pod_name": pod_name,
-                "recorded_at_unix": time.time(),
-            }
-            _write_json_atomic(receipt, result)
-            return result
+            sleep(0.25)
+            try:
+                pods = control.list_pods()
+            except Exception as exc:
+                inventory_error = exc
+            else:
+                pod_id = _pod_id_from_name_inventory(pods, pod_name)
+                if pod_id is not None:
+                    break
+                result = {
+                    "state": "absent",
+                    "pod_name": pod_name,
+                    "recorded_at_unix": time.time(),
+                }
+                _write_json_atomic(receipt, result)
+                return result
         provider_ttl_unix = _provider_ttl_unix(operation)
         now = clock()
         if inventory_error is not None:
@@ -373,6 +377,29 @@ def _provider_ttl_unix(operation: Mapping[str, Any]) -> float:
     ):
         raise ValueError("RunPod create intent requires a valid intent time")
     return float(intent_at) + max_runtime
+
+
+def _pod_id_from_name_inventory(
+    pods: Sequence[Mapping[str, Any]],
+    pod_name: str,
+) -> str | None:
+    unexpected = [
+        str(row.get("id") or "<missing-id>")
+        for row in pods
+        if str(row.get("name")) != pod_name
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "RunPod watchdog found unexpected active Pods: " + ", ".join(unexpected)
+        )
+    if len(pods) > 1:
+        raise RuntimeError(f"multiple RunPod Pods share watchdog name {pod_name!r}")
+    if not pods:
+        return None
+    pod_id = str(pods[0].get("id") or "")
+    if not pod_id:
+        raise RuntimeError("RunPod watchdog reconciliation found no Pod id")
+    return pod_id
 
 
 def _watchdog_environment(source: Mapping[str, str], *, api_key: str) -> dict[str, str]:

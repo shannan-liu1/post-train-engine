@@ -21,7 +21,9 @@ from post_train_engine.runpod import cuda_version_from_image
 
 _FROZEN_FORBID = ConfigDict(frozen=True, extra="forbid")
 _MAX_USER_AUTHORIZED_SPEND_USD = 1.5
-_RUNPOD_USER_AGENT = "post-train-engine/0.0.1"
+_RUNPOD_USER_AGENT = "post-train-engine"
+_AMBIGUOUS_HTTP_CREATE_STATUSES = frozenset({408, 409, 425, 429, 499})
+_MAX_PROVIDER_ERROR_DETAIL_CHARS = 500
 
 
 class RunPodTransport(Protocol):
@@ -142,12 +144,25 @@ class RunPodProviderTransport(RunPodRESTTransport):
             with open_no_redirect(request, timeout=self._timeout_seconds) as response:
                 raw = json.loads(read_bounded_response(response).decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            body = redact_secret_text(
-                exc.read(501).decode("utf-8", errors="replace")[:500]
-            )
-            if 400 <= exc.code < 500:
+            try:
+                read_limit = (
+                    4 * _MAX_PROVIDER_ERROR_DETAIL_CHARS
+                    + len(self._api_key.encode("utf-8"))
+                    + 1
+                )
+                provider_reason = _redact_provider_detail(
+                    exc.read(read_limit).decode("utf-8", errors="replace"),
+                    exact_secret=self._api_key,
+                )
+            finally:
+                exc.close()
+            if (
+                400 <= exc.code < 500
+                and exc.code not in _AMBIGUOUS_HTTP_CREATE_STATUSES
+            ):
                 raise RunPodCreateRejectedError(
-                    f"RunPod GraphQL create rejected with HTTP {exc.code}: {body}"
+                    "RunPod GraphQL create rejected with "
+                    f"HTTP {exc.code}: {provider_reason}"
                 ) from exc
             raise
         errors = raw.get("errors") if isinstance(raw, dict) else None
@@ -155,7 +170,10 @@ class RunPodProviderTransport(RunPodRESTTransport):
             message = errors[0].get("message") if isinstance(errors[0], dict) else None
             raise RuntimeError(
                 "RunPod GraphQL create failed: "
-                + redact_secret_text(str(message or "unknown error"))[:500]
+                + _redact_provider_detail(
+                    str(message or "unknown error"),
+                    exact_secret=self._api_key,
+                )
             )
         data = raw.get("data") if isinstance(raw, dict) else None
         pod = data.get("podFindAndDeployOnDemand") if isinstance(data, dict) else None
@@ -343,39 +361,11 @@ class RunPodControlPlane:
                     intent_at_unix + budget.max_runtime_seconds
                 ),
             }
-            try:
-                raw = self.transport.request("POST", "/pods", provider_request)
-            except RunPodCreateRejectedError:
-                self._write_journal(
-                    {
-                        "state": "rejected",
-                        "intent_at_unix": intent_at_unix,
-                        "pod_name": pod_name,
-                        "request_sha256": request_sha256,
-                        "operation_sha256": operation_sha256,
-                        "budget": budget_json,
-                        "request": request,
-                    }
-                )
-                raise
-            except BaseException as exc:
-                self._write_journal(
-                    {
-                        "state": "ambiguous",
-                        "intent_at_unix": intent_at_unix,
-                        "pod_name": pod_name,
-                        "request_sha256": request_sha256,
-                        "operation_sha256": operation_sha256,
-                        "budget": budget_json,
-                        "request": request,
-                    }
-                )
-                raw = self._reconcile_by_name_with_retries(pod_name)
-                if raw is None:
-                    raise AmbiguousPodCreationError(
-                        "RunPod create response was ambiguous; no same-name Pod "
-                        "appeared during bounded reconciliation"
-                    ) from exc
+            raw = self._submit_create(
+                provider_request,
+                operation=operation,
+                pod_name=pod_name,
+            )
         else:
             if journal.get("request_sha256") != request_sha256:
                 raise ValueError(
@@ -416,16 +406,11 @@ class RunPodControlPlane:
                         intent_at_unix + budget.max_runtime_seconds
                     ),
                 }
-                try:
-                    raw = self.transport.request("POST", "/pods", provider_request)
-                except BaseException as exc:
-                    self._write_journal({"state": "ambiguous", **operation})
-                    raw = self._reconcile_by_name_with_retries(pod_name)
-                    if raw is None:
-                        raise AmbiguousPodCreationError(
-                            "RunPod create response was ambiguous; no same-name Pod "
-                            "appeared during bounded reconciliation"
-                        ) from exc
+                raw = self._submit_create(
+                    provider_request,
+                    operation=operation,
+                    pod_name=pod_name,
+                )
             else:
                 raw = self._reconcile_by_name_with_retries(pod_name)
                 if raw is None:
@@ -740,6 +725,28 @@ class RunPodControlPlane:
             )
         return None if not matches else matches[0]
 
+    def _submit_create(
+        self,
+        provider_request: dict[str, Any],
+        *,
+        operation: dict[str, Any],
+        pod_name: str,
+    ) -> Any:
+        try:
+            return self.transport.request("POST", "/pods", provider_request)
+        except RunPodCreateRejectedError:
+            self._write_journal({"state": "rejected", **operation})
+            raise
+        except BaseException as exc:
+            self._write_journal({"state": "ambiguous", **operation})
+            raw = self._reconcile_by_name_with_retries(pod_name)
+            if raw is None:
+                raise AmbiguousPodCreationError(
+                    "RunPod create response was ambiguous; no same-name Pod "
+                    "appeared during bounded reconciliation"
+                ) from exc
+            return raw
+
     def _reconcile_by_name_with_retries(
         self,
         pod_name: str,
@@ -842,6 +849,12 @@ def _non_negative_amount(value: Any) -> float:
 def _sha256_json(body: dict[str, Any]) -> str:
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _redact_provider_detail(text: str, *, exact_secret: str) -> str:
+    return redact_secret_text(text).replace(exact_secret, "[REDACTED]")[
+        :_MAX_PROVIDER_ERROR_DETAIL_CHARS
+    ]
 
 
 def _positive_timestamp(value: Any, *, label: str) -> float:
